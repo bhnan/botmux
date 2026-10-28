@@ -1280,6 +1280,64 @@ export interface Session {
   };
 }
 
+/** Persisted topic knowledge entity (spec 20261028-topic-search §3.1).
+ *
+ * Three related but distinct concepts — do not conflate them:
+ * - `Session` is an execution session (one CLI worker lifecycle);
+ * - `Topic` is the persisted knowledge catalog entry for one Lark thread
+ *   location (`topicKey` encoding shared with `sessionTopicKey` in
+ *   `src/topic/identity.ts`);
+ * - `SessionTopicGroup` (dashboard/web) is a display aggregation computed
+ *   from session rows and never persisted.
+ *
+ * First version covers `kind=thread` locations only. */
+export interface Topic {
+  schemaVersion: 1;
+  topicKey: string;
+  chatId: string;
+  /** Real `om_` routing root of the thread; not the native `omt_*` id. */
+  rootMessageId: string;
+  /** Native thread handle for jump links; display metadata, never identity. */
+  nativeThreadId?: string;
+  /** Directory snapshot; never written back onto session titles. */
+  title: string;
+  /** Authorization association; assigned by the host, never by the model. */
+  accessPolicyRef: string;
+  /** Optimistic-concurrency counter for summary mutations. */
+  revision: number;
+  summaries: TopicSummary[];
+  /** Boundary of the source messages last successfully summarized. Encoded by
+   * the source adapter; NOT a page token and NOT comparable by string order. */
+  summarizedThroughCursor?: string;
+  /** ISO-8601 UTC of the oldest message covered by current summaries. */
+  coverageStartAt?: string;
+  /** ISO-8601 UTC through which source input has been successfully processed. */
+  sourceThroughAt?: string;
+  /** ISO-8601 UTC of the last successful history check (≠ summary cursor). */
+  lastCheckedAt?: string;
+  updatedAt: string;
+}
+
+export interface TopicSummary {
+  /** Server-assigned; stable across updates of the same summary. */
+  id: string;
+  text: string;
+  keywords: string[];
+  /** Messages this summary cites; must belong to this topic's authorized
+   * input — the model cannot fabricate references to other topics. */
+  sourceMessageIds: string[];
+  updatedAt: string;
+  /** Model/prompt version identifier; never contains credentials. */
+  generatorKey: string;
+  embedding?: {
+    /** provider/model/revision/dimensions identity of the vector space. */
+    modelKey: string;
+    /** Hash of the embedded text; stale vectors are dropped on mismatch. */
+    contentHash: string;
+    vector: number[];
+  };
+}
+
 export interface CrossPrincipalInterruptionMessage {
   turnId: string;
   text: string;

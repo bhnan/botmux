@@ -11,6 +11,7 @@ import { sessionTerminalHref } from './session-terminal.js';
 import { copyText } from './clipboard.js';
 import { toast } from './toast.js';
 import { sessionMutationBlockedText } from './session-mutation-blocked.js';
+import { nonEmptyString, sessionTopicKind, sessionTopicKey, type SessionTopicKind } from '../../topic/identity.js';
 
 export function resumeErrorMessage(reason: unknown, translate: typeof t = t): string {
   if (reason === 'workspace_retired') return translate('sessions.resumeWorkspaceRetired');
@@ -255,7 +256,11 @@ export function sessionSearchText(s: any): string {
   return `${JSON.stringify(s)} ${sessionLocationText(s)} ${sessionLocationTitle(s)}`.toLowerCase();
 }
 
-export type SessionTopicKind = 'thread' | 'chat' | 'session';
+// Topic key/kind live in the shared browser-safe identity module (also the
+// single source for the persisted Topic catalog); re-exported here so
+// existing dashboard imports keep working.
+export { sessionTopicKey } from '../../topic/identity.js';
+export type { SessionTopicKind } from '../../topic/identity.js';
 
 /** Location-level grouping used by the Dashboard topic view.
  *
@@ -278,31 +283,6 @@ export interface SessionTopicGroup<T = any> {
   latestActivityAt: number;
   multiBot: boolean;
   inferredBotTriggered: boolean;
-}
-
-function nonEmptyString(value: unknown): string {
-  return typeof value === 'string' ? value.trim() : '';
-}
-
-function sessionTopicKind(s: any): SessionTopicKind {
-  const chatId = nonEmptyString(s?.chatId);
-  const rootMessageId = nonEmptyString(s?.rootMessageId);
-  if (s?.scope === 'chat') return chatId ? 'chat' : 'session';
-  return chatId && rootMessageId ? 'thread' : 'session';
-}
-
-/** Stable location key for the current schema. Keep it separate from any
- * future `collaborationId`: location and logical task identity are different
- * dimensions and must not silently alias each other. */
-export function sessionTopicKey(s: any): string {
-  const chatId = nonEmptyString(s?.chatId);
-  const rootMessageId = nonEmptyString(s?.rootMessageId);
-  const kind = sessionTopicKind(s);
-  if (kind === 'thread') {
-    return `thread:${encodeURIComponent(chatId)}:${encodeURIComponent(rootMessageId)}`;
-  }
-  if (kind === 'chat') return `chat:${encodeURIComponent(chatId)}`;
-  return `session:${encodeURIComponent(nonEmptyString(s?.sessionId) || 'unknown')}`;
 }
 
 function topicTitle(rows: any[], fallback: string): string {
