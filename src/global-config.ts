@@ -148,6 +148,20 @@ export interface MultiTopicGlobalConfig {
   enabled?: boolean;
 }
 
+/** Lenient stored shape of the topic-search block (spec 20261028-topic-search
+ *  §4). Only structural whitelisting happens here; the strict resolver —
+ *  which decides whether the feature may run — lives in src/topic/config.ts. */
+export interface TopicSearchGlobalConfig {
+  enabled?: boolean;
+  allowedChatIds?: string[];
+  llm?: Record<string, unknown>;
+  embedding?: { enabled?: boolean; model?: Record<string, unknown> };
+  schedule?: Record<string, unknown>;
+  initialLookbackDays?: number;
+  maxConcurrentTopics?: number;
+  maxTopicsPerRun?: number;
+}
+
 export interface WorkerConfig {
   /** Default-on switch for fresh/resumed worker memory admission. */
   memoryAdmissionEnabled?: boolean;
@@ -252,6 +266,9 @@ export interface GlobalConfig {
   /** Machine-wide multi-topic orchestration switch. Missing / enabled !== false
    *  preserves legacy behavior. `BOTMUX_MULTI_TOPIC_ENABLED` overrides it. */
   multiTopic?: MultiTopicGlobalConfig;
+  /** 话题知识与统一检索（spec 20261028-topic-search）。机器级、默认关闭；
+   *  深度校验与生效解析在 src/topic/config.ts（resolver 决定是否启动后台）。 */
+  topicSearch?: TopicSearchGlobalConfig;
   /** Optional proxy for GitHub release assets and checksums, preferred over
    *  HTTP_PROXY/HTTPS_PROXY. Registry metadata and platform-package downloads
    *  use only environment proxies + NO_PROXY; package-manager installs use
@@ -823,6 +840,39 @@ function readMultiTopic(raw: unknown): MultiTopicGlobalConfig | undefined {
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+/** Lenient `topicSearch` reader: keep only structurally-valid known keys so a
+ *  hand-edited config degrades to "feature off" (the strict resolver in
+ *  src/topic/config.ts reports why) instead of poisoning unrelated reads.
+ *  Unknown/future keys inside `llm`/`embedding.model`/`schedule` are
+ *  round-tripped untouched — they belong to the strict resolver's schema. */
+function readTopicSearch(raw: unknown): TopicSearchGlobalConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const v = raw as Record<string, unknown>;
+  const out: TopicSearchGlobalConfig = {};
+  if (typeof v.enabled === 'boolean') out.enabled = v.enabled;
+  if (Array.isArray(v.allowedChatIds)) {
+    out.allowedChatIds = v.allowedChatIds.filter((id): id is string => typeof id === 'string' && id.trim() !== '');
+  }
+  if (v.llm && typeof v.llm === 'object' && !Array.isArray(v.llm)) out.llm = { ...(v.llm as Record<string, unknown>) };
+  if (v.embedding && typeof v.embedding === 'object' && !Array.isArray(v.embedding)) {
+    const e = v.embedding as Record<string, unknown>;
+    const embedding: TopicSearchGlobalConfig['embedding'] = {};
+    if (typeof e.enabled === 'boolean') embedding.enabled = e.enabled;
+    if (e.model && typeof e.model === 'object' && !Array.isArray(e.model)) {
+      embedding.model = { ...(e.model as Record<string, unknown>) };
+    }
+    out.embedding = embedding;
+  }
+  if (v.schedule && typeof v.schedule === 'object' && !Array.isArray(v.schedule)) {
+    out.schedule = { ...(v.schedule as Record<string, unknown>) };
+  }
+  for (const key of ['initialLookbackDays', 'maxConcurrentTopics', 'maxTopicsPerRun'] as const) {
+    const value = v[key];
+    if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) out[key] = value;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 export function globalConfigPath(): string {
   const configured = process.env.BOTMUX_GLOBAL_CONFIG_FILE?.trim();
   if (configured) {
@@ -906,6 +956,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (workflow) out.workflow = workflow;
   const multiTopic = readMultiTopic(raw.multiTopic);
   if (multiTopic) out.multiTopic = multiTopic;
+  const topicSearch = readTopicSearch(raw.topicSearch);
+  if (topicSearch) out.topicSearch = topicSearch;
   if (typeof raw.httpProxy === 'string' && raw.httpProxy.trim()) out.httpProxy = raw.httpProxy.trim();
   // Lenient http(s) origin check; resolveOAuthRedirectUri re-validates shape.
   if (typeof raw.oauthRedirectBase === 'string' && /^https?:\/\//.test(raw.oauthRedirectBase.trim())) {
