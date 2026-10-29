@@ -352,7 +352,7 @@ JSON 格式，与 \`botmux history\` 的单条消息字段一致，并附带 \`r
 
 export const SEND_SKILL = `---
 name: botmux-send
-description: 向飞书话题发送消息。用户在飞书上阅读看不到终端输出，需要用户看到的内容（关键结论、方案、最终结果、进度更新）必须通过 botmux send 发送。支持图文混排（图片穿插在 markdown 正文中）、文本、图片/文件附件、原始 interactive 卡片 JSON（发出后可用 botmux card patch 原地更新，或用 botmux card stream 做原生打字机流式更新）、@mention。**当你自主执行任务撞到只有人类才能解除的硬阻碍、无法靠自己继续时（需要授权/凭证、要人拍不可逆决策、缺访问权限、需求歧义自己定不了），回消息时带 \`--attention\` 举手**——既把"我卡在哪、需要你做什么"发给用户，又把本会话标进 dashboard「需要你」列，让人一眼看到哪个任务卡住、为什么卡。
+description: 向飞书话题发送消息。用户在飞书上阅读看不到终端输出，需要用户看到的内容（关键结论、方案、最终结果、进度更新）必须通过 botmux send 发送。修改已有文档后使用 send --diff 输出真实折叠预览。支持图文混排（图片穿插在 markdown 正文中）、文本、图片/文件附件、原始 interactive 卡片 JSON（发出后可用 botmux card patch 原地更新，或用 botmux card stream 做原生打字机流式更新）、@mention。**当你自主执行任务撞到只有人类才能解除的硬阻碍、无法靠自己继续时（需要授权/凭证、要人拍不可逆决策、缺访问权限、需求歧义自己定不了），回消息时带 \`--attention\` 举手**——既把"我卡在哪、需要你做什么"发给用户，又把本会话标进 dashboard「需要你」列，让人一眼看到哪个任务卡住、为什么卡。
 ---
 
 # botmux-send — 向飞书话题发送消息
@@ -386,6 +386,26 @@ description: 向飞书话题发送消息。用户在飞书上阅读看不到终�
 - **需要用户继续动作**时，把“下一步 / 需要你确认”放在最后一节；状态 emoji 只作少量语义提示，不堆装饰。
 
 短消息保持轻，只有信息确实需要层级时才使用结构化 Markdown。
+
+## 修改已有文档：\`--diff\`
+
+修改已有文本文档后，默认给出简短摘要和真实 diff 预览。使用核心 \`botmux send --diff <统一diff文件>\`，由代码处理解析、计数、折叠面板、逐行着色、转义和截断。遵循用户明确的输出格式。
+
+1. 编辑前保存本轮起始文本，完成后与实际保存的版本生成 unified diff，默认 3 行上下文。只包含本轮文档修改；不要用 Git HEAD 混入已有未提交修改，不要编造旧内容。
+2. 先将完整文档/完整 diff 作为附件或可访问链接交付，再发一次最终 diff 卡片。\`--diff\` 不能与原始卡片、图片/附件/视频、语音、slash 混用；\`--diff\` 是展示输入，继续沿用 send 的 @、final、回复位置及权限边界。
+3. 用位置正文、stdin 或 \`--content-file\` 提供摘要（优先级仍为 content-file > positional > stdin）。摘要简短说明修改和验证；每文件一个折叠面板，标题显示完整 +N/-M，新增绿色、删除红色、上下文灰色并以 · 打头。
+4. 输入为已保存的 UTF-8 diff 文件，最多 2MiB。代码默认每文件最多 60 行、整卡约 18KB 预览预算；超出时保留真实计数和截断说明。原始文件不被修改。新建文档、无可靠基线、仅富文本样式或图片修改时用摘要及完整文档交付；文本 diff 不证明布局变化。
+
+\`\`\`bash
+# 先交付完整内容
+botmux send --files /absolute/task/output/change.diff --no-mention '完整 diff。'
+# 同一轮只发一次 final
+botmux send --diff /absolute/task/output/change.diff --response-kind final --mention-back '已更新文档，验证通过。'
+# 只检查卡片，不发送，也不需要会话或飞书权限
+botmux send --diff /absolute/task/output/change.diff --dry-run '修改摘要'
+\`\`\`
+
+\`--dry-run\` 返回 card、bytes/fits，以及 diff.stats/diff.preview；实际发送失败按既有 send 契约处理，已成功发送不重发。font 模式使用比例字体，长行换行，不能保证列对齐；面板内上下文的灰色和缩进效果仍需客户端确认，不承诺悬停浮层。
 
 ### 可选排版配方（参考，不是强制模板）
 

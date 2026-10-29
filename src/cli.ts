@@ -7380,6 +7380,7 @@ const SEND_HELP_BODY = [
   '       --video-covers <path>           视频封面图片（可重复，按顺序对应 --videos）',
   '       --card-file <path>              直接发送飞书/Lark interactive 卡片 JSON',
   '       --card-json <json>              直接发送飞书/Lark interactive 卡片 JSON 字符串',
+  '       --diff <path>                   把 unified diff 文件格式化为逐文件折叠红绿预览；正文作为摘要',
   '       --dry-run                       不发送：把正文按卡片渲染后输出 JSON 与告警，用于发送前自查',
   '                                      （只渲染正文；不上传图片/附件、不解析 @、不加页脚）',
   '    图表：正文里的 ```vega-lite 代码块会渲染成飞书原生图表（柱/条/折线/面积/散点/饼）。',
@@ -9500,6 +9501,7 @@ import {
   matchUniqueChatMemberOpenId,
 } from './services/send-policy.js';
 import { normalizePositionalSendContent } from './services/send-content.js';
+import { prepareDiffSend } from './cli/send-diff.js';
 import { describeScheduleState } from './services/schedule-until-done.js';
 
 /** Map until-done / notify validation codes to a one-line CLI message. */
@@ -10195,6 +10197,18 @@ function reportCardRenderDiagnostics(diagnostics: CardRenderDiagnostic[]): void 
 }
 
 async function sendDryRun(rest: string[]): Promise<void> {
+  if (rest.some(arg => arg === '--diff' || arg.startsWith('--diff='))) {
+    try {
+      const { rendered } = await prepareDiffSend(rest, readStdin);
+      const diagnostics: CardRenderDiagnostic[] = [];
+      const budget = fitChartsToCardBudget(rendered.card, { reserveBytes: CARD_LATE_CHROME_RESERVE_BYTES, diagnostics });
+      console.log(JSON.stringify({ dryRun: true, bytes: budget.bytes, fits: budget.fits, diagnostics, diff: { stats: rendered.stats, preview: rendered.preview }, card: rendered.card }, null, 2));
+      return;
+    } catch (error) {
+      console.error(`botmux send: ${error instanceof Error ? error.message : String(error)}`);
+      process.exit(2);
+    }
+  }
   if (argValue(rest, '--card-file') !== undefined || argValue(rest, '--card-json') !== undefined) {
     console.error('botmux send --dry-run 只渲染 markdown 正文，不能与 --card-file/--card-json 混用');
     process.exit(2);
@@ -10281,6 +10295,16 @@ async function cmdSend(rest: string[]): Promise<void> {
   // central session-capability gate — same hard door every Feishu-touching CLI
   // command consults.
   assertTurnTransportOrExit('send');
+  // --diff is a core input format. Normalize before relay/transport selection
+  // so every backend still enforces the existing custom-card send contract.
+  if (rest.some(arg => arg === '--diff' || arg.startsWith('--diff='))) {
+    try {
+      rest = (await prepareDiffSend(rest, readStdin)).args;
+    } catch (error) {
+      console.error(`botmux send: ${error instanceof Error ? error.message : String(error)}`);
+      process.exit(2);
+    }
+  }
   const replyLayoutRequest = parseReplyLayoutRequest(rest);
   if (replyLayoutRequest.warning) console.error(replyLayoutRequest.warning);
   let replyLayout = replyLayoutRequest.layout;
