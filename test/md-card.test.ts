@@ -1820,6 +1820,40 @@ describe('unified diff reply cards', () => {
     expect(JSON.stringify(result.card)).toContain('修改结果');
   });
 
+  it('keeps visible rows from an explicitly incomplete hunk without treating them as full counts', () => {
+    const prefix = '--- a/spec.md\n+++ b/spec.md\n@@ -1,3 +1,3 @@\n-old\n+new\n';
+    expect(() => parseUnifiedDiff(prefix)).toThrow();
+    const files = parseUnifiedDiff(prefix, { allowIncomplete: true });
+    const result = buildDiffCard(files, { inputBytes: 3 * 1024 * 1024 });
+    expect(result.statsScope).toBe('preview');
+    expect(result.stats.added).toBe(1);
+    expect(result.stats.removed).toBe(1);
+    expect(JSON.stringify(result.card)).toContain('+new');
+    expect(JSON.stringify(result.card)).toContain('-old');
+    expect(JSON.stringify(result.card)).toContain('计数仅预览');
+  });
+
+  it('only relaxes EOF truncation and drops unfinished trailing file headers', () => {
+    const prefix = BASIC + '--- a/later.md\n++';
+    const files = parseUnifiedDiff(prefix, { allowIncomplete: true });
+    expect(files).toHaveLength(1);
+    expect(files[0].path).toBe('docs/stress_test.md');
+    expect(() => parseUnifiedDiff('--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n!invalid\n', { allowIncomplete: true })).toThrow();
+  });
+
+  it('shows up to sixty preview rows and preserves part of a single very long line', () => {
+    const input = '--- a/spec.md\n+++ b/spec.md\n@@ -0,0 +1,100 @@\n' + Array.from({ length: 100 }, (_, i) => '+requirement ' + i).join('\n') + '\n';
+    const result = buildDiffCard(parseUnifiedDiff(input), { inputBytes: 3 * 1024 * 1024 });
+    expect(result.preview.rows).toBe(60);
+    expect(JSON.stringify(result.card)).toContain('diff 超限，仅显示前60行');
+    expect(result.stats.added).toBe(59);
+    const long = '--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n+first visible content ' + 'x'.repeat(20_000) + '\n';
+    const line = buildDiffCard(parseUnifiedDiff(long));
+    expect(JSON.stringify(line.card)).toContain('+first visible content');
+    expect(JSON.stringify(line.card)).toContain('长行已截断');
+    expect(line.bytes).toBeLessThanOrEqual(DIFF_PREVIEW_BUDGET_BYTES);
+  });
+
   it('统一 diff 的真实计数、路径、上下文和空行', () => {
     const files = parseUnifiedDiff(BASIC);
     assert.equal(files[0].path, 'docs/stress_test.md');

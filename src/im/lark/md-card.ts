@@ -145,6 +145,7 @@ export function createReplyCard(
 export interface DiffRow {
   kind: string;
   text: string;
+  truncated?: boolean;
 }
 
 export interface DiffFile {
@@ -162,6 +163,7 @@ export interface DiffFile {
 export interface DiffCardResult {
   card: ReplyCardV2;
   bytes: number;
+  statsScope: 'full' | 'preview';
   stats: { files: number | null; added: number | null; removed: number | null };
   preview: { files: number; rows: number; truncated: boolean; omittedFiles: number | null; reason?: 'input_too_large'; inputBytes?: number };
 }
@@ -203,7 +205,7 @@ function diffPathLabel(raw: string): string {
   return decoded === '/dev/null' ? decoded : decoded.replace(/^[ab]\//, '');
 }
 
-export function parseUnifiedDiff(input: string): DiffFile[] {
+export function parseUnifiedDiff(input: string, { allowIncomplete = false }: { allowIncomplete?: boolean } = {}): DiffFile[] {
   if (Buffer.byteLength(input, 'utf8') > MAX_DIFF_INPUT_BYTES) throw new Error('diff 输入超过 2MiB');
   const lines = input.replace(/\r\n/g, '\n').split('\n');
   if (lines.at(-1) === '') lines.pop();
@@ -220,6 +222,11 @@ export function parseUnifiedDiff(input: string): DiffFile[] {
   };
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+    const partialTail = allowIncomplete && i === lines.length - 1 && !input.endsWith('\n');
+    // A byte-bounded prefix may stop in a header. Keep preceding visible rows
+    // without inventing the trailing file/path/hunk. Content rows are retained.
+    if (partialTail && (pendingOld !== undefined || (!(oldRemaining || newRemaining)
+      && (line.startsWith('diff ') || line.startsWith('--- ') || line.startsWith('@@'))))) break;
     if (pendingOld !== undefined) {
       if (!file) failDiffLine(i + 1, '文件头缺少旧路径');
       if (!line.startsWith('+++ ')) failDiffLine(i + 1, '缺少 +++ 文件头');
@@ -243,7 +250,7 @@ export function parseUnifiedDiff(input: string): DiffFile[] {
       if (!['+', '-', ' '].includes(kind)) failDiffLine(i + 1, 'hunk 内容行缺少 +、- 或空格前缀');
       if (kind !== '+' && oldRemaining-- <= 0) failDiffLine(i + 1, '旧版本行数超出 hunk 声明');
       if (kind !== '-' && newRemaining-- <= 0) failDiffLine(i + 1, '新版本行数超出 hunk 声明');
-      file.rows.push({kind, text: line.slice(1)});
+      file.rows.push({kind, text: line.slice(1), ...(partialTail ? { truncated: true } : {})});
       if (kind === '+') file.added++;
       if (kind === '-') file.removed++;
       continue;
@@ -297,9 +304,9 @@ export function parseUnifiedDiff(input: string): DiffFile[] {
     if (line === '' || line.startsWith('diff ') || /^index |^(dis)?similarity index /.test(line)) continue;
     failDiffLine(i + 1, '不支持的 unified diff 内容');
   }
-  if (pendingOld !== undefined || oldRemaining || newRemaining) failDiffLine(lines.length, '文件头或 hunk 不完整');
-  if (!files.length && input.trim()) throw new Error('输入没有 unified diff 文件头');
-  return files;
+  if (!allowIncomplete && (pendingOld !== undefined || oldRemaining || newRemaining)) failDiffLine(lines.length, '文件头或 hunk 不完整');
+  if (!files.length && input.trim() && !allowIncomplete) throw new Error('输入没有 unified diff 文件头');
+  return allowIncomplete ? files.filter(file => (file.header && file.rows.length > 0) || file.notes.length > 0) : files;
 }
 
 function escapeDiffMarkdown(value: string): string {
@@ -314,63 +321,65 @@ function displayDiffPath(value: string): string {
 function renderDiffRow(row: DiffRow): string {
   const color = row.kind === '+' ? 'green' : row.kind === '-' ? 'red' : 'grey';
   const prefix = ['+', '-'].includes(row.kind) ? row.kind : row.kind === ' ' ? '·' : '';
-  let content = escapeDiffMarkdown(row.text);
+  let text = row.text.slice(0, 1024);
+  const last = text.charCodeAt(text.length - 1);
+  if (last >= 0xd800 && last <= 0xdbff) text = text.slice(0, -1);
+  if (row.truncated || row.text.length > 1024) text += '…';
+  let content = escapeDiffMarkdown(text);
   const indent = content.match(/^[ \t]*/)![0].replace(/\t/g, '    ');
   content = '&nbsp;'.repeat(indent.length) + content.slice(content.match(/^[ \t]*/)![0].length);
   return `<font color='${color}'>${prefix}${content}</font>`;
 }
 
 export function buildDiffCard(files: DiffFile[], {summary = '', maxLines = 60, inputBytes, inputName}: { summary?: string; maxLines?: number; inputBytes?: number; inputName?: string } = {}): DiffCardResult {
-  if (Buffer.byteLength(summary, 'utf8') > 4_000) throw new Error('摘要超过 4000 UTF-8 字节');
+  if (Buffer.byteLength(summary, 'utf8') > 4_000) throw new Error('摘要过长');
   if (!Number.isInteger(maxLines) || maxLines < 1 || maxLines > 200) throw new Error('max-lines 需要为 1–200');
   // The custom final validator reserves botmux_* IDs for host sections.
   // Preserve the shared heading presentation without carrying those IDs.
   const summaryElements = summary
     ? buildCardBodyElements(summary).map(({ element_id: _elementId, ...element }) => element)
     : [];
-  if (inputBytes !== undefined && inputBytes > MAX_DIFF_INPUT_BYTES) {
-    const label = inputName ? escapeDiffMarkdown(displayDiffPath(inputName)) : 'diff 文件';
-    const card = createReplyCard([
-      ...summaryElements,
-      { tag: 'markdown', content: '**差异文件较大，已省略逐行预览**' },
-      { tag: 'markdown', content: `${label} 的大小为 **${(inputBytes / (1024 * 1024)).toFixed(2)} MiB**，超过 **2 MiB** 的预览上限。\n\n未解析完整差异，文件数和增删统计暂不可用。请查看本轮的完整 diff 文件。` },
-    ]);
-    const bytes = Buffer.byteLength(JSON.stringify(card), 'utf8');
-    if (bytes > DIFF_PREVIEW_BUDGET_BYTES) throw new Error('卡片摘要超过预览预算');
-    return { card, bytes, stats: { files: null, added: null, removed: null }, preview: { files: 0, rows: 0, truncated: true, omittedFiles: null, reason: 'input_too_large', inputBytes } };
-  }
+  const partial = inputBytes !== undefined && inputBytes > MAX_DIFF_INPUT_BYTES;
   const stats = {files: files.length, added: files.reduce((n, f) => n + f.added, 0), removed: files.reduce((n, f) => n + f.removed, 0)};
   let count = Math.min(files.length, 20);
   let limit = maxLines;
   function assemble(): DiffCardResult {
     const elements: Record<string, unknown>[] = [];
     elements.push(...summaryElements);
-    elements.push({tag: 'markdown', content: files.length ? `共 ${stats.files} 个文件，+${stats.added} / -${stats.removed}。完整内容请查看原始 diff 文件。` : '未检测到内容差异。'});
-    let truncated = count < files.length;
+    if (!partial) elements.push({tag: 'markdown', content: files.length ? `共 ${stats.files} 个文件，+${stats.added} / -${stats.removed}。完整内容请查看原始 diff 文件。` : '未检测到内容差异。'});
+    else if (count === 0) elements.push({tag: 'markdown', text_size: 'notation', content: `<font color='grey'>diff 超限，${inputName ? escapeDiffMarkdown(displayDiffPath(inputName)) + '的' : ''}当前片段暂无可展示行，完整差异请查看原始文件。</font>`});
+    let truncated = partial || count < files.length;
+    const previewStats = { files: count, added: 0, removed: 0 };
     let shownRows = 0;
     for (const f of files.slice(0, count)) {
       const shown = f.rows.slice(0, limit);
       shownRows += shown.length;
       const lines = [...f.notes.map(note => `<font color='grey'>${escapeDiffMarkdown(displayDiffPath(note))}</font>`), ...shown.map(renderDiffRow)];
-      if (shown.length < f.rows.length) {
-        truncated = true;
-        lines.push(`<font color='grey'>预览已截断：展示 ${shown.length}/${f.rows.length} 行，完整内容请查看原始 diff 文件。</font>`);
-      }
+      const added = partial ? shown.filter(row => row.kind === '+').length : f.added;
+      const removed = partial ? shown.filter(row => row.kind === '-').length : f.removed;
+      previewStats.added += added; previewStats.removed += removed;
+      const longLine = shown.some(row => row.truncated || row.text.length > 1024);
+      const limited = partial || shown.length < f.rows.length || longLine;
+      truncated ||= limited;
+      const caption = limited ? `diff 超限，仅显示前${shown.length}行${partial ? '（计数仅预览）' : ''}${longLine ? '，长行已截断' : ''}。` : '';
       if (!lines.length) lines.push("<font color='grey'>无文本内容变化。</font>");
       elements.push({
         tag: 'collapsible_panel', expanded: false,
         header: {
-          title: {tag: 'markdown', content: `**${escapeDiffMarkdown(displayDiffPath(f.path))}** <font color='green'>+${f.added}</font> <font color='red'>-${f.removed}</font>`},
+          title: {tag: 'markdown', content: `**${escapeDiffMarkdown(displayDiffPath(f.path))}** <font color='green'>+${added}</font> <font color='red'>-${removed}</font>`},
           icon: {tag: 'standard_icon', token: 'down-small-ccm_outlined'},
           icon_position: 'right', icon_expanded_angle: -180,
         },
         border: {color: 'grey', corner_radius: '5px'}, padding: '8px 8px 8px 8px',
-        elements: [{tag: 'markdown', content: lines.join('\n')}],
+        elements: [
+          {tag: 'markdown', content: lines.join('\n')},
+          ...(caption ? [{tag: 'markdown', text_size: 'notation', content: `<font color='grey'>${caption}</font>`}] : []),
+        ],
       });
     }
-    if (count < files.length) elements.push({tag: 'markdown', content: `另外 ${files.length - count} 个文件未展开预览，完整内容请查看原始 diff 文件。`});
+    if (count < files.length) elements.push({tag: 'markdown', text_size: 'notation', content: `<font color='grey'>另有 ${files.length - count} 个已读取文件未展开预览，完整内容请查看原始 diff 文件。</font>`});
     const card = createReplyCard(elements);
-    return {card, bytes: Buffer.byteLength(JSON.stringify(card), 'utf8'), stats, preview: {files: count, rows: shownRows, truncated, omittedFiles: files.length - count}};
+    return {card, bytes: Buffer.byteLength(JSON.stringify(card), 'utf8'), statsScope: partial ? 'preview' : 'full', stats: partial ? previewStats : stats, preview: {files: count, rows: shownRows, truncated, omittedFiles: partial ? null : files.length - count, ...(partial ? { reason: 'input_too_large' as const, inputBytes } : {})}};
   }
   let result = assemble();
   while (result.bytes > DIFF_PREVIEW_BUDGET_BYTES && (limit > 1 || count > 0)) {

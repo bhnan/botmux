@@ -16,7 +16,7 @@ src/services/send-policy.ts：parseDiffFlag/diffUsageError；src/im/lark/md-card
 生成纯展示 schema 2.0，无 callback。dry-run 只本地解析并返回 JSON，不走会话/relay/provider。真实发送经过既有授权、路由、final、mention、预期链接、幂等和回放处理。与 --layout、--as、文档评论等组合沿用既有卡片边界。
 
 ## Failure modes and edge cases
-逐行解析最多2MiB，超大文件采用提示卡片并保留完整原文件；正常输入严格 UTF-8、hunk 数字和行数验证、Git quoted UTF-8、增删文件、rename/binary 说明、行数和字节双重截断。空 diff 不伪造变化。媒体/附件先单独交付再 final；不新增上传或补偿写操作。
+逐行解析最多2MiB，超大文件读取有界前缀并显示部分diff，用小灰字说明截断；保留完整原文件。正常输入严格 UTF-8、hunk 数字和行数验证、Git quoted UTF-8、增删文件、rename/binary 说明、行数和字节双重截断。空 diff 不伪造变化。媒体/附件先单独交付再 final；不新增上传或补偿写操作。
 
 ## Security, compliance, and operational rules
 用户内容仅作数据，无 shell。原始 diff 在调用时读取一次并作为确定性渲染输入。不会改变身份或 durable outbox 语义。live daemon 切换需单独授权（可能影响同机所有 Bot），实现和验证完成后再提交具体部署结果。
@@ -35,10 +35,26 @@ src/services/send-policy.ts：parseDiffFlag/diffUsageError；src/im/lark/md-card
 
 摘要现在经过通用 Markdown 正规化（例如清理末尾无显示意义的换行），CLI 用例对照同一 body builder 验证摘要优先级。diff 行内容的换行/转义保留原实现。
 
-## PR反馈修复：标题、错误及超大diff
+## 历史PR反馈修复：标题、错误及超大diff
+
+本节记录已推送的 f724276 版本；超大输入的完全省略方案已被下节“待审批修订”取代。
 
 - diff摘要继续使用通用Markdown显示，但去掉生成的宿主element_id，避免H1/H2标题触发custom final保留ID校验；不放宽全局自定义卡片校验。标题仍可见，回读不再保留该摘要的宿主层级ID。
 - CLI内统一卡片构建错误处理，正常发送、dry-run和relay均以单行原因+退出码2反馈用户输入或预算错误，不输出内部堆栈。
 - 文件超过2MiB时，不解析全文也不截到半个hunk；输出大小和预览上限说明卡片。stats的files/added/removed为null，preview.reason为input_too_large，明确统计不可用。完整文件不被修改，仍由Agent先交付附件/链接。
 - 文件stat检查后的读取结果也保留长度保护，文件增长时使用相同提示。直接调用parseUnifiedDiff的文本输入仍严格执行2MiB守卫。
 - diff与plugin-card-action的当前发送互斥已先补回归并验证，不增加callback能力。
+
+标题展示与原普通send一致：H1/H2均使用heading-2字号，H3-H6沿用正文加粗回退。本功能支持标题语法并修复final拒发，不新增diff专属样式或改变原send标题字号。
+
+## 超限仍保留部分diff（远端更新待审批）
+
+超2MiB时使用FD读取有界前缀，最多2MiB+1字节用于判断超限；只解码2MiB，UTF-8流式解码保留末尾字符边界。解析器仅在明确前缀模式允许EOF未完成hunk，非法内容仍拒绝，未完整尾部文件头不展示。
+
+保留原折叠文件面板，每文件最多60行；小灰字说明实际展示行数和计数仅预览。单长行显示前段并提示截断；卡片超过18KB时继续降低实际展示行或文件数。
+
+完整输入的statsScope=full，超限前缀的statsScope=preview，部分计数只统计显示的行，未知全量省略文件数为null。本轮只在本地实现与展示，远端更新待明确审批。
+
+## 摘要错误与Agent重试
+
+摘要超长时，命令原因简化为“摘要过长”，仍退出码2并在发送前结束。错误返回当前Agent；Agent精简摘要或表格后使用同一diff重试，必要时去掉可选摘要。程序不自动发送兜底话术或错误说明卡片。已成功发送不重发；本流程不新开Agent轮次，也不在CLI内运行模型。

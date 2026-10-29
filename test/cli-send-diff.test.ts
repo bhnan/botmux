@@ -81,7 +81,7 @@ describe('send --diff CLI', () => {
   });
 
   it.each([
-    { name: '摘要字节超限', summary: 'x'.repeat(4001), reason: '摘要超过 4000' },
+    { name: '摘要字节超限', summary: 'x'.repeat(4001), reason: '摘要过长' },
     {
       name: '表格渲染超预算',
       summary: [
@@ -100,26 +100,45 @@ describe('send --diff CLI', () => {
     expect(captured(result.stdout)).toHaveLength(0);
   });
 
-  it('shows a notice rather than false counts for a file larger than the preview limit', () => {
-    const input = '--- a/spec.md\n+++ b/spec.md\n@@ -0,0 +1 @@\n+' + 'x'.repeat(2 * 1024 * 1024) + '\n';
+  it('reads a bounded prefix and shows partial diff when the file exceeds the input budget', () => {
+    const rows = Array.from({ length: 100_000 }, (_, i) => '+requirement ' + i + ' with extra details');
+    const input = '--- a/spec.md\n+++ b/spec.md\n@@ -0,0 +1,100000 @@\n' + rows.join('\n') + '\n';
     const result = preview(['--diff', '@diff', '需求文档的完整差异较大。'], input, '', '', 'forbid_read');
     expect(result.status, String(result.stderr)).toBe(0);
     const output = JSON.parse(String(result.stdout));
     expect(output.diff.preview.reason).toBe('input_too_large');
-    expect(output.diff.stats).toEqual({ files: null, added: null, removed: null });
-    expect(JSON.stringify(output.card)).toContain('2 MiB');
+    expect(output.diff.statsScope).toBe('preview');
+    expect(output.diff.stats.added).toBeGreaterThan(0);
+    expect(JSON.stringify(output.card)).toContain('+requirement 0');
+    expect(JSON.stringify(output.card)).toContain('diff 超限，仅显示前60行');
     expect(JSON.stringify(output.card)).not.toContain('未检测到内容差异');
     expect(output.fits).toBe(true);
   });
 
-  it('shows the same notice when the diff grows between stat and reading', () => {
+  it('keeps a bounded partial line when the diff grows after the size check', () => {
     const result = preview(['--diff', '@diff'], patch, '', '', 'grow_after_stat');
     expect(result.status, String(result.stderr)).toBe(0);
     const output = JSON.parse(String(result.stdout));
     expect(output.diff.preview.reason).toBe('input_too_large');
     expect(output.diff.preview.inputBytes).toBeGreaterThan(2 * 1024 * 1024);
-    expect(output.diff.stats).toEqual({ files: null, added: null, removed: null });
+    expect(output.diff.statsScope).toBe('preview');
+    expect(output.diff.stats.added).toBe(1);
+    expect(JSON.stringify(output.card)).toContain('+xxx');
+    expect(JSON.stringify(output.card)).toContain('长行已截断');
     expect(output.fits).toBe(true);
+  });
+
+  it('keeps Unicode valid when the input budget ends inside a multibyte character', () => {
+    const header = '--- a/spec.md\n+++ b/spec.md\n@@ -0,0 +1 @@\n+';
+    const beginning = '😀需求';
+    const padding = 'a'.repeat(2 * 1024 * 1024 - Buffer.byteLength(header + beginning) - 1);
+    const input = header + beginning + padding + '😀尾部\n';
+    const result = preview(['--diff', '@diff'], input, '', '', 'forbid_read');
+    expect(result.status, String(result.stderr)).toBe(0);
+    const output = JSON.parse(String(result.stdout));
+    expect(output.diff.statsScope).toBe('preview');
+    expect(JSON.stringify(output.card)).toContain('😀需求');
+    expect(JSON.stringify(output.card)).not.toContain('\ufffd');
   });
 
   it.each([
@@ -160,7 +179,7 @@ describe('send --diff CLI', () => {
       expect(String(incompatiblePlugin.stderr)).toContain('--plugin-card-action');
       const oversizedSummary = run([], 'final', 'x'.repeat(4001));
       expect(oversizedSummary.status).toBe(2);
-      expect(String(oversizedSummary.stderr)).toContain('botmux send: 摘要超过 4000');
+      expect(String(oversizedSummary.stderr)).toContain('botmux send: 摘要过长');
       expect(String(oversizedSummary.stderr)).not.toMatch(/\n\s+at\s|md-card\.ts:\d/);
       expect(captured(oversizedSummary.stdout)).toHaveLength(0);
       const attention = run(['--attention=decision'], 'progress');
@@ -174,8 +193,7 @@ describe('send --diff CLI', () => {
       const card = JSON.parse(requests[0].body.content);
       expect(JSON.stringify(card)).toContain('已修改');
       expect(JSON.stringify(card)).not.toContain('botmux_md_h');
-      if (largeInput) expect(JSON.stringify(card)).toContain('已省略逐行预览');
-      else expect(card.body.elements.some((element: { tag: string }) => element.tag === 'collapsible_panel')).toBe(true);
+      expect(card.body.elements.some((element: { tag: string }) => element.tag === 'collapsible_panel')).toBe(true);
       expect(requests[0].body.content.match(/"element_id":"botmux_reply_footer"/g)).toHaveLength(1);
       expect((requests[0].body.content.match(/<at id=ou_requester>/g) ?? [])).toHaveLength(1);
       const replay = run();

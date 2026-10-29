@@ -21,17 +21,36 @@ if (forbiddenDiffRead) {
   syncBuiltinESMExports();
 }
 const growingDiff = process.env.BOTMUX_TEST_GROW_DIFF_AFTER_STAT;
-if (growingDiff) {
-  const originalStat = fs.statSync.bind(fs);
+if (growingDiff || forbiddenDiffRead) {
+  const watched = new Map<number, number>();
+  const originalOpen = fs.openSync.bind(fs);
+  const originalFstat = fs.fstatSync.bind(fs);
+  const originalRead = fs.readSync.bind(fs);
+  const originalClose = fs.closeSync.bind(fs);
   let grown = false;
-  fs.statSync = ((path: fs.PathLike, options?: unknown) => {
-    const result = originalStat(path, options as never);
-    if (String(path) === growingDiff && !grown) {
+  fs.openSync = ((...args: any[]) => {
+    const fd = (originalOpen as (...args: any[]) => number)(...args);
+    if (String(args[0]) === growingDiff || String(args[0]) === forbiddenDiffRead) watched.set(fd, 0);
+    return fd;
+  }) as typeof fs.openSync;
+  fs.fstatSync = ((...args: any[]) => {
+    const stat = (originalFstat as (...args: any[]) => fs.Stats)(...args);
+    if (watched.has(args[0]) && growingDiff && !grown) {
       grown = true;
-      fs.writeFileSync(growingDiff, '--- a/spec.md\n+++ b/spec.md\n@@ -0,0 +1 @@\n+' + 'x'.repeat(2 * 1024 * 1024) + '\n');
+      fs.writeFileSync(growingDiff, '--- a/spec.md\n+++ b/spec.md\n@@ -0,0 +1 @@\n+' + 'x'.repeat(3 * 1024 * 1024) + '\n');
     }
-    return result;
-  }) as typeof fs.statSync;
+    return stat;
+  }) as typeof fs.fstatSync;
+  fs.readSync = ((...args: any[]) => {
+    const alreadyRead = watched.get(args[0]);
+    if (alreadyRead !== undefined && args[3] > 2 * 1024 * 1024 + 1 - alreadyRead) {
+      throw new Error('diff prefix read exceeded its byte budget');
+    }
+    const bytes = (originalRead as (...args: any[]) => number)(...args);
+    if (alreadyRead !== undefined) watched.set(args[0], alreadyRead + bytes);
+    return bytes;
+  }) as typeof fs.readSync;
+  fs.closeSync = ((fd: number) => { watched.delete(fd); return originalClose(fd); }) as typeof fs.closeSync;
   syncBuiltinESMExports();
 }
 if ((globalThis as { Bun?: unknown }).Bun && (forbiddenDiffRead || growingDiff)) {
