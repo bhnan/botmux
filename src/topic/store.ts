@@ -183,7 +183,10 @@ export interface CommitSummaryMutationInput {
   expectedDeletionEpoch?: number;
   /** 提交成功后写入的源游标（编码后的不透明字符串）。 */
   nextCursor: string;
+  /** 本批最后一条源消息的 createTime（不是处理时刻）。 */
   sourceThroughAt: string;
+  /** 首次成功处理的源消息时间；已有值时不变。 */
+  coverageStartAt?: string;
   generatorKey: string;
   now: string;
 }
@@ -595,10 +598,22 @@ export function openTopicStore(options: OpenTopicStoreOptions = {}): TopicStore 
         const nextRevision = currentRevision + 1;
         db.prepare(
           `UPDATE topics
-              SET revision = ?, summarized_through_cursor = ?, source_through_at = ?,
+              SET revision = ?, summarized_through_cursor = ?,
+                  source_through_at = CASE
+                    WHEN source_through_at IS NULL OR source_through_at < ? THEN ? ELSE source_through_at END,
+                  coverage_start_at = COALESCE(coverage_start_at, ?),
                   last_checked_at = ?, updated_at = ?
             WHERE topic_key = ?`,
-        ).run(nextRevision, nextCursor, input.sourceThroughAt, input.now, input.now, input.topicKey);
+        ).run(
+          nextRevision,
+          nextCursor,
+          input.sourceThroughAt,
+          input.sourceThroughAt,
+          input.coverageStartAt ?? null,
+          input.now,
+          input.now,
+          input.topicKey,
+        );
 
         const topic = this.getTopic(input.topicKey);
         return {

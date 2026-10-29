@@ -134,7 +134,7 @@ describe('增量摘要更新', () => {
     expect(store.getTopic('thread:oc_1:om_1')!.summaries).toHaveLength(1);
   });
 
-  it('CAS 冲突后重读：语义前提已变的 update 被丢弃，add 仍然提交', async () => {
+  it('CAS 冲突时若另一写者已处理同批，不重放旧 add（不产生重复摘要）', async () => {
     // 先是已经有一批摘要
     await updateTopicFromSource(
       { store, source: fakeSource([{ messages: [message('om_1', 1)] }]), enricher: fakeEnricher([
@@ -143,41 +143,50 @@ describe('增量摘要更新', () => {
       entry,
       {},
     );
-    const existing = store.getTopic('thread:oc_1:om_1')!.summaries[0];
 
-    // 模型调用期间，另一个进程改了这条摘要并推进了 revision。
-    // 真实源会带上重叠窗口：om_1 仍在，om_2 是新增。
+    // 模型调用期间，另一个实例处理了同一批（om_2）并推进了游标与 revision。
     const source = fakeSource([{ messages: [message('om_1', 1), message('om_2', 2)] }]);
     const enricher: TopicEnricher = {
       generatorKey: 'test-model@v1',
       enrich: vi.fn(async () => {
         const topic = store.getTopic('thread:oc_1:om_1')!;
-        store.commitSummaryMutation({
+        const concurrent = store.commitSummaryMutation({
           topicKey: 'thread:oc_1:om_1',
           expectedRevision: topic.revision,
           mutations: [
-            { op: 'update', id: existing.id, text: '别人改的新正文', keywords: [], sourceMessageIds: ['om_9'] },
+            { op: 'add', text: '并发写入的摘要', keywords: [], sourceMessageIds: ['om_2'] },
           ],
-          nextCursor: encodeCursor({ createTime: message('om_2', 2).createTime, messageIds: ['om_2b'] }),
+          nextCursor: encodeCursor({ createTime: message('om_2', 2).createTime, messageIds: ['om_2'] }),
           sourceThroughAt: '2026-10-01T00:00:02.000Z',
           generatorKey: 'other-model@v1',
           now: '2026-10-01T00:00:09.000Z',
         });
+        expect(concurrent.status).toBe('committed');
         return {
           mutations: [
-            { op: 'update', id: existing.id, text: '基于旧正文的补充', keywords: [], sourceMessageIds: ['om_2'] },
-            { op: 'add', text: '新增事件', keywords: [], sourceMessageIds: ['om_2'] },
+            { op: 'add', text: '本实例的重复摘要', keywords: [], sourceMessageIds: ['om_2'] },
           ],
           generatorKey: 'test-model@v1',
         };
       }) as never,
     };
     const outcome = await updateTopicFromSource({ store, source, enricher }, entry, {});
+
+    // 对方已覆盖本批边界：按已处理收尾，绝不重放本实例的 add。
     expect(outcome.status).toBe('committed');
-    expect(outcome.added).toBe(1);
+    expect(outcome.added).toBe(0);
     expect(outcome.updated).toBe(0);
     const texts = store.getTopic('thread:oc_1:om_1')!.summaries.map(summary => summary.text).sort();
-    expect(texts).toEqual(['别人改的新正文', '新增事件']);
+    expect(texts).toEqual(['原始摘要', '并发写入的摘要']);
+
+    // 下一轮不会再补一条重复摘要。
+    const next = await updateTopicFromSource(
+      { store, source: fakeSource([{ messages: [message('om_1', 1), message('om_2', 2)] }]), enricher: fakeEnricher([]) },
+      entry,
+      {},
+    );
+    expect(next.status).toBe('no_increment');
+    expect(store.getTopic('thread:oc_1:om_1')!.summaries).toHaveLength(2);
   });
 
   it('整批都是已删除消息时用 noop 推进游标（否则会被永久重读）', async () => {
@@ -277,6 +286,40 @@ describe('增量摘要更新', () => {
       encodeCursor({ createTime: '2026-10-01T00:00:01.000Z', messageIds: ['om_0'] }),
     );
   });
+  it('sourceThroughAt / coverageStartAt 取消息时间，而不是处理时刻', async () => {
+    const older = { messageId: 'om_old', createTime: '2026-09-20T08:00:00.000Z', text: '九月决定' };
+    const newer = { messageId: 'om_new', createTime: '2026-09-21T08:00:00.000Z', text: '九月补充' };
+    const outcome = await updateTopicFromSource(
+      {
+        store,
+        source: fakeSource([{ messages: [older, newer] }]),
+        enricher: fakeEnricher([
+          { op: 'add', text: '九月决定', keywords: ['九月'], sourceMessageIds: ['om_old', 'om_new'] },
+        ]),
+        now: () => '2026-10-29T00:00:00.000Z',
+      },
+      entry,
+      {},
+    );
+    expect(outcome.status).toBe('committed');
+    const topic = store.getTopic('thread:oc_1:om_1')!;
+    expect(topic.coverageStartAt).toBe('2026-09-20T08:00:00.000Z');
+    expect(topic.sourceThroughAt).toBe('2026-09-21T08:00:00.000Z');
+
+    const search = createTopicSearchService({ store });
+    const inRange = await search.search(
+      { query: '九月', filters: { sourceFrom: '2026-09-20T00:00:00Z', sourceTo: '2026-09-21T23:59:59Z' } },
+      {},
+    );
+    expect(inRange.items).toHaveLength(1);
+    // 处理时刻是 10 月 29 日，但消息不在 10 月，日期筛选必须按消息时间判。
+    const outOfRange = await search.search(
+      { query: '九月', filters: { sourceFrom: '2026-10-01T00:00:00Z' } },
+      {},
+    );
+    expect(outOfRange.items).toEqual([]);
+  });
+
   it('已摘要消息被撤回后，下一轮删除旧摘要并正常摘要剩余消息', async () => {
     // 第 1 轮：om_100 被摘要，游标推进到它。
     await updateTopicFromSource(

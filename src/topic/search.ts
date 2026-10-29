@@ -50,8 +50,12 @@ export interface TopicSearchQuery {
 }
 
 export interface TopicSearchCaller {
-  /** 调用者被授权读取的群。空数组 = 什么都读不到（不是「全部」）。 */
-  allowedChatIds: readonly string[];
+  /**
+   * 调用者可见的群范围。**省略** = Dashboard 已认证，可读全部已保留历史话题；
+   * 空数组 = 明确什么都读不到（不是「全部」）。更新范围（`allowedChatIds`）与
+   * 历史检索范围不是一回事：群移出更新范围后，已保留的旧摘要仍应可检索。
+   */
+  visibleChatIds?: readonly string[];
 }
 
 export interface TopicSearchMatch {
@@ -180,6 +184,10 @@ function passesSourceTimeFilter(topic: Topic, sourceFrom: string | null, sourceT
   }
   if (sourceFrom && sourceThrough < Date.parse(sourceFrom)) return false;
   if (sourceTo && sourceThrough > Date.parse(sourceTo)) return false;
+  // 覆盖起点晚于筛选上界：该话题没有任何消息落在这个时间窗内，不能凭
+  // sourceThroughAt（最后一条）就把它当成窗口内的命中。
+  const coverageStart = topic.coverageStartAt ? Date.parse(topic.coverageStartAt) : NaN;
+  if (sourceTo && !Number.isNaN(coverageStart) && coverageStart > Date.parse(sourceTo)) return false;
   return true;
 }
 
@@ -215,9 +223,11 @@ export function createTopicSearchService(deps: TopicSearchDeps): TopicSearchServ
         throw new TopicSearchError('invalid_limit', `limit must be within 1..${hardLimit}`);
       }
       const filters = normalizeFilters(query.filters);
-      const allowed = new Set(caller.allowedChatIds.map(id => id.trim()).filter(Boolean));
-      if (allowed.size === 0) {
-        // 无授权 = 空结果，而不是「全库」；也不报错，避免被当成探测存在性的信号。
+      const visible = caller.visibleChatIds === undefined
+        ? null
+        : new Set(caller.visibleChatIds.map(id => id.trim()).filter(Boolean));
+      if (visible && visible.size === 0) {
+        // 明确无可见范围 = 空结果，而不是「全库」；也不报错，避免被当成探测存在性的信号。
         return {
           items: [],
           effectiveMode: 'keyword',
@@ -227,7 +237,7 @@ export function createTopicSearchService(deps: TopicSearchDeps): TopicSearchServ
         };
       }
       for (const chatId of filters.chatIds) {
-        if (!allowed.has(chatId)) {
+        if (visible && !visible.has(chatId)) {
           throw new TopicSearchError('forbidden', 'requested chat scope is not authorized');
         }
       }
@@ -242,14 +252,17 @@ export function createTopicSearchService(deps: TopicSearchDeps): TopicSearchServ
       const tokens = tokenizeQuery(rawQuery);
       if (tokens.length === 0) throw new TopicSearchError('invalid_query', 'query has no searchable token');
 
-      // 候选 = 授权群内 + 群过滤内。先过滤，后面才打分。
-      const allTopics = deps.store.listTopics({ limit: maxCandidates + 1 });
-      const budgetExceeded = allTopics.length > maxCandidates;
-      const candidates = allTopics
-        .slice(0, maxCandidates)
-        .filter(topic => allowed.has(chatIdOf(topic)))
+      // 候选 = 可见范围 + 群过滤 + 来源时间过滤。**先过滤再计预算**：否则范围外
+      // 或明显不匹配的记录会先占满 maxCandidates，把合法历史结果挤掉。
+      const allTopics = deps.store.listTopics();
+      const visibleTopics = visible
+        ? allTopics.filter(topic => visible.has(chatIdOf(topic)))
+        : allTopics;
+      const scopedTopics = visibleTopics
         .filter(topic => filters.chatIds.length === 0 || filters.chatIds.includes(chatIdOf(topic)))
         .filter(topic => passesSourceTimeFilter(topic, filters.sourceFrom, filters.sourceTo));
+      const budgetExceeded = scopedTopics.length > maxCandidates;
+      const candidates = scopedTopics.slice(0, maxCandidates);
 
       const degradedReasons: string[] = [];
       if (budgetExceeded) degradedReasons.push('candidate_budget_truncated');
@@ -391,9 +404,9 @@ export function createTopicSearchService(deps: TopicSearchDeps): TopicSearchServ
       if (knownTotal === undefined) {
         degradedReasons.push('coverage_unknown');
       } else {
-        const stored = deps.store
-          .listTopics({ limit: maxCandidates })
-          .filter(topic => allowed.has(chatIdOf(topic))).length;
+        const stored = visible
+          ? allTopics.filter(topic => visible.has(chatIdOf(topic))).length
+          : allTopics.length;
         unindexed = Math.max(0, knownTotal - stored);
         coverageState = unindexed === 0 ? 'complete' : 'partial';
       }

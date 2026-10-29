@@ -84,33 +84,6 @@ export function computeRetryAtIso(attempts: number, nowIso: string): string {
   return new Date(Date.parse(nowIso) + backoffMs).toISOString();
 }
 
-/**
- * 冲突重试时把 update 降级：目标摘要正文已被别处改写 → 这条 update 的语义前提没了，
- * 直接丢弃（等价 noop），而不是拿旧前提覆盖新正文。
- */
-function reconcileMutationsAfterConflict(
-  mutations: readonly SummaryMutation[],
-  before: Topic,
-  after: Topic,
-): SummaryMutation[] {
-  const beforeText = new Map(before.summaries.map(summary => [summary.id, summary.text]));
-  const afterIds = new Set(after.summaries.map(summary => summary.id));
-  const reconciled: SummaryMutation[] = [];
-  for (const mutation of mutations) {
-    if (mutation.op === 'noop') continue;
-    if (mutation.op === 'add') {
-      reconciled.push(mutation);
-      continue;
-    }
-    if (!afterIds.has(mutation.id)) continue;
-    const original = beforeText.get(mutation.id);
-    const current = after.summaries.find(summary => summary.id === mutation.id)?.text;
-    if (original === undefined || current !== original) continue;
-    reconciled.push(mutation);
-  }
-  return reconciled.length > 0 ? reconciled : [{ op: 'noop' }];
-}
-
 function buildRequest(
   topic: Topic,
   messages: ReadonlyArray<{ messageId: string; createTime: string; text: string; senderName?: string }>,
@@ -162,7 +135,6 @@ export async function updateTopicFromSource(
     title: entry.title,
     accessPolicyRef: entry.accessPolicyRef,
     now: now(),
-    coverageStartAt: now(),
   });
 
   const topic = deps.store.getTopic(topicKey);
@@ -228,6 +200,12 @@ export async function updateTopicFromSource(
 
   const normalized = normalizeSourceMessages(page.messages);
   const checkedAt = now();
+  // 源时间必须取消息自己的 createTime：用处理时刻会让「10 月 1 日消息在 10 月 29 日
+  // 才处理」被记成 10 月 29 日，日期筛选直接错位。
+  const earliestSourceAt = normalized.reduce(
+    (earliest, message) => (!earliest || message.createTime < earliest ? message.createTime : earliest),
+    '',
+  );
   const sourceMessageTimes: Record<string, string> = {};
   for (const message of normalized) sourceMessageTimes[message.messageId] = message.createTime;
 
@@ -303,6 +281,10 @@ export async function updateTopicFromSource(
   invalidate(deletedIds);
 
   const deletionEpoch = deps.store.deletionEpoch(topicKey);
+  const batchThroughAt = selection.nextCursor?.createTime
+    ?? currentTopic.sourceThroughAt
+    ?? checkedAt;
+  const coverageStartAt = currentTopic.coverageStartAt ?? (earliestSourceAt || undefined);
 
   const failAfterCommitError = (errorCode: string, batchSize: number): UpdateTopicOutcome => {
     const at = now();
@@ -359,7 +341,8 @@ export async function updateTopicFromSource(
       mutations: [{ op: 'noop' }],
       sourceMessageTimes,
       nextCursor,
-      sourceThroughAt: checkedAt,
+      sourceThroughAt: batchThroughAt,
+      ...(coverageStartAt ? { coverageStartAt } : {}),
       generatorKey: deps.enricher.generatorKey,
       now: checkedAt,
     });
@@ -409,7 +392,8 @@ export async function updateTopicFromSource(
     mutations,
     sourceMessageTimes,
     nextCursor,
-    sourceThroughAt: checkedAt,
+    sourceThroughAt: batchThroughAt,
+    ...(coverageStartAt ? { coverageStartAt } : {}),
     generatorKey: deps.enricher.generatorKey,
     now: checkedAt,
   });
@@ -430,36 +414,24 @@ export async function updateTopicFromSource(
   }
 
   if (result.status === 'conflict') {
-    // 冲突重读：把语义前提已变的 update 丢掉，再提交一次；不重跑模型（模型结果仍有效）。
-    const fresh = deps.store.getTopic(topicKey);
-    if (!fresh) {
-      return { topicKey, status: 'conflict', batchSize: selection.batch.length, added: 0, updated: 0, cursorAdvanced: false };
+    // 失效可能同时改了 revision 和 epoch：先判 epoch，别让重试路径绕过。
+    if (deps.store.deletionEpoch(topicKey) !== deletionEpoch) {
+      return failAfterCommitError('stale_epoch', selection.batch.length);
     }
-    const reconciled = reconcileMutationsAfterConflict(mutations, currentTopic, fresh);
-    const retried = commit({
-      topicKey,
-      expectedRevision: fresh.revision,
-      // 必须沿用 enrich 前捕获的 epoch：若期间发生过失效，revision 冲突会让重试
-      // 读到新 epoch，从而把基于旧快照的结果放进来。
-      expectedDeletionEpoch: deletionEpoch,
-      mutations: reconciled,
-      sourceMessageTimes,
-      nextCursor,
-      sourceThroughAt: checkedAt,
-      generatorKey: deps.enricher.generatorKey,
-      now: checkedAt,
-    });
-    if (!retried) return failAfterCommitError('commit_failed', selection.batch.length);
-    if (retried.status === 'blocked') return failAfterCommitError(retried.reason, selection.batch.length);
-    if (retried.status === 'committed') {
+    const fresh = deps.store.getTopic(topicKey);
+    const freshCursor = decodeCursor(fresh?.summarizedThroughCursor);
+    // 另一个写者已经把游标推过本批边界：这批消息按「已处理」收尾，
+    // **绝不重放旧 add**（那正是并发重复摘要的来源）。模型结果直接丢弃，
+    // 下一轮从新游标重新切增量；若它其实没处理完，下一轮会补上。
+    if (freshCursor && selection.nextCursor && freshCursor.createTime >= selection.nextCursor.createTime) {
       deps.store.clearJobFailure(topicKey, checkedAt);
       return {
         topicKey,
         status: 'committed',
         batchSize: selection.batch.length,
-        added: retried.applied.added,
-        updated: retried.applied.updated,
-        cursorAdvanced: true,
+        added: 0,
+        updated: 0,
+        cursorAdvanced: false,
         ...(invalidated > 0 ? { invalidated } : {}),
       };
     }

@@ -16,6 +16,7 @@ import {
 } from './config.js';
 import { createTopicEmbedder, type TopicEmbedder, type TopicEmbeddingEndpoint } from './embedding-client.js';
 import { createTopicEnricher, type TopicEnricher, type TopicModelEndpoint } from './model-client.js';
+import { threadTopicKey } from './identity.js';
 import { createTopicScheduler, type TopicRunReport, type TopicScheduler, type TopicTickOutcome } from './scheduler.js';
 import { createTopicSearchService, type TopicSearchService } from './search.js';
 import type { TopicHistoryReader } from './source.js';
@@ -114,27 +115,37 @@ export function createTopicRuntime(deps: TopicRuntimeDeps): TopicRuntime {
     const activeStore = ensureStore();
     const allowedChats = new Set(config.allowedChatIds);
     const entries = (await deps.source.discoverTopics()).filter(entry => allowedChats.has(entry.chatId));
+
+    const nowIso = now();
+    const skipUntil = backoffFilter(activeStore, nowIso);
+    // 退避中的话题不占本轮预算，否则 maxTopicsPerRun=1 时队首失败项会把其它话题
+    // 永久堵死。失败尝试也会更新 job.updatedAt，恢复后按「最久没尝试」排到后面，
+    // 不把失败位置当成成功摘要游标。
+    const due = entries.filter(entry => !skipUntil(threadTopicKey(entry.chatId, entry.rootMessageId)));
+    const budget = Math.max(1, config.maxTopicsPerRun);
+    const ordered = due
+      .map(entry => {
+        const key = threadTopicKey(entry.chatId, entry.rootMessageId);
+        const topic = activeStore.getTopic(key);
+        const lastChecked = topic?.lastCheckedAt ? Date.parse(topic.lastCheckedAt) : 0;
+        const lastAttempt = activeStore.jobState(key)?.updatedAt;
+        const lastAttemptMs = lastAttempt ? Date.parse(lastAttempt) : 0;
+        const lastTouched = Math.max(
+          Number.isNaN(lastChecked) ? 0 : lastChecked,
+          Number.isNaN(lastAttemptMs) ? 0 : lastAttemptMs,
+        );
+        return { entry, lastTouched };
+      })
+      .sort((a, b) => a.lastTouched - b.lastTouched);
+
     const report: TopicRunReport = {
       topicsChecked: 0,
       topicsUpdated: 0,
       topicsSkipped: 0,
       topicsFailed: 0,
       pendingEmbeddings: 0,
-      truncated: entries.length > config.maxTopicsPerRun,
+      truncated: ordered.length > budget,
     };
-
-    const budget = Math.max(1, config.maxTopicsPerRun);
-    // 公平游标：按「最久没检查」排序，避免大量历史话题把新话题饿死。
-    const ordered = [...entries]
-      .map(entry => {
-        const key = `thread:${encodeURIComponent(entry.chatId)}:${encodeURIComponent(entry.rootMessageId)}`;
-        const topic = activeStore.getTopic(key);
-        const lastChecked = topic?.lastCheckedAt ? Date.parse(topic.lastCheckedAt) : 0;
-        return { entry, lastChecked: Number.isNaN(lastChecked) ? 0 : lastChecked };
-      })
-      .sort((a, b) => a.lastChecked - b.lastChecked);
-
-    const skipUntil = backoffFilter(activeStore, now());
     const concurrency = Math.max(1, Math.min(config.maxConcurrentTopics, 4));
     const queue = ordered.slice(0, budget);
 

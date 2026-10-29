@@ -4361,8 +4361,9 @@ const server = createServer(async (req, res) => {
       const handled = await handleTopicSearchRequest(req, url, {
         // 访问范围：本仓库没有 per-user chat ACL——能过上面认证 gate 的身份就是
         // 宿主可见范围（匿名/只读访客在 gate 处已被 401）。因此这里给部署级
-        // `allowedChatIds`，由 SearchService 再做交集与越权拒绝（filters 只能缩小）。
-        authorize: () => ({ ok: true as const, allowedChatIds: topicSearchConfig().config.allowedChatIds }),
+        // Dashboard 认证 gate 已经限定可见范围；`topicSearch.allowedChatIds` 只是
+        // 「更新哪些群」的扫描范围，不能拿来做历史检索的准入（否则群移出后会丢旧历史）。
+        authorize: () => ({ ok: true as const }),
         search: async (query, caller) => {
           const runtime = await ensureTopicSearchRuntime();
           if (!runtime) throw new Error('topic_search_runtime_unavailable');

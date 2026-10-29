@@ -27,7 +27,15 @@ export const TOPIC_SEARCH_ROUTE = '/api/topic-search';
 
 /** Dashboard 侧给出的访问决定：要么给出可见群范围，要么明确拒绝。 */
 export type TopicSearchAccessDecision =
-  | { ok: true; allowedChatIds: readonly string[] }
+  | {
+    ok: true;
+    /**
+     * 可选的可见群范围。省略 = Dashboard 已认证，可读全部已保留历史话题；
+     * 这里不是「更新范围」（`topicSearch.allowedChatIds`），群移出更新范围后
+     * 旧摘要仍应可检索。
+     */
+    visibleChatIds?: readonly string[];
+  }
   | { ok: false; status: 401 | 403; error: string };
 
 export interface TopicSearchRouteDeps {
@@ -183,7 +191,9 @@ export async function handleTopicSearchRequest(
   }
 
   try {
-    const result: TopicSearchResponse = await deps.search(query, { allowedChatIds: access.allowedChatIds });
+    const result: TopicSearchResponse = await deps.search(query, {
+      ...(access.visibleChatIds ? { visibleChatIds: access.visibleChatIds } : {}),
+    });
     const now = deps.now ?? (() => new Date().toISOString());
     return { status: 200, body: { ok: true, generatedAt: now(), ...result } };
   } catch (error) {

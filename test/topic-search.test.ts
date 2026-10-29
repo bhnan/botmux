@@ -75,7 +75,7 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-const allChats = { allowedChatIds: ['oc_1', 'oc_2'] };
+const allChats = { visibleChatIds: ['oc_1', 'oc_2'] };
 
 describe('关键词检索', () => {
   it('按话题去重返回，并带命中摘要与来源消息', async () => {
@@ -100,23 +100,49 @@ describe('关键词检索', () => {
     expect(result.items.map(item => item.title)).toEqual(['支付超时排障']);
   });
 
-  it('候选先按授权范围收窄：不允许的群即使命中也不返回', async () => {
-    const scoped = await service().search({ query: '沙箱' }, { allowedChatIds: ['oc_1'] });
+  it('显式可见范围仍然先收窄：范围外的群即使命中也不返回', async () => {
+    const scoped = await service().search({ query: '沙箱' }, { visibleChatIds: ['oc_1'] });
     expect(scoped.items).toEqual([]);
     const full = await service().search({ query: '沙箱' }, allChats);
     expect(full.items.map(item => item.title)).toEqual(['沙箱文件策略']);
   });
 
-  it('无授权范围返回空结果而不是全库', async () => {
-    const result = await service().search({ query: 'owner' }, { allowedChatIds: [] });
+  it('省略可见范围 = Dashboard 已认证可读全部历史（更新范围不参与检索准入）', async () => {
+    const result = await service().search({ query: '沙箱' }, {});
+    expect(result.items.map(item => item.title)).toEqual(['沙箱文件策略']);
+  });
+
+  it('无可见范围返回空结果而不是全库', async () => {
+    const result = await service().search({ query: 'owner' }, { visibleChatIds: [] });
     expect(result.items).toEqual([]);
     expect(result.degradedReasons).toContain('no_authorized_scope');
   });
 
-  it('请求未授权的 chat 过滤直接 403（不能借过滤提权）', async () => {
+  it('请求可见范围外的 chat 过滤直接 403（不能借过滤提权）', async () => {
     await expect(
       service().search({ query: 'owner', filters: { chatIds: ['oc_9'] } }, allChats),
     ).rejects.toMatchObject({ code: 'forbidden' });
+  });
+
+  it('候选预算在过滤之后才计数：范围外话题不能挤掉授权内的命中', async () => {
+    // topic_key 排序下 oc_0 会排在 oc_1 前面；预算 1 时旧实现会先截到 oc_0。
+    addTopic(
+      { chatId: 'oc_0', rootMessageId: 'om_0' },
+      '范围外旧话题',
+      { text: 'owner 相关但不可见的历史讨论', keywords: ['owner'] },
+    );
+    const result = await service({ maxCandidateTopics: 1 })
+      .search({ query: 'owner' }, { visibleChatIds: ['oc_1'] });
+    expect(result.items.map(item => item.title)).toEqual(['跨 bot owner 校验']);
+    // 预算按可见候选计（oc_1 有 2 个话题），所以仍会标 partial；关键是范围外的 oc_0
+    // 没有把唯一预算名额占掉。
+    expect(result.coverage.state).toBe('partial');
+  });
+
+  it('有效候选超出预算时明确 partial，而不是静默截断', async () => {
+    const result = await service({ maxCandidateTopics: 1 })
+      .search({ query: 'owner' }, { visibleChatIds: ['oc_1'] });
+    expect(result.degradedReasons).toContain('candidate_budget_truncated');
   });
 
   it('mode=keyword 时不请求向量', async () => {

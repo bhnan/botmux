@@ -34,7 +34,7 @@ const searchResult = {
 
 function deps(overrides: Partial<TopicSearchRouteDeps> = {}): TopicSearchRouteDeps {
   return {
-    authorize: () => ({ ok: true, allowedChatIds: ['oc_1'] }),
+    authorize: () => ({ ok: true }),
     search: vi.fn(async () => searchResult),
     config: () => enabledConfig,
     // 注入 body 读取，测试里完全绕开真实 socket。
@@ -147,7 +147,7 @@ describe('话题检索路由：响应与错误映射', () => {
       url(),
       deps({
         search,
-        authorize: () => ({ ok: true, allowedChatIds: ['oc_1', 'oc_2'] }),
+        authorize: () => ({ ok: true, visibleChatIds: ['oc_1', 'oc_2'] }),
         readJsonBody: async () => ({ query: 'owner', mode: 'keyword', limit: 2 }),
       }),
     );
@@ -155,8 +155,14 @@ describe('话题检索路由：响应与错误映射', () => {
     expect(result?.body).toMatchObject({ ok: true, generatedAt: '2026-10-01T00:00:00.000Z', ...searchResult });
     expect(search).toHaveBeenCalledWith(
       { query: 'owner', mode: 'keyword', limit: 2 },
-      { allowedChatIds: ['oc_1', 'oc_2'] },
+      { visibleChatIds: ['oc_1', 'oc_2'] },
     );
+  });
+
+  it('Dashboard 认证但不额外限制可见群时，不向 SearchService 传空范围', async () => {
+    const search = vi.fn(async () => searchResult);
+    await handleTopicSearchRequest(req(), url(), deps({ search }));
+    expect(search).toHaveBeenCalledWith({ query: 'owner' }, {});
   });
 
   it('检索层错误映射为 403/429/400，未知异常映射 503 且不泄露细节', async () => {

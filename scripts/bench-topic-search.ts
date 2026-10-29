@@ -129,7 +129,7 @@ async function main(): Promise<void> {
       topicUrl: topic => `https://example.test/topic/${topic.rootMessageId}`,
     });
     const allowedChatIds = Array.from({ length: CHAT_COUNT }, (_, index) => `oc_group_${index}`);
-    const caller = { allowedChatIds };
+    const caller = { visibleChatIds: allowedChatIds };
 
     // Deterministic spread over the corpus (stride keeps targets from clustering).
     const queryIndexes = Array.from({ length: QUERY_COUNT }, (_, index) =>
