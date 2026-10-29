@@ -26,3 +26,5 @@
 重构授权：用户明确要求与 attention/urgent 保持代码位置和实现方式一致；具体计划见 refactor-plan.md。删除独立命令 helper 和重复参数解析，继续只提交本地 commit，PR/push/部署暂缓。
 
 卡片模块进一步合并：已移除独立 diff-card.ts 与独立 DiffCard 外壳类型。diff 正文和摘要使用 md-card 内现有构建函数，整张卡片配置使用 createReplyCard。diff 用例合并到 md-card.test.ts；本轮卡片模块及发送相关检查为 448 项通过、2 项 Linux 专用跳过，开发版完整构建通过；v3.54.0 候选核心检查 264 项通过。
+
+本机试用与草稿PR授权：本机同版本候选已切换、实际演示发送成功，试用反馈展示可用；当前已授权推送功能分支和创建draft PR，正式合并与发版尚未执行。
