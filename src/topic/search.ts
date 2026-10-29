@@ -208,39 +208,51 @@ function cursorSignature(input: {
   timeField: TopicTimeField | null;
   timeFrom: string | null;
   timeTo: string | null;
-  indexVersion: string;
 }): string {
   return JSON.stringify(input);
 }
 
-function encodeSearchCursor(payload: {
-  signature: string;
-  offset: number;
-  exp: number;
-}): string {
-  return Buffer.from(JSON.stringify({ v: 1, ...payload }), 'utf8').toString('base64url');
+type SearchCursorPayload =
+  | { signature: string; exp: number; kind: 'offset'; offset: number }
+  | {
+    signature: string;
+    exp: number;
+    kind: 'keyset';
+    field: TopicTimeField;
+    time: number;
+    key: string;
+  };
+
+function encodeSearchCursor(payload: SearchCursorPayload): string {
+  return Buffer.from(JSON.stringify({ v: 2, ...payload }), 'utf8').toString('base64url');
 }
 
-function decodeSearchCursor(
-  value: string,
-): { signature: string; offset: number; exp: number } {
+function decodeSearchCursor(value: string): SearchCursorPayload {
   if (!value) throw new TopicSearchError('invalid_cursor', 'cursor is empty');
   try {
-    const parsed = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as {
-      v?: unknown;
-      signature?: unknown;
-      offset?: unknown;
-      exp?: unknown;
-    };
-    if (
-      parsed.v !== 1 ||
-      typeof parsed.signature !== 'string' ||
-      typeof parsed.offset !== 'number' ||
-      typeof parsed.exp !== 'number'
-    ) {
+    const parsed = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as Record<string, unknown>;
+    if (parsed.v !== 2 || typeof parsed.signature !== 'string' || typeof parsed.exp !== 'number') {
       throw new Error('bad cursor shape');
     }
-    return { signature: parsed.signature, offset: parsed.offset, exp: parsed.exp };
+    if (parsed.kind === 'offset' && typeof parsed.offset === 'number') {
+      return { signature: parsed.signature, exp: parsed.exp, kind: 'offset', offset: parsed.offset };
+    }
+    if (
+      parsed.kind === 'keyset'
+      && (parsed.field === 'created' || parsed.field === 'latestMessage')
+      && typeof parsed.time === 'number'
+      && typeof parsed.key === 'string'
+    ) {
+      return {
+        signature: parsed.signature,
+        exp: parsed.exp,
+        kind: 'keyset',
+        field: parsed.field,
+        time: parsed.time,
+        key: parsed.key,
+      };
+    }
+    throw new Error('bad cursor shape');
   } catch {
     throw new TopicSearchError('invalid_cursor', 'cursor is not decodable');
   }
@@ -326,7 +338,11 @@ export function createTopicSearchService(deps: TopicSearchDeps): TopicSearchServ
       const chatScopedTopics = visibleTopics
         .filter(topic => filters.chatIds.length === 0 || filters.chatIds.includes(chatIdOf(topic)));
       const unknownTimeTopics = effectiveTimeFilter
-        ? chatScopedTopics.filter(topic => !topicTimeOf(topic, effectiveTimeFilter.field)).length
+        ? chatScopedTopics.filter(topic => {
+          const value = topicTimeOf(topic, effectiveTimeFilter.field);
+          // 缺失或无法解析都视为「时间不可用」：过滤与 coverage 用同一判定。
+          return !value || Number.isNaN(Date.parse(value));
+        }).length
         : 0;
       const scopedTopics = chatScopedTopics.filter(topic => passesTopicTimeFilter(topic, effectiveTimeFilter));
       const budgetExceeded = scopedTopics.length > maxCandidates;
@@ -337,18 +353,7 @@ export function createTopicSearchService(deps: TopicSearchDeps): TopicSearchServ
       if (timeFilter.legacyMapped) degradedReasons.push('legacy_time_filter_mapped');
       if (unknownTimeTopics > 0) degradedReasons.push('time_metadata_unknown');
 
-      const indexVersion = JSON.stringify({
-        topics: candidates.length,
-        latestUpdatedAt: candidates.reduce((max, topic) => {
-          const parsed = Date.parse(topic.updatedAt);
-          return Number.isNaN(parsed) ? max : Math.max(max, parsed);
-        }, 0),
-        summaries: candidates.reduce((total, topic) => total + topic.summaries.length, 0),
-        latestMessageAt: candidates.reduce((max, topic) => {
-          const parsed = topic.latestMessageAt ? Date.parse(topic.latestMessageAt) : NaN;
-          return Number.isNaN(parsed) ? max : Math.max(max, parsed);
-        }, 0),
-      });
+      const hasTokens = tokens.length > 0;
       const signature = cursorSignature({
         query: normalizeKeywordText(rawQuery),
         mode: requestedMode,
@@ -356,20 +361,29 @@ export function createTopicSearchService(deps: TopicSearchDeps): TopicSearchServ
         timeField: effectiveTimeFilter?.field ?? null,
         timeFrom: effectiveTimeFilter?.from ?? null,
         timeTo: effectiveTimeFilter?.to ?? null,
-        indexVersion,
       });
       let offset = 0;
+      let keyset: Extract<SearchCursorPayload, { kind: 'keyset' }> | null = null;
       if (query.cursor) {
         const cursor = decodeSearchCursor(query.cursor);
         if (cursor.exp < Date.now()) throw new TopicSearchError('invalid_cursor', 'cursor expired');
         if (cursor.signature !== signature) {
           throw new TopicSearchError('invalid_cursor', 'cursor does not match this query');
         }
-        offset = cursor.offset;
+        if (!hasTokens) {
+          if (cursor.kind !== 'keyset' || cursor.field !== effectiveTimeFilter?.field) {
+            throw new TopicSearchError('invalid_cursor', 'cursor does not match this time filter');
+          }
+          keyset = cursor;
+        } else {
+          if (cursor.kind !== 'offset') {
+            throw new TopicSearchError('invalid_cursor', 'cursor does not match this query');
+          }
+          offset = cursor.offset;
+        }
       }
 
       // 关键词通道（纯日期筛选时没有关键词，直接跳过）
-      const hasTokens = tokens.length > 0;
       const keywordScores = new Map<string, { topic: Topic; match: KeywordTopicMatch }>();
       if (hasTokens) {
         for (const topic of candidates) {
@@ -419,17 +433,33 @@ export function createTopicSearchService(deps: TopicSearchDeps): TopicSearchServ
       const effectiveMode: 'keyword' | 'hybrid' =
         requestedMode === 'keyword' || !vectorRanked || vectorRanked.length === 0 ? 'keyword' : 'hybrid';
 
-      let ordered: string[];
+      let page: string[];
+      let nextCursor: string | null;
       if (!hasTokens && effectiveTimeFilter) {
         // 纯日期筛选：按用户所选口径倒序（最新在前），同值按 topicKey 稳定排序。
         const field = effectiveTimeFilter.field;
-        ordered = [...candidates]
-          .sort((a, b) => {
-            const left = Date.parse(topicTimeOf(a, field) ?? '') || 0;
-            const right = Date.parse(topicTimeOf(b, field) ?? '') || 0;
-            return right - left || a.topicKey.localeCompare(b.topicKey);
+        const selectedTime = (topic: Topic): number => Date.parse(topicTimeOf(topic, field) ?? '');
+        const sorted = [...candidates]
+          .sort((a, b) => selectedTime(b) - selectedTime(a) || a.topicKey.localeCompare(b.topicKey));
+        const remaining = keyset
+          ? sorted.filter(topic => {
+            const at = selectedTime(topic);
+            return at < keyset!.time || (at === keyset!.time && topic.topicKey > keyset!.key);
           })
-          .map(topic => topic.topicKey);
+          : sorted;
+        const pageTopics = remaining.slice(0, limit);
+        page = pageTopics.map(topic => topic.topicKey);
+        const last = pageTopics[pageTopics.length - 1];
+        nextCursor = remaining.length > limit && last
+          ? encodeSearchCursor({
+            signature,
+            exp: Date.now() + CURSOR_TTL_MS,
+            kind: 'keyset',
+            field,
+            time: selectedTime(last),
+            key: last.topicKey,
+          })
+          : null;
       } else {
         let fused: Map<string, number>;
         if (effectiveMode === 'hybrid' && vectorRanked) {
@@ -437,15 +467,19 @@ export function createTopicSearchService(deps: TopicSearchDeps): TopicSearchServ
         } else {
           fused = new Map(keywordRanked.map(entry => [entry.key, entry.score]));
         }
-        ordered = [...fused.entries()]
+        const ordered = [...fused.entries()]
           .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
           .map(([key]) => key);
-      }
-      const page = ordered.slice(offset, offset + limit);
-      const nextCursor =
-        ordered.length > offset + limit
-          ? encodeSearchCursor({ signature, offset: offset + limit, exp: Date.now() + CURSOR_TTL_MS })
+        page = ordered.slice(offset, offset + limit);
+        nextCursor = ordered.length > offset + limit
+          ? encodeSearchCursor({
+            signature,
+            exp: Date.now() + CURSOR_TTL_MS,
+            kind: 'offset',
+            offset: offset + limit,
+          })
           : null;
+      }
 
       const topicByKey = new Map(candidates.map(topic => [topic.topicKey, topic]));
       const items: TopicSearchItem[] = [];

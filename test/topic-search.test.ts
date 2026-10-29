@@ -217,6 +217,39 @@ describe('话题时间筛选', () => {
     }, {})).rejects.toMatchObject({ code: 'invalid_cursor' });
   });
 
+  it('分页期间后台写入最新消息不会让纯日期游标失效', async () => {
+    meta('om_1', '2026-10-01T00:00:00.000Z', '2026-10-03T00:00:00.000Z');
+    meta('om_2', '2026-10-01T00:00:00.000Z', '2026-10-04T00:00:00.000Z');
+    meta('om_3', '2026-10-01T00:00:00.000Z', '2026-10-02T00:00:00.000Z');
+    const filter = { field: 'latestMessage' as const, from: '2026-10-01T00:00:00Z', to: '2026-10-05T00:00:00Z' };
+    const page1 = await service().search({ query: '', limit: 1, timeFilter: filter }, {});
+    expect(page1.items.map(item => item.topicKey)).toEqual(['thread:oc_1:om_2']);
+    expect(page1.nextCursor).toBeTruthy();
+
+    // 后台 updater 记录到新消息（即使摘要失败也会写 latest），把 om_1 推到游标之前。
+    meta('om_1', '2026-10-01T00:00:00.000Z', '2026-10-05T00:00:00.000Z');
+    const page2 = await service().search({
+      query: '', limit: 1, cursor: page1.nextCursor, timeFilter: filter,
+    }, {});
+    expect(page2.items.map(item => item.topicKey)).toEqual(['thread:oc_2:om_3']);
+  });
+
+  it('无法解析的时间按未知处理：排除并计入 coverage', async () => {
+    meta('om_1', '2026-10-01T00:00:00.000Z', '2026-10-03T00:00:00.000Z');
+    store.recordSourceMetadata({
+      topicKey: 'thread:oc_1:om_2',
+      latestMessageAt: 'not-a-date',
+      now: '2026-10-03T00:00:00.000Z',
+    });
+    const result = await service().search({
+      query: '',
+      timeFilter: { field: 'latestMessage', from: '2026-10-01T00:00:00Z', to: '2026-10-05T00:00:00Z' },
+    }, {});
+    expect(result.items.map(item => item.topicKey)).toEqual(['thread:oc_1:om_1']);
+    // om_2 不可解析、om_3 缺失 → 两个都算未知。
+    expect(result.coverage.unknownTimeTopics).toBe(2);
+  });
+
   it('时间未知的话题被排除，并在 coverage 里明确计数', async () => {
     meta('om_1', '2026-10-01T00:00:00.000Z', '2026-10-03T00:00:00.000Z');
     const result = await service().search({

@@ -33851,6 +33851,10 @@ body:has(.workbench-route-host) { min-width: 0; }
   line-height: 1.5;
 }
 
+.sessions-filter-hint.error {
+  color: var(--warning);
+}
+
 .sessions-filter-cli {
   display: grid;
   gap: var(--sp-2);

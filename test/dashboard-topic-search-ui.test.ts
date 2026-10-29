@@ -7,6 +7,7 @@ import {
   initialTopicSearchState,
   requestTopicSearch,
   topicSearchReducer,
+  topicTimeFilterIssue,
   topicTimeFilterKey,
   type TopicSearchAction,
   type TopicSearchHit,
@@ -279,6 +280,25 @@ describe('topic content search request handling', () => {
     expect(state.loadingMore).toBe(false);
     expect(state.items.map(item => item.topicKey)).toEqual(['thread:oc:om_1']);
     expect(state.nextCursor).toBe('cursor-2');
+  });
+
+  it('日期筛选的界面校验不会静默丢弃已填写条件', () => {
+    const base = { topicTimeField: '', topicTimeFrom: '', topicTimeTo: '' } as const;
+    expect(topicTimeFilterIssue({ ...base } as never)).toBeNull();
+    expect(topicTimeFilterIssue({ ...base, topicTimeField: 'created' } as never)).toBe('need_range');
+    expect(topicTimeFilterIssue({ ...base, topicTimeFrom: '2026-10-01' } as never)).toBe('need_field');
+    expect(topicTimeFilterIssue({
+      ...base,
+      topicTimeField: 'latestMessage',
+      topicTimeFrom: '2026-10-05',
+      topicTimeTo: '2026-10-01',
+    } as never)).toBe('invalid_range');
+    expect(topicTimeFilterIssue({
+      ...base,
+      topicTimeField: 'latestMessage',
+      topicTimeFrom: '2026-10-01',
+      topicTimeTo: '2026-10-03',
+    } as never)).toBeNull();
   });
 
   it('纯日期筛选：空关键词也发请求，并携带 timeFilter 与独立 key', async () => {

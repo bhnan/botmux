@@ -132,7 +132,7 @@ import { controlCsrfHeaders } from './control-csrf.js';
 
 type SessionRow = Record<string, any> & { sessionId: string; status: string };
 
-type FiltersState = {
+export type FiltersState = {
   q: string;
   status: string;
   adopt: string;
@@ -167,6 +167,15 @@ function topicTimeFilterFromFilters(filters: FiltersState): TopicSearchTimeFilte
   if (!from && !to) return null;
   if (from && to && Date.parse(from) > Date.parse(to)) return null;
   return { field: filters.topicTimeField, from, to };
+}
+
+/** 日期筛选的界面校验：不要静默丢弃用户已经填写的条件。 */
+export function topicTimeFilterIssue(filters: FiltersState): 'need_field' | 'need_range' | 'invalid_range' | null {
+  const hasDates = Boolean(filters.topicTimeFrom.trim() || filters.topicTimeTo.trim());
+  if (!hasDates) return filters.topicTimeField ? 'need_range' : null;
+  if (!filters.topicTimeField) return 'need_field';
+  if (topicTimeFilterFromFilters(filters)) return null;
+  return 'invalid_range';
 }
 
 type ChatBotsMap = Map<string, { botIds: Set<string>; observedNames: Set<string> }>;
@@ -681,6 +690,14 @@ function SessionsFilterDrawer(props: {
     { value: '', label: t('sessions.chatAny') },
     ...props.chatOptions,
   ];
+  const timeIssue = topicTimeFilterIssue(props.filters);
+  const timeHint = timeIssue === 'need_field'
+    ? t('sessions.topicTime.needField')
+    : timeIssue === 'need_range'
+      ? t('sessions.topicTime.needRange')
+      : timeIssue === 'invalid_range'
+        ? t('sessions.topicTime.invalidRange')
+        : t('sessions.topicTime.hint');
   const cliQueryNorm = cliQuery.trim().toLowerCase();
   const visibleClis = cliQueryNorm
     ? CLI_FILTER_OPTIONS.filter(cli => cli.toLowerCase().includes(cliQueryNorm))
@@ -823,7 +840,13 @@ function SessionsFilterDrawer(props: {
               onChange={event => props.setFilters(prev => ({ ...prev, topicTimeTo: event.currentTarget.value }))}
             />
           </div>
-          <span className="sessions-filter-hint">{t('sessions.topicTime.hint')}</span>
+          <span
+            className={`sessions-filter-hint${timeIssue ? ' error' : ''}`}
+            role={timeIssue ? 'alert' : undefined}
+            data-topic-time-issue={timeIssue ?? undefined}
+          >
+            {timeHint}
+          </span>
         </div>
         <div className="sessions-filter-toggles">
           <label className="filter-toggle">
