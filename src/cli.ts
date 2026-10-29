@@ -18422,10 +18422,10 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
     const guidance = mcpDenied
       ? 'Only the botmux-owned Plugin MCP gateway bootstrap (`mcp serve`) is available inside a workflow subagent.'
       : workflowMutation
-          ? 'Workflow authorization and run mutations must be initiated by the host/user, not a subagent.'
-          : rootDenied
-            ? 'This root command is not in the workflow read-only allowlist; chat-facing effects belong in a hostExecutor activity.'
-            : 'Chat-facing or schedule-mutating effects belong in a hostExecutor activity, not a subagent.';
+        ? 'Workflow authorization and run mutations must be initiated by the host/user, not a subagent.'
+        : rootDenied
+          ? 'This root command is not in the workflow read-only allowlist; chat-facing effects belong in a hostExecutor activity.'
+          : 'Chat-facing or schedule-mutating effects belong in a hostExecutor activity, not a subagent.';
     console.error(
       `botmux ${command}${sub ? ` ${sub}` : ''} refused inside workflow ` +
       `subagent (run=${runId} node=${nodeId}).  ${guidance}`,
