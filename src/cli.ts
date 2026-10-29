@@ -9426,6 +9426,10 @@ import {
   buildImageCardElements,
   buildReplyCardFooterElements,
   buildCardBodyElements,
+  buildDiffCard,
+  parseUnifiedDiff,
+  MAX_DIFF_INPUT_BYTES,
+  type DiffFile,
   CARD_LATE_CHROME_RESERVE_BYTES,
   createReplyCard,
   fitChartsToCardBudget,
@@ -9503,7 +9507,6 @@ import {
   matchUniqueChatMemberOpenId,
 } from './services/send-policy.js';
 import { normalizePositionalSendContent } from './services/send-content.js';
-import { buildDiffCard, parseUnifiedDiff, MAX_INPUT_BYTES, type DiffFile } from './im/lark/diff-card.js';
 import { describeScheduleState } from './services/schedule-until-done.js';
 
 /** Map until-done / notify validation codes to a one-line CLI message. */
@@ -10216,9 +10219,9 @@ function reportCardRenderDiagnostics(diagnostics: CardRenderDiagnostic[]): void 
 function readSendDiffFile(path: string): DiffFile[] {
   try {
     const stat = statSync(path);
-    if (!stat.isFile() || stat.size > MAX_INPUT_BYTES) throw new Error('diff 需要不超过 2MiB 的普通 UTF-8 文件');
+    if (!stat.isFile() || stat.size > MAX_DIFF_INPUT_BYTES) throw new Error('diff 需要不超过 2MiB 的普通 UTF-8 文件');
     const bytes = readFileSync(path);
-    if (bytes.length > MAX_INPUT_BYTES) throw new Error('diff 输入超过 2MiB');
+    if (bytes.length > MAX_DIFF_INPUT_BYTES) throw new Error('diff 输入超过 2MiB');
     return parseUnifiedDiff(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
   } catch (error) {
     console.error(`botmux send: ${error instanceof Error ? error.message : String(error)}`);

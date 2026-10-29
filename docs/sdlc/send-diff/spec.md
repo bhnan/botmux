@@ -10,7 +10,7 @@ cmdSend 先处理 help/dry-run，再处理身份、relay、VC 和既有卡片发
 接收已有 unified diff，生成每文件折叠面板，+N/-M、红绿上下文、Markdown 转义和 nbsp 缩进，整卡约 18KB 预算。正文使用 send 原有的 content-file > positional > stdin 优先级作为摘要；在既有参数校验和正文读取处生成 diff 卡片，直接进入原有发送流程。
 
 ## Architecture and data flow
-src/services/send-policy.ts：parseDiffFlag/diffUsageError；src/im/lark/diff-card.ts：纯解析/渲染；src/cli.ts：命令执行、普通正文读取、有界 UTF-8 diff 文件读取、dry-run、help；src/skills/definitions.ts：推荐 native 命令。
+src/services/send-policy.ts：parseDiffFlag/diffUsageError；src/im/lark/md-card.ts：通用 Markdown 和 diff 正文渲染，共用 createReplyCard；src/cli.ts：命令执行、普通正文读取、有界 UTF-8 diff 文件读取、dry-run、help；src/skills/definitions.ts：推荐 native 命令。
 
 ## Interfaces, schemas, and permissions
 生成纯展示 schema 2.0，无 callback。dry-run 只本地解析并返回 JSON，不走会话/relay/provider。真实发送经过既有授权、路由、final、mention、预期链接、幂等和回放处理。与 --layout、--as、文档评论等组合沿用既有卡片边界。
@@ -29,4 +29,8 @@ src/services/send-policy.ts：parseDiffFlag/diffUsageError；src/im/lark/diff-ca
 
 ## 命令层一致性重构
 
-按照用户要求删除独立 send-diff.ts 与 argv 改写层。diff 与 attention/urgent 的参数策略同位于 send-policy.ts，执行同位于 cli.ts；纯卡片解析渲染保留于 im/lark。policy 测试合并到已有 send-policy.test.ts，摘要和输入行为使用真实 CLI 测试。relay 将生成卡片放入原有 cardFile 协议，不新增宿主 flag 或身份通道。
+按照用户要求删除独立 send-diff.ts 与 argv 改写层。diff 与 attention/urgent 的参数策略同位于 send-policy.ts，执行同位于 cli.ts；卡片解析渲染统一位于 im/lark/md-card.ts，共用普通回复卡片外壳。policy 测试合并到已有 send-policy.test.ts，摘要和输入行为使用真实 CLI 测试。relay 将生成卡片放入原有 cardFile 协议，不新增宿主 flag 或身份通道。
+
+卡片模块进一步合并：已移除独立 diff-card.ts 与独立 DiffCard 外壳类型。diff 正文和摘要使用 md-card 内现有构建函数，整张卡片配置使用 createReplyCard。diff 用例合并到 md-card.test.ts；本轮卡片模块及发送相关检查为 448 项通过、2 项 Linux 专用跳过，开发版完整构建通过；v3.54.0 候选核心检查 264 项通过。
+
+摘要现在经过通用 Markdown 正规化（例如清理末尾无显示意义的换行），CLI 用例对照同一 body builder 验证摘要优先级。diff 行内容的换行/转义保留原实现。

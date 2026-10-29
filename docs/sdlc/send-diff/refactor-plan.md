@@ -21,3 +21,15 @@
 
 完成后提交新的本地重构 commit，保留已提交历史。记录重构前后运行代码量与移除文件；更新设计/验证和候选技能。
 旧 v3.54.0 部署候选和部署脚本须在最终提交前同步本次功能，避免未来部署旧实现；目前运行版本不切换。
+
+## 卡片模块合并（2026-10-29T13:48:23+08:00）
+
+用户进一步明确卡片代码尽量集中在同一位置，复用 Markdown 卡片基础。基于 9fbed24 执行本轮重构：
+
+- 将 diff 解析、正文元素和预算逻辑合入 src/im/lark/md-card.ts，删除 diff-card.ts。
+- 删除独立 DiffCard 外壳类型，统一使用 ReplyCardV2 和 createReplyCard()，共用 update_multi、width_mode 和 vertical direction。
+- diff 摘要使用通用 buildCardBodyElements()，折叠面板保留逐行着色、转义和真实 diff 内容。
+- CLI 直接从现有 md-card import 取得所需函数；对 diff 私有辅助函数/常量使用明确命名，避免与已有 Markdown 渲染逻辑冲突。
+- 将 diff 解析/渲染测试并入已有 md-card.test.ts，移除独立 diff-card.test.ts；补充通用配置与 Markdown 摘要表格的行为验证。
+- 运行 md-card、send-policy、cli-send-diff、普通 dry-run/final/发送回归和预算检查；完整构建。同步 v3.54.0 候选并验证。
+- 在原分支提交本地重构 commit，更新补丁和任务记录。PR、push、共享 daemon 部署继续暂缓。

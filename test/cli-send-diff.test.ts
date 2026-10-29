@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { spawnSyncTsScript, spawnTsScript } from './helpers/ts-runner.js';
 import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 import { RELAY_ORIGIN_CAPABILITY_BASENAME, replaceManagedOriginCapabilityFile } from '../src/core/managed-origin-capability.js';
+import { buildCardBodyElements } from '../src/im/lark/md-card.js';
 
 const cli = fileURLToPath(new URL('../src/cli.ts', import.meta.url));
 const fixture = fileURLToPath(new URL('./fixtures/send-reply-card-capture.ts', import.meta.url));
@@ -47,7 +48,9 @@ describe('send --diff CLI', () => {
   ])('uses ordinary body precedence for $args', ({ args, input, expected }) => {
     const result = preview(args, patch, input);
     expect(result.status, String(result.stderr)).toBe(0);
-    expect(JSON.parse(String(result.stdout)).card.body.elements[0]).toEqual({ tag: 'markdown', content: expected });
+    const elements = JSON.parse(String(result.stdout)).card.body.elements;
+    const summaryElements = buildCardBodyElements(expected);
+    expect(elements.slice(0, summaryElements.length)).toEqual(summaryElements);
   });
 
   it.each([
