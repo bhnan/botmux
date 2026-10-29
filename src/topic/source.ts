@@ -48,6 +48,11 @@ export interface TopicHistoryReadOptions {
 
 export interface TopicHistoryPage {
   messages: TopicSourceMessage[];
+  /**
+   * 是否确认读取的是原生话题容器。false = 退化成按 root_id 扫群，
+   * 回复类消息可能天然缺席 —— 此时禁止把「缺席」判成删除。
+   */
+  verifiedThread?: boolean;
   /** 源侧是否因为预算/分页上限而截断：true 时调用方不能推进「检查完成」。 */
   truncated: boolean;
   /** 原生话题标识（`omt_*`）：只用于跳转，不能当路由身份（见 Topic.nativeThreadId）。 */

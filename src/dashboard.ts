@@ -8348,13 +8348,14 @@ async function ensureTopicSearchRuntime(): Promise<import('./topic/runtime.js').
                 throw Object.assign(new Error(`topic_messages http_${upstream.status}`), { code: 'source_read_failed' });
               }
               const body = (await upstream.json().catch(() => null)) as
-                | { messages?: unknown; complete?: unknown; nativeThreadId?: unknown }
+                | { messages?: unknown; complete?: unknown; nativeThreadId?: unknown; verifiedThread?: unknown }
                 | null;
               const messages = Array.isArray(body?.messages) ? body?.messages : [];
               return {
                 messages: messages as Array<{ messageId?: unknown; content?: unknown; createTime?: unknown }>,
                 complete: body?.complete === true,
                 ...(typeof body?.nativeThreadId === 'string' ? { nativeThreadId: body.nativeThreadId } : {}),
+                ...(body?.verifiedThread === false ? { verifiedThread: false } : { verifiedThread: true }),
               };
             },
             accessPolicyRef: 'deployment:topic-search',

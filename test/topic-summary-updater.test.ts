@@ -336,6 +336,164 @@ describe('增量摘要更新', () => {
     expect(store.getTopic('thread:oc_1:om_1')!.summaries).toEqual([]);
   });
 
+  it('失效与 revision 冲突同时发生时，重试仍沿用 enrich 前的 epoch（不得绕过）', async () => {
+    store.upsertTopicDirectory({
+      topicKey: 'thread:oc_1:om_1',
+      chatId: 'oc_1',
+      rootMessageId: 'om_1',
+      title: entry.title,
+      accessPolicyRef: entry.accessPolicyRef,
+      now: '2026-10-01T00:00:00.000Z',
+      coverageStartAt: '2026-10-01T00:00:00.000Z',
+    });
+    store.commitSummaryMutation({
+      topicKey: 'thread:oc_1:om_1',
+      expectedRevision: 0,
+      mutations: [{ op: 'add', text: '含 om_100 的旧摘要', keywords: [], sourceMessageIds: ['om_100'] }],
+      nextCursor: encodeCursor({ createTime: '2026-10-01T00:00:01.000Z', messageIds: ['om_0'] }),
+      sourceThroughAt: '2026-10-01T00:00:01.000Z',
+      generatorKey: 'test-model@v1',
+      now: '2026-10-01T00:00:01.000Z',
+    });
+
+    const enricher: TopicEnricher = {
+      generatorKey: 'test-model@v1',
+      enrich: vi.fn(async () => {
+        // 模型拿着删除前快照；期间另一个进程确认撤回并删掉了引用它的摘要，
+        // 这会让 revision 与 epoch 同时变化。
+        store.invalidateSummariesForMessages({
+          topicKey: 'thread:oc_1:om_1',
+          messageIds: ['om_100'],
+          now: '2026-10-01T00:00:05.000Z',
+        });
+        return {
+          mutations: [
+            { op: 'add', text: '基于旧快照的摘要', keywords: [], sourceMessageIds: ['om_101'] },
+          ],
+          generatorKey: 'test-model@v1',
+        };
+      }) as never,
+    };
+    const outcome = await updateTopicFromSource(
+      {
+        store,
+        // 页面里 om_100 仍存在：本轮开始时的缺席判定不会触发，撤销只发生在 enrich 期间。
+        source: fakeSource([{ messages: [message('om_100', 2), message('om_101', 3, '新消息')] }]),
+        enricher,
+      },
+      entry,
+      {},
+    );
+
+    expect(outcome.status).toBe('failed');
+    expect(outcome.errorCode).toBe('stale_epoch');
+    expect(outcome.cursorAdvanced).toBe(false);
+    const topic = store.getTopic('thread:oc_1:om_1')!;
+    expect(topic.summaries).toEqual([]);
+    expect(topic.summarizedThroughCursor).toBe(
+      encodeCursor({ createTime: '2026-10-01T00:00:01.000Z', messageIds: ['om_0'] }),
+    );
+  });
+
+  it('退化读取（verifiedThread=false）不做「缺席即删除」，不误删存活摘要', async () => {
+    store.upsertTopicDirectory({
+      topicKey: 'thread:oc_1:om_1',
+      chatId: 'oc_1',
+      rootMessageId: 'om_1',
+      title: entry.title,
+      accessPolicyRef: entry.accessPolicyRef,
+      now: '2026-10-01T00:00:00.000Z',
+      coverageStartAt: '2026-10-01T00:00:00.000Z',
+    });
+    store.commitSummaryMutation({
+      topicKey: 'thread:oc_1:om_1',
+      expectedRevision: 0,
+      mutations: [{ op: 'add', text: '引用回复的摘要', keywords: [], sourceMessageIds: ['om_100'] }],
+      nextCursor: encodeCursor({ createTime: '2026-10-01T00:00:01.000Z', messageIds: ['om_0'] }),
+      sourceThroughAt: '2026-10-01T00:00:01.000Z',
+      generatorKey: 'test-model@v1',
+      now: '2026-10-01T00:00:01.000Z',
+    });
+
+    const outcome = await updateTopicFromSource(
+      {
+        store,
+        source: {
+          discoverTopics: async () => [entry],
+          // 退化扫描看不到回复消息 om_100；它仍然活着，不能判成删除。
+          readMessages: async () => ({
+            messages: [message('om_101', 3, '新消息')],
+            truncated: false,
+            verifiedThread: false,
+          }),
+        } as never,
+        enricher: fakeEnricher([
+          { op: 'add', text: '新消息摘要', keywords: [], sourceMessageIds: ['om_101'] },
+        ]),
+      },
+      entry,
+      {},
+    );
+
+    expect(outcome.status).toBe('committed');
+    expect(outcome.invalidated).toBeUndefined();
+    expect(store.getTopic('thread:oc_1:om_1')!.summaries.map(summary => summary.text))
+      .toEqual(['引用回复的摘要', '新消息摘要']);
+  });
+
+  it('重叠窗口截断时，截断页里显式 deleted 的消息仍然失效', async () => {
+    store.upsertTopicDirectory({
+      topicKey: 'thread:oc_1:om_1',
+      chatId: 'oc_1',
+      rootMessageId: 'om_1',
+      title: entry.title,
+      accessPolicyRef: entry.accessPolicyRef,
+      now: '2026-10-01T00:00:00.000Z',
+      coverageStartAt: '2026-10-01T00:00:00.000Z',
+    });
+    const cursorTime = '2026-10-01T00:00:01.000Z';
+    store.commitSummaryMutation({
+      topicKey: 'thread:oc_1:om_1',
+      expectedRevision: 0,
+      mutations: [{ op: 'add', text: '旧摘要', keywords: [], sourceMessageIds: ['om_100'] }],
+      nextCursor: encodeCursor({ createTime: cursorTime, messageIds: ['om_100'] }),
+      sourceThroughAt: cursorTime,
+      generatorKey: 'test-model@v1',
+      now: cursorTime,
+    });
+
+    const readMessages = vi.fn(async (
+      _entry: TopicDirectoryEntry,
+      options: { after?: { createTime: string; messageIds: string[] }; limit: number },
+    ) => {
+      const afterMs = options.after ? Date.parse(options.after.createTime) : NaN;
+      if (Number.isFinite(afterMs) && afterMs < Date.parse(cursorTime)) {
+        return {
+          messages: [{ ...message('om_100', -1, '已撤回内容'), deleted: true }],
+          truncated: true,
+        };
+      }
+      return { messages: [message('om_2', 3, '新消息')], truncated: false };
+    });
+    const outcome = await updateTopicFromSource(
+      {
+        store,
+        source: { discoverTopics: async () => [entry], readMessages } as never,
+        enricher: fakeEnricher([
+          { op: 'add', text: '新消息摘要', keywords: [], sourceMessageIds: ['om_2'] },
+        ]),
+      },
+      entry,
+      {},
+    );
+
+    expect(readMessages).toHaveBeenCalledTimes(2);
+    expect(outcome.status).toBe('committed');
+    expect(outcome.invalidated).toBe(1);
+    expect(store.getTopic('thread:oc_1:om_1')!.summaries.map(summary => summary.text))
+      .toEqual(['新消息摘要']);
+  });
+
   it('重叠窗口被预算截断时退回正常增量，不把话题判成窗口不足', async () => {
     store.upsertTopicDirectory({
       topicKey: 'thread:oc_1:om_1',

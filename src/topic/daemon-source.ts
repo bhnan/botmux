@@ -55,6 +55,8 @@ export interface DaemonHistoryPage {
   /** false = 窗口没覆盖到调用方给的处理边界（预算/页数用尽）→ 不得推进游标。 */
   complete: boolean;
   nativeThreadId?: string;
+  /** false = 退化成按 root_id 扫群，回复可能缺席 → 不能据此判删除。 */
+  verifiedThread?: boolean;
 }
 
 export interface DaemonTopicSourceDeps {
@@ -179,6 +181,7 @@ export function createDaemonTopicSource(deps: DaemonTopicSourceDeps): TopicHisto
     return {
       messages,
       truncated: !page.complete,
+      ...(page.verifiedThread === false ? { verifiedThread: false } : { verifiedThread: true }),
       // 原生话题 id 只接受 `omt_*` 形状：它只用于跳转，形状不对就当作没有，
       // 免得把路由根消息 id（om_*）当话题 id 拼出打不开的链接。
       ...(isNativeTopicId(page.nativeThreadId) ? { nativeThreadId: page.nativeThreadId } : {}),

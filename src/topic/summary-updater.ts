@@ -193,11 +193,17 @@ export async function updateTopicFromSource(
     });
 
   let page;
+  // 截断的重叠页里已经明确标了 deleted 的消息不能因为退回增量而丢掉。
+  let earlyDeletedIds: string[] = [];
   try {
     page = await readPage(readAfter, recheckSinceIso ? limits.recheckLimit : limits.maxMessagesPerBatch);
     if (page.truncated && recheckSinceIso) {
-      // 重叠窗口太宽（话题消息量超过核查预算）：退回正常增量，本轮放弃
-      // 「缺席即删除」判定，但增量摘要照常推进——不能因为核查读不完就把话题卡死。
+      // 重叠窗口太宽（话题消息量超过核查预算）：先把本页显式删除标记记下，
+      // 再退回正常增量；本轮放弃「缺席即删除」，但增量摘要照常推进——
+      // 不能因为核查读不完就把话题卡死。
+      earlyDeletedIds = normalizeSourceMessages(page.messages)
+        .filter(message => message.deleted === true)
+        .map(message => message.messageId);
       recheckSinceIso = undefined;
       page = await readPage(cursor, limits.maxMessagesPerBatch);
     }
@@ -237,7 +243,10 @@ export async function updateTopicFromSource(
 
   if (page.truncated) {
     // 窗口没覆盖到游标：本轮不摘要，但窗口里明确标了 deleted 的消息仍要立即失效。
-    invalidate(normalized.filter(message => message.deleted === true).map(message => message.messageId));
+    invalidate([
+      ...earlyDeletedIds,
+      ...normalized.filter(message => message.deleted === true).map(message => message.messageId),
+    ]);
     deps.store.recordJobFailure({
       topicKey,
       errorCode: 'source_window_too_narrow',
@@ -275,11 +284,12 @@ export async function updateTopicFromSource(
   // 1. 源侧在本次读到的任意消息上标了 deleted（不只增量段）；
   // 2. 重叠窗口内、之前已摘要过的来源消息在完整窗口里消失 —— 只有页面完整
   //    （truncated=false）时才敢把「缺席」当删除，否则会把读不到的旧消息误删。
-  const deletedIds = new Set<string>();
+  const deletedIds = new Set<string>(earlyDeletedIds);
   for (const message of normalized) {
     if (message.deleted === true) deletedIds.add(message.messageId);
   }
-  if (cursor && recheckSinceIso) {
+  // 退化成按 root_id 扫群时，话题回复本来就可能读不到；此时「缺席」不代表删除。
+  if (cursor && recheckSinceIso && page.verifiedThread !== false) {
     const present = new Set(
       normalized
         .filter(message => message.createTime >= recheckSinceIso!)
@@ -429,7 +439,9 @@ export async function updateTopicFromSource(
     const retried = commit({
       topicKey,
       expectedRevision: fresh.revision,
-      expectedDeletionEpoch: deps.store.deletionEpoch(topicKey),
+      // 必须沿用 enrich 前捕获的 epoch：若期间发生过失效，revision 冲突会让重试
+      // 读到新 epoch，从而把基于旧快照的结果放进来。
+      expectedDeletionEpoch: deletionEpoch,
       mutations: reconciled,
       sourceMessageTimes,
       nextCursor,

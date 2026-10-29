@@ -101,11 +101,12 @@ describe('daemon 源：增量契约的完整性判定', () => {
     accessPolicyRef: 'deployment:topic-search',
   };
 
-  function build(page: { messages?: unknown[]; complete?: boolean; nativeThreadId?: string }) {
+  function build(page: { messages?: unknown[]; complete?: boolean; nativeThreadId?: string; verifiedThread?: boolean }) {
     const fetchHistory = vi.fn(async () => ({
       messages: page.messages ?? [],
       complete: page.complete ?? true,
       ...(page.nativeThreadId ? { nativeThreadId: page.nativeThreadId } : {}),
+      ...(page.verifiedThread === false ? { verifiedThread: false } : {}),
     }));
     const source = createDaemonTopicSource({
       listSessions: () => sessions,
@@ -170,6 +171,15 @@ describe('daemon 源：增量契约的完整性判定', () => {
       ['om_101', true],
       ['om_102', false],
     ]);
+  });
+
+  it('退化读取（verifiedThread=false）透传给更新器，供其关闭缺席删除判定', async () => {
+    const { source } = build({ verifiedThread: false, messages: [] });
+    const page = await source.readMessages(entry, { limit: 10 });
+    expect(page.verifiedThread).toBe(false);
+
+    const verified = build({ messages: [] });
+    expect((await verified.source.readMessages(entry, { limit: 10 })).verifiedThread).toBe(true);
   });
 
   it('complete=true 时可以正常提交，并带回原生话题 id', async () => {
