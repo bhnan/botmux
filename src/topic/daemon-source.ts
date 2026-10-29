@@ -78,6 +78,22 @@ export interface DaemonTopicSourceDeps {
 export const DAEMON_HISTORY_MAX_LIMIT = 200;
 const DEFAULT_WINDOW = 200;
 
+/**
+ * daemon `/api/topics/messages` 响应 → 内部页面对象。
+ *
+ * `verifiedThread` 采用 **fail-closed**：只有响应明确是 `true` 才允许更新器用
+ * 「消息缺席」推断删除。缺字段（旧版本/代理丢字段）时宁可少删，也不能误删存活内容。
+ */
+export function parseDaemonHistoryBody(body: unknown): DaemonHistoryPage {
+  const record = body && typeof body === 'object' ? body as Record<string, unknown> : {};
+  return {
+    messages: Array.isArray(record.messages) ? record.messages as DaemonHistoryMessage[] : [],
+    complete: record.complete === true,
+    ...(typeof record.nativeThreadId === 'string' ? { nativeThreadId: record.nativeThreadId } : {}),
+    verifiedThread: record.verifiedThread === true,
+  };
+}
+
 function nonEmptyString(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
@@ -181,7 +197,7 @@ export function createDaemonTopicSource(deps: DaemonTopicSourceDeps): TopicHisto
     return {
       messages,
       truncated: !page.complete,
-      ...(page.verifiedThread === false ? { verifiedThread: false } : { verifiedThread: true }),
+      verifiedThread: page.verifiedThread === true,
       // 原生话题 id 只接受 `omt_*` 形状：它只用于跳转，形状不对就当作没有，
       // 免得把路由根消息 id（om_*）当话题 id 拼出打不开的链接。
       ...(isNativeTopicId(page.nativeThreadId) ? { nativeThreadId: page.nativeThreadId } : {}),

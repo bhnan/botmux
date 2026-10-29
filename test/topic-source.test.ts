@@ -7,7 +7,7 @@ import {
   selectIncrement,
   type TopicSourceMessage,
 } from '../src/topic/source.js';
-import { createDaemonTopicSource } from '../src/topic/daemon-source.js';
+import { createDaemonTopicSource, parseDaemonHistoryBody } from '../src/topic/daemon-source.js';
 
 function message(messageId: string, createTime: string, text = 'x'): TopicSourceMessage {
   return { messageId, createTime, text };
@@ -106,7 +106,7 @@ describe('daemon 源：增量契约的完整性判定', () => {
       messages: page.messages ?? [],
       complete: page.complete ?? true,
       ...(page.nativeThreadId ? { nativeThreadId: page.nativeThreadId } : {}),
-      ...(page.verifiedThread === false ? { verifiedThread: false } : {}),
+      ...(page.verifiedThread !== undefined ? { verifiedThread: page.verifiedThread } : {}),
     }));
     const source = createDaemonTopicSource({
       listSessions: () => sessions,
@@ -178,7 +178,7 @@ describe('daemon 源：增量契约的完整性判定', () => {
     const page = await source.readMessages(entry, { limit: 10 });
     expect(page.verifiedThread).toBe(false);
 
-    const verified = build({ messages: [] });
+    const verified = build({ messages: [], verifiedThread: true });
     expect((await verified.source.readMessages(entry, { limit: 10 })).verifiedThread).toBe(true);
   });
 
@@ -207,5 +207,29 @@ describe('daemon 源：增量契约的完整性判定', () => {
         { limit: 1 },
       ),
     ).rejects.toMatchObject({ code: 'source_unavailable' });
+  });
+});
+
+
+describe('daemon 历史响应解析（fail-closed）', () => {
+  it('verifiedThread 只有显式为 true 才启用缺席判定，缺字段按 false', () => {
+    expect(parseDaemonHistoryBody({ verifiedThread: true }).verifiedThread).toBe(true);
+    expect(parseDaemonHistoryBody({ verifiedThread: false }).verifiedThread).toBe(false);
+    expect(parseDaemonHistoryBody({}).verifiedThread).toBe(false);
+    expect(parseDaemonHistoryBody(null).verifiedThread).toBe(false);
+    expect(parseDaemonHistoryBody({ verifiedThread: 'true' }).verifiedThread).toBe(false);
+  });
+
+  it('消息、complete 与原生话题 id 一并归一化', () => {
+    const page = parseDaemonHistoryBody({
+      messages: [{ messageId: 'om_1', createTime: 1, content: 'x' }],
+      complete: true,
+      nativeThreadId: 'omt_1',
+      verifiedThread: true,
+    });
+    expect(page.messages).toHaveLength(1);
+    expect(page.complete).toBe(true);
+    expect(page.nativeThreadId).toBe('omt_1');
+    expect(parseDaemonHistoryBody({ complete: 'yes' }).complete).toBe(false);
   });
 });

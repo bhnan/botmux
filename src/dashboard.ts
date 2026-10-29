@@ -8312,12 +8312,15 @@ async function ensureTopicSearchRuntime(): Promise<import('./topic/runtime.js').
   if (!topicSearchRuntimePromise) {
     topicSearchRuntimePromise = (async () => {
       try {
-        const [{ createTopicRuntime, buildTopicClients }, { resolveTopicEndpointsFromEnv }, { createDaemonTopicSource }] =
-          await Promise.all([
-            import('./topic/runtime.js'),
-            import('./topic/endpoints.js'),
-            import('./topic/daemon-source.js'),
-          ]);
+        const [
+          { createTopicRuntime, buildTopicClients },
+          { resolveTopicEndpointsFromEnv },
+          { createDaemonTopicSource, parseDaemonHistoryBody },
+        ] = await Promise.all([
+          import('./topic/runtime.js'),
+          import('./topic/endpoints.js'),
+          import('./topic/daemon-source.js'),
+        ]);
         const runtime = createTopicRuntime({
           readConfig: () => readGlobalConfig().topicSearch,
           source: createDaemonTopicSource({
@@ -8350,13 +8353,7 @@ async function ensureTopicSearchRuntime(): Promise<import('./topic/runtime.js').
               const body = (await upstream.json().catch(() => null)) as
                 | { messages?: unknown; complete?: unknown; nativeThreadId?: unknown; verifiedThread?: unknown }
                 | null;
-              const messages = Array.isArray(body?.messages) ? body?.messages : [];
-              return {
-                messages: messages as Array<{ messageId?: unknown; content?: unknown; createTime?: unknown }>,
-                complete: body?.complete === true,
-                ...(typeof body?.nativeThreadId === 'string' ? { nativeThreadId: body.nativeThreadId } : {}),
-                ...(body?.verifiedThread === false ? { verifiedThread: false } : { verifiedThread: true }),
-              };
+              return parseDaemonHistoryBody(body);
             },
             accessPolicyRef: 'deployment:topic-search',
           }),

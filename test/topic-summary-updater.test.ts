@@ -37,7 +37,10 @@ function fakeSource(pages: Array<{ messages: TopicSourceMessage[]; truncated?: b
   readMessages: ReturnType<typeof vi.fn>;
 } {
   const queue = [...pages];
-  const readMessages = vi.fn(async () => queue.shift() ?? { messages: [], truncated: false });
+  const readMessages = vi.fn(async () => ({
+    verifiedThread: true,
+    ...(queue.shift() ?? { messages: [], truncated: false }),
+  }));
   return { discoverTopics: async () => [entry], readMessages } as never;
 }
 

@@ -289,7 +289,7 @@ export async function updateTopicFromSource(
     if (message.deleted === true) deletedIds.add(message.messageId);
   }
   // 退化成按 root_id 扫群时，话题回复本来就可能读不到；此时「缺席」不代表删除。
-  if (cursor && recheckSinceIso && page.verifiedThread !== false) {
+  if (cursor && recheckSinceIso && page.verifiedThread === true) {
     const present = new Set(
       normalized
         .filter(message => message.createTime >= recheckSinceIso!)
