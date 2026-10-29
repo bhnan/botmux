@@ -44,6 +44,7 @@
     "switch:here": "bun run build && bun run use:here",
     "test": "vitest run --project unit",
     "test:all": "vitest run",
+    "bench:topic-search": "bun scripts/bench-topic-search.ts",
     "test:e2e": "vitest run --project e2e",
     "test:midscene": "midscene-test test/midscene --result-dir midscene_run/dashboard/results",
     "test:midscene:feishu": "bun run test:e2e-browser",
