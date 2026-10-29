@@ -22,7 +22,7 @@ Add a `topicSearch` section to `~/.botmux/config.json`:
 }
 ```
 
-- `allowedChatIds`: only topics in these chats are indexed, and page searches only recall within this scope.
+- `allowedChatIds`: the **update scope** — only topics in these chats are scanned. It does not gate search: retained history stays searchable after a chat leaves the update scope; page visibility is governed by Dashboard authentication.
 - `llmModelRef`: a reference name; the real connection comes from the Dashboard process environment:
 
 ```sh
@@ -78,11 +78,11 @@ Disable it with:
 { "topicSearch": { "enabled": false } }
 ```
 
-After a Dashboard restart the background job stops and the page falls back to the original search; existing data is retained. To remove it, disable the feature and delete `topic-search.sqlite*`; no session or Lark message is affected.
+After a Dashboard restart the background job stops and the page falls back to the original search; existing data is retained. In-flight model tasks still finish, persist, and advance the successful cursor; re-enabling resumes from that cursor (including messages added while disabled) instead of redoing everything. To remove the index, disable the feature and delete `topic-search.sqlite*`; no session or Lark message is affected.
 
 ## Known limits
 
 - Only thread topics with a readable Bot session in this deployment are indexed; chats, DMs, and sessions without a root message are skipped.
 - Deletion detection re-checks `recheckOverlapHours` (default 24 hours, up to 200 messages) before the current cursor each run; older historical deletions are not guaranteed to disappear from every result immediately, and a budget-truncated window only honours explicit deletion markers from the source; degraded scans without a native topic id never use absence as a deletion signal.
 - Coverage describes this deployment's known topic directory, not the whole Lark tenant.
-- On a fixed synthetic dataset (1,000 topics / 10,000 summaries / 20 queries), keyword search measured P95 ≈ 33 ms with a 100% Top-3 rate; those queries carry unique entity tokens, so this shows retrieval mechanics and latency, not real semantic quality.
+- On a fixed synthetic dataset (1,000 topics / 10,000 summaries / 20 queries), keyword search measured P95 ≈ 22 ms with a 100% Top-3 rate; those queries carry unique entity tokens, so this shows retrieval mechanics and latency, not real semantic quality.
