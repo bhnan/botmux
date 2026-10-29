@@ -229,7 +229,7 @@ import {
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
-import { deleteMessage, getChatMode, getChatModeStrict, replyMessage, sendMessage, resolveUnionIdFromOpenId, resolveTargetAppOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, getMessageThreadId, getMessageDetail, type ChatBotMember } from '../im/lark/client.js';
+import { deleteMessage, getChatMode, getChatModeStrict, replyMessage, sendMessage, resolveUnionIdFromOpenId, resolveTargetAppOpenId, listThreadMessages, listThreadMessagesIncremental, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, getMessageThreadId, getMessageDetail, type ChatBotMember } from '../im/lark/client.js';
 import { fillNativeTopicId, isNativeTopicId } from './native-topic-id.js';
 import { parseProjectCoordinatorAction } from '../services/project-coordinator.js';
 import { projectCoordinator } from '../services/project-coordinator-runtime.js';
@@ -4982,6 +4982,68 @@ ipcRoute('GET', '/api/sessions/:sessionId/history', async (req, res, params) => 
       scope: session.scope ?? 'thread',
       ownerOpenId: session.ownerOpenId,
       messages: enrichHistorySenders(messages, senders, botMembers, botInfos),
+    });
+  } catch (err: any) {
+    jsonRes(res, 502, { ok: false, error: ipcErrorText(err) });
+  }
+});
+
+/** 把飞书消息体收敛成纯文本（text/post 取正文字段，其它保留结构化内容）。 */
+function contentTextForTopic(message: any): string {
+  const raw = message?.body?.content;
+  if (typeof raw !== 'string') return '';
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const text = parsed.text ?? parsed.title ?? parsed.content;
+    if (typeof text === 'string' && text.trim()) return text;
+  } catch {
+    // 非 JSON 正文（少数富文本形态）：原样返回。
+  }
+  return raw;
+}
+
+/**
+ * 话题增量历史（给 Dashboard 的话题摘要 runtime 用）。
+ *
+ * 与 `/api/sessions/:id/history` 的区别：那条是「上下文窗口」（最新 N 条，供人看），
+ * 这条是「增量契约」——从最新往旧翻，遇到调用方给出的处理边界就停，并**明确回报
+ * `complete`**：false 表示窗口没覆盖到边界（预算/页数用尽），调用方不得推进游标，
+ * 否则会永久跳过中间一段消息。
+ *
+ * 凭证留在这个 daemon 里：中心进程只知道 chatId/rootMessageId，不持有 app secret。
+ */
+ipcRoute('GET', '/api/topics/messages', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, NOT_BOUND_BODY.legacy);
+  const url = new URL(req.url ?? '/', 'http://localhost');
+  const chatId = (url.searchParams.get('chatId') ?? '').trim();
+  const rootMessageId = (url.searchParams.get('rootMessageId') ?? '').trim();
+  if (!chatId || !rootMessageId) return jsonRes(res, 400, { ok: false, error: 'missing_topic' });
+  const limitRaw = Number(url.searchParams.get('limit'));
+  const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(Math.floor(limitRaw), 200) : 200;
+  const afterTimeRaw = Number(url.searchParams.get('afterTime'));
+  const afterTimeMs = Number.isFinite(afterTimeRaw) && afterTimeRaw > 0 ? afterTimeRaw : undefined;
+  const afterMessageIds = url.searchParams.getAll('afterId').filter(id => id.trim().length > 0);
+  try {
+    const result = await listThreadMessagesIncremental(cachedLarkAppId, chatId, rootMessageId, {
+      maxMessages: limit,
+      ...(afterTimeMs === undefined ? {} : { afterTimeMs }),
+      afterMessageIds,
+    });
+    jsonRes(res, 200, {
+      ok: true,
+      escaped: true,
+      complete: result.complete,
+      verifiedThread: result.verifiedThread,
+      ...(result.threadId ? { nativeThreadId: result.threadId } : {}),
+      messages: result.messages.map((message: any) => ({
+        messageId: message?.message_id,
+        createTime: Number(message?.create_time) || undefined,
+        senderId: message?.sender?.id,
+        senderType: message?.sender?.sender_type,
+        ...(message?.sender?.name ? { senderName: message.sender.name } : {}),
+        msgType: message?.message_type,
+        content: contentTextForTopic(message),
+      })),
     });
   } catch (err: any) {
     jsonRes(res, 502, { ok: false, error: ipcErrorText(err) });

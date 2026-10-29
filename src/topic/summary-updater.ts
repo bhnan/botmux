@@ -219,9 +219,21 @@ export async function updateTopicFromSource(
     };
   }
 
+  const checkedAt = now();
+  if (page.nativeThreadId) {
+    // 原生话题 id 只用于跳转，但需要在读到它的这一轮落库，否则页面拿不到入口。
+    deps.store.upsertTopicDirectory({
+      topicKey,
+      chatId: entry.chatId,
+      rootMessageId: entry.rootMessageId,
+      nativeThreadId: page.nativeThreadId,
+      title: entry.title,
+      accessPolicyRef: entry.accessPolicyRef,
+      now: checkedAt,
+    });
+  }
   const normalized = normalizeSourceMessages(page.messages);
   const selection = selectIncrement({ messages: normalized, cursor, limit: limits.maxMessagesPerBatch });
-  const checkedAt = now();
 
   if (selection.batch.length === 0) {
     // 零增量：只记检查状态，零模型调用。

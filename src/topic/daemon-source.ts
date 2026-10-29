@@ -14,6 +14,7 @@
  * 把中间一段永久跳过。
  */
 
+import { isNativeTopicId } from '../core/native-topic-id.js';
 import { threadAnchorOf, threadTopicKey, topicFallbackTitle } from './identity.js';
 import {
   normalizeSourceMessages,
@@ -21,6 +22,7 @@ import {
   type TopicHistoryPage,
   type TopicHistoryReadOptions,
   type TopicHistoryReader,
+  type TopicSourceCursor,
   type TopicSourceMessage,
 } from './source.js';
 
@@ -37,7 +39,7 @@ export interface TopicSourceSessionRow {
   status?: unknown;
 }
 
-/** daemon `GET /api/sessions/:id/history` 返回的消息形状（子集）。 */
+/** daemon `GET /api/topics/messages` 返回的消息形状（子集）。 */
 export interface DaemonHistoryMessage {
   messageId?: unknown;
   content?: unknown;
@@ -46,21 +48,29 @@ export interface DaemonHistoryMessage {
   msgType?: unknown;
 }
 
+export interface DaemonHistoryPage {
+  messages: readonly DaemonHistoryMessage[];
+  /** false = 窗口没覆盖到调用方给的处理边界（预算/页数用尽）→ 不得推进游标。 */
+  complete: boolean;
+  nativeThreadId?: string;
+}
+
 export interface DaemonTopicSourceDeps {
   listSessions: () => readonly TopicSourceSessionRow[] | Promise<readonly TopicSourceSessionRow[]>;
-  /** 由宿主提供：走已签名的 daemon 内部调用，`limit` 上限由 daemon 决定（当前 200）。
-   *  `larkAppId` 用于定位持有该 app 凭证的 daemon（跨 bot 同话题时来源可能不同）。 */
+  /** 由宿主提供：走已签名的 daemon 内部调用。
+   *  `after` 是上次成功处理的边界，daemon 侧据此「从新往旧翻到边界就停」；
+   *  返回的 `complete` 为 false 时调用方**不得**推进游标。 */
   fetchHistory: (
     session: { sessionId: string; larkAppId?: string },
-    limit: number,
-  ) => Promise<readonly DaemonHistoryMessage[]>;
+    options: { limit: number; after?: TopicSourceCursor },
+  ) => Promise<DaemonHistoryPage>;
   /** 授权策略引用（宿主决定；同一次读取必须落在同一策略域内）。 */
   accessPolicyRef: string;
   windowSize?: number;
   maxWindow?: number;
 }
 
-/** daemon 历史接口的硬上限（`/api/sessions/:id/history` 把 limit 夹到 200）。 */
+/** daemon 话题历史接口的硬上限（`/api/topics/messages` 把 limit 夹到 200）。 */
 export const DAEMON_HISTORY_MAX_LIMIT = 200;
 const DEFAULT_WINDOW = 200;
 
@@ -154,15 +164,22 @@ export function createDaemonTopicSource(deps: DaemonTopicSourceDeps): TopicHisto
     }
 
     const requested = Math.min(Math.max(windowSize, options.limit * 4), maxWindow);
-    const raw = await deps.fetchHistory(session, requested);
+    const page = await deps.fetchHistory(session, {
+      limit: requested,
+      ...(options.after ? { after: options.after } : {}),
+    });
     const messages = normalizeSourceMessages(
-      raw.map(toSourceMessage).filter((item): item is TopicSourceMessage => item !== null),
+      page.messages.map(toSourceMessage).filter((item): item is TopicSourceMessage => item !== null),
     );
-
-    const coveredByCursor =
-      !options.after || messages.length === 0 || messages[0].createTime <= options.after.createTime;
-    const windowFull = messages.length >= requested;
-    return { messages, truncated: windowFull && !coveredByCursor };
+    // daemon 侧已经按边界提前停止；`complete` 是唯一的完整性判据，不再靠
+    // 「窗口是否取满 + 时间戳比较」去猜（那会在同毫秒多条消息时判断错）。
+    return {
+      messages,
+      truncated: !page.complete,
+      // 原生话题 id 只接受 `omt_*` 形状：它只用于跳转，形状不对就当作没有，
+      // 免得把路由根消息 id（om_*）当话题 id 拼出打不开的链接。
+      ...(isNativeTopicId(page.nativeThreadId) ? { nativeThreadId: page.nativeThreadId } : {}),
+    };
   }
 
   return {

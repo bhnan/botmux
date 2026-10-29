@@ -2404,6 +2404,96 @@ export async function listChatMessages(
   );
 }
 
+export interface ThreadIncrementOptions {
+  /** 本次最多取多少条（默认 200）。达到即停，`complete=false`。 */
+  maxMessages?: number;
+  /** 每页请求条数（默认 API 上限 50）。 */
+  pageSize?: number;
+  /** 每页请求的 HTTP 超时（透传 Axios）。 */
+  timeoutMs?: number;
+  /** 取消信号：翻页前检查，被取消后不再发起下一页。 */
+  signal?: AbortSignal;
+  /**
+   * 已处理边界：`create_time`（毫秒）。消息 id 不透明，**不能**用字符串比较先后，
+   * 因此边界由「毫秒 + 该毫秒上已处理的 id 集合」共同表达。
+   */
+  afterTimeMs?: number;
+  /** 边界毫秒上已处理的 id（用于同毫秒去重；不提供时只按毫秒截断）。 */
+  afterMessageIds?: readonly string[];
+}
+
+export interface ThreadIncrementResult {
+  /** 时间正序（旧 → 新）返回。 */
+  messages: any[];
+  threadId?: string;
+  /** true = 确认是 thread 容器；false = 退化成按 root_id 扫群（可能不完整）。 */
+  verifiedThread: boolean;
+  /**
+   * true = 已经覆盖到「调用方给的处理边界」或读到了容器开头。
+   * false = 预算/页数用尽仍未覆盖边界 —— 调用方**不得**把游标推进到本批之后
+   * （否则会永久跳过中间一段），这正是话题增量摘要最怕的失败方向。
+   */
+  complete: boolean;
+}
+
+/**
+ * 话题增量读取：从最新往旧翻页，遇到「已处理边界」就停，因此只返回**游标之后**的
+ * 真实增量，而不是「最新 N 条」。
+ *
+ * 与 `listThreadMessages` 的差别（后者是 `botmux history` 的上下文窗口语义）：
+ * - 这里返回 `complete`，让调用方能判断「窗口是否覆盖到边界」；
+ * - 支持 `signal` 取消与 `maxMessages` 预算；
+ * - 同毫秒消息用 id 集合去重，不会被时间戳比较静默吞掉。
+ */
+export async function listThreadMessagesIncremental(
+  larkAppId: string,
+  chatId: string,
+  rootMessageId: string,
+  options: ThreadIncrementOptions = {},
+): Promise<ThreadIncrementResult> {
+  const c = getBotClient(larkAppId);
+  const maxMessages = Math.max(1, Math.floor(options.maxMessages ?? 200));
+  const pageSize = Math.min(Math.max(Math.floor(options.pageSize ?? LARK_MESSAGE_LIST_MAX_PAGE), 1), LARK_MESSAGE_LIST_MAX_PAGE);
+  const boundaryIds = new Set(options.afterMessageIds ?? []);
+  const results: any[] = [];
+  const threadId = await resolveThreadId(c, rootMessageId);
+  let verifiedThread = Boolean(threadId);
+  let complete = false;
+
+  const reachedBoundary = (item: any): boolean => {
+    if (options.afterTimeMs === undefined) return false;
+    const createdAt = Number(item?.create_time);
+    if (!Number.isFinite(createdAt)) return false;
+    if (createdAt < options.afterTimeMs) return true;
+    if (createdAt === options.afterTimeMs && boundaryIds.has(String(item?.message_id ?? ''))) return true;
+    return false;
+  };
+
+  const scan: MessagePageScan = threadId
+    ? { containerType: 'thread', containerId: threadId, pageSize, errorAction: 'list thread messages', timeoutMs: options.timeoutMs, signal: options.signal }
+    : { containerType: 'chat', containerId: chatId, pageSize, errorAction: 'list messages', timeoutMs: options.timeoutMs, signal: options.signal };
+
+  for await (const items of iterateMessagePages(c, scan)) {
+    for (const item of items) {
+      // 退化路径（没有原生 thread id）必须自己按 root_id 过滤，否则会把整群消息
+      // 当成话题增量喂给摘要器。
+      if (!threadId && item?.message_id !== rootMessageId && item?.root_id !== rootMessageId) continue;
+      if (reachedBoundary(item)) {
+        complete = true;
+        break;
+      }
+      results.push(item);
+      if (results.length >= maxMessages) break;
+    }
+    if (complete || results.length >= maxMessages) break;
+  }
+  // 没有边界（首轮回填）时，翻到容器开头就是完整覆盖。
+  if (options.afterTimeMs === undefined && results.length < maxMessages) complete = true;
+
+  results.sort((left, right) => String(left?.create_time ?? '').localeCompare(String(right?.create_time ?? '')));
+  return { messages: results, threadId, verifiedThread, complete };
+}
+
 export interface ChatMessageScanOptions {
   /** Lark page size per request. Clamped to the API max of 50. */
   pageSize?: number;

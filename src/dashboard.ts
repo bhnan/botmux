@@ -1,5 +1,9 @@
 // src/dashboard.ts
 import { createServer, get as httpGet, type IncomingMessage, type ServerResponse } from 'node:http';
+// 话题检索：config 是纯函数模块（无 Node-only 依赖），留在启动路径上也不会把
+// store/模型客户端这类重模块提前加载；路由 handler 只做请求适配。
+import { resolveTopicSearchConfig, topicSearchBlockedReason } from './topic/config.js';
+import { handleTopicSearchRequest, TOPIC_SEARCH_ROUTE } from './dashboard/topic-search-api.js';
 import { createServer as createTcpServer } from 'node:net';
 import { applyVcMeetingInviterPolicyPatch } from './services/vc-meeting-inviter-policy.js';
 import type { Duplex } from 'node:stream';
@@ -4351,6 +4355,26 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // 话题聚合检索（一期）：只读查询，挂在上面这条认证 gate 之后，复用现有端口与
+    // Dashboard 访问策略。功能关闭时返回 403 disabled，页面据此回退到原列表。
+    if (url.pathname === TOPIC_SEARCH_ROUTE) {
+      const handled = await handleTopicSearchRequest(req, url, {
+        // 访问范围：本仓库没有 per-user chat ACL——能过上面认证 gate 的身份就是
+        // 宿主可见范围（匿名/只读访客在 gate 处已被 401）。因此这里给部署级
+        // `allowedChatIds`，由 SearchService 再做交集与越权拒绝（filters 只能缩小）。
+        authorize: () => ({ ok: true as const, allowedChatIds: topicSearchConfig().config.allowedChatIds }),
+        search: async (query, caller) => {
+          const runtime = await ensureTopicSearchRuntime();
+          if (!runtime) throw new Error('topic_search_runtime_unavailable');
+          return runtime.search(query, caller);
+        },
+        config: () => topicSearchConfig().config,
+        readJsonBody,
+      });
+      // 摘要文本属于敏感内容：响应显式 no-store（jsonRes 默认不设缓存头）。
+      if (handled) return dashboardControlJson(res, handled.status, handled.body);
+    }
+
     if (url.pathname === '/api/workflows' || url.pathname.startsWith('/api/workflows/')) {
       return jsonRes(res, 410, {
         ok: false,
@@ -8112,8 +8136,8 @@ listenWithProbe({
     },
     log: (m) => logger.info(`[auto-cleanup] ${m}`),
   });
-  // 话题知识后台整理 + 本机检索端点（config-gated，默认关闭）。放在端口绑定回调里：
-  // 端点发现文件要带上真实 dashboard 端口之后才能被 CLI 找到。
+  // 话题知识后台整理（config-gated，默认关闭）。查询接口本身跟着主 server 一起
+  // 注册在路由链里，不额外监听端口、不需要进程外发现文件。
   void startTopicSearchIfEnabled();
 }).catch((err) => {
   clearInterval(listenPendingWarn);
@@ -8270,95 +8294,139 @@ function handlePlatformTeamSync(payload: PlatformTeamSyncMessage): void {
   logger.info(`[platform-tunnel] team-sync 已应用 rev=${applied.rev} teams=${applied.teams.length}`);
 }
 
-// 话题知识（topic-search）：后台增量摘要 + 本机只读检索端点。
-// 缺省全关：没有 `topicSearch` 节或 `enabled=false` 时连库都不打开、不起 listener。
+// 话题知识（topic-search，一期）：后台增量摘要 + 页面查询。
+// 缺省全关：没有 `topicSearch` 节或 `enabled=false` 时不开库、不起定时器、不调模型；
+// 查询接口本身一直注册（关闭时返回 403 disabled，页面据此回退到原列表）。
 // 凭证仍留在各 bot daemon —— 历史经已签名的 `/api/sessions/:id/history` 读取。
 let topicSearchRuntime: import('./topic/runtime.js').TopicRuntime | undefined;
-let topicSearchApi: import('./dashboard/topic-search-api.js').TopicSearchApiHandle | undefined;
+let topicSearchRuntimePromise: Promise<import('./topic/runtime.js').TopicRuntime | null> | undefined;
+
+/** 每次都现读配置：管理员改完配置应立刻影响查询与调度（不做进程内缓存）。 */
+function topicSearchConfig() {
+  return resolveTopicSearchConfig(readGlobalConfig().topicSearch);
+}
+
+/** 懒建 runtime：只有真正要用（查询或调度）时才打开 Topic 库。 */
+async function ensureTopicSearchRuntime(): Promise<import('./topic/runtime.js').TopicRuntime | null> {
+  if (topicSearchRuntime) return topicSearchRuntime;
+  if (!topicSearchRuntimePromise) {
+    topicSearchRuntimePromise = (async () => {
+      try {
+        const [{ createTopicRuntime, buildTopicClients }, { resolveTopicEndpointsFromEnv }, { createDaemonTopicSource }] =
+          await Promise.all([
+            import('./topic/runtime.js'),
+            import('./topic/endpoints.js'),
+            import('./topic/daemon-source.js'),
+          ]);
+        const runtime = createTopicRuntime({
+          readConfig: () => readGlobalConfig().topicSearch,
+          source: createDaemonTopicSource({
+            listSessions: () => aggregator.getSessions(),
+            fetchHistory: async (session, options) => {
+              // 走「增量契约」路由：从最新往旧翻到边界就停，并回报 complete。
+              // 与 `/api/sessions/:id/history`（上下文窗口）不同，这条不会把
+              // 「窗口取满但没覆盖到游标」当成完整增量。
+              const rows = aggregator.getSessions();
+              const row = rows.find(candidate => String(candidate.sessionId ?? '') === session.sessionId);
+              const chatId = String(row?.chatId ?? '');
+              const rootMessageId = String(row?.rootMessageId ?? '');
+              if (!chatId || !rootMessageId) {
+                throw Object.assign(new Error('topic_anchor_missing'), { code: 'source_read_failed' });
+              }
+              const query = new URLSearchParams({ chatId, rootMessageId, limit: String(options.limit) });
+              if (options.after) {
+                const afterTime = Date.parse(options.after.createTime);
+                if (Number.isFinite(afterTime)) query.set('afterTime', String(afterTime));
+                for (const id of options.after.messageIds) query.append('afterId', id);
+              }
+              const upstream = await proxyToDaemon(
+                session.larkAppId ?? '',
+                `/api/topics/messages?${query.toString()}`,
+                { method: 'GET' },
+              );
+              if (!upstream.ok) {
+                throw Object.assign(new Error(`topic_messages http_${upstream.status}`), { code: 'source_read_failed' });
+              }
+              const body = (await upstream.json().catch(() => null)) as
+                | { messages?: unknown; complete?: unknown; nativeThreadId?: unknown }
+                | null;
+              const messages = Array.isArray(body?.messages) ? body?.messages : [];
+              return {
+                messages: messages as Array<{ messageId?: unknown; content?: unknown; createTime?: unknown }>,
+                complete: body?.complete === true,
+                ...(typeof body?.nativeThreadId === 'string' ? { nativeThreadId: body.nativeThreadId } : {}),
+              };
+            },
+            accessPolicyRef: 'deployment:topic-search',
+          }),
+          resolveEnricher: config => buildTopicClients(config, resolveTopicEndpointsFromEnv(config)).enricher,
+          resolveEmbedder: config => buildTopicClients(config, resolveTopicEndpointsFromEnv(config)).embedder,
+          // 已知目录 = 当前聚合到的 thread 话题数；用它判断 coverage 是否 partial。
+          knownTopicCount: () => {
+            const keys = new Set<string>();
+            for (const row of aggregator.getSessions()) {
+              if (!row.chatId || !row.rootMessageId || row.scope === 'chat') continue;
+              keys.add(`${row.chatId}::${row.rootMessageId}`);
+            }
+            return keys.size;
+          },
+          topicUrl: topic => {
+            // 复用聚合行上已经算好的 AppLink：`feishuThreadLink` 只在原生 omt id
+            // 已知时存在，`feishuChatLink` 是群入口兜底。两者都没有就不给 url，
+            // 由页面降级——绝不在这里自己拼一个可能打不开的链接。
+            const row = aggregator.getSessions().find(
+              candidate =>
+                String(candidate.chatId ?? '') === topic.chatId
+                && String(candidate.rootMessageId ?? '') === topic.rootMessageId,
+            );
+            const link = row?.feishuThreadLink ?? row?.feishuChatLink;
+            return typeof link === 'string' && link ? link : undefined;
+          },
+          onReport: (report, slotId) =>
+            logger.info(
+              `[topic-search] ${slotId} checked=${report.topicsChecked} updated=${report.topicsUpdated} skipped=${report.topicsSkipped} failed=${report.topicsFailed}`,
+            ),
+          onError: (error, slotId) =>
+            logger.warn(`[topic-search] ${slotId} 失败：${error instanceof Error ? error.message : String(error)}`),
+        });
+        topicSearchRuntime = runtime;
+        return runtime;
+      } catch (error) {
+        logger.warn(
+          `[topic-search] runtime 初始化失败：${error instanceof Error ? error.message : String(error)}（聊天主链路不受影响）`,
+        );
+        topicSearchRuntimePromise = undefined;
+        return null;
+      }
+    })();
+  }
+  return topicSearchRuntimePromise;
+}
 
 async function startTopicSearchIfEnabled(): Promise<void> {
   try {
-    const { readGlobalConfig } = await import('./global-config.js');
-    const { resolveTopicSearchConfig, topicSearchBlockedReason } = await import('./topic/config.js');
-    const { config: topicConfig, issues } = resolveTopicSearchConfig(readGlobalConfig().topicSearch);
+    const { config: topicConfig, issues } = topicSearchConfig();
     if (!topicConfig.enabled) return;
     if (issues.length > 0) {
       // 配置非法就拒绝启动（fail-closed）：静默回落默认值会让管理员以为定时已生效。
       logger.warn(
-        `[topic-search] 配置非法，未启动：${issues.map(issue => `${issue.field}=${issue.code}`).join(', ')}`,
+        `[topic-search] 配置非法，未启动后台整理：${issues.map(issue => `${issue.field}=${issue.code}`).join(', ')}`,
       );
       return;
     }
     const blocked = topicSearchBlockedReason(topicConfig);
     if (blocked) {
-      logger.warn(`[topic-search] 未启动：${blocked}（需要 enabled + allowedChatIds + llmModelRef）`);
+      logger.warn(`[topic-search] 未启动后台整理：${blocked}（需要 enabled + allowedChatIds + llmModelRef）`);
       return;
     }
-    const [{ createTopicRuntime, buildTopicClients }, { resolveTopicEndpointsFromEnv }, { createDaemonTopicSource }, { startTopicSearchApi }] =
-      await Promise.all([
-        import('./topic/runtime.js'),
-        import('./topic/endpoints.js'),
-        import('./topic/daemon-source.js'),
-        import('./dashboard/topic-search-api.js'),
-      ]);
-
-    const clients = buildTopicClients(topicConfig, resolveTopicEndpointsFromEnv(topicConfig));
-    if (!clients.enricher) {
-      // 摘要模型连不上（缺 BOTMUX_TOPIC_LLM_*）时不要起定时器：那只会每轮失败。
-      logger.warn('[topic-search] 未启动：摘要模型端点未配置（BOTMUX_TOPIC_LLM_BASE_URL / BOTMUX_TOPIC_LLM_MODEL）');
-      return;
-    }
-
-    const source = createDaemonTopicSource({
-      listSessions: () => aggregator.getSessions(),
-      fetchHistory: async (session, limit) => {
-        const upstream = await proxyToDaemon(
-          session.larkAppId ?? '',
-          `/api/sessions/${encodeURIComponent(session.sessionId)}/history?limit=${limit}`,
-          { method: 'GET' },
-        );
-        if (!upstream.ok) {
-          throw Object.assign(new Error(`history http_${upstream.status}`), { code: 'source_read_failed' });
-        }
-        const body = (await upstream.json().catch(() => null)) as { messages?: unknown } | null;
-        const messages = Array.isArray(body?.messages) ? body?.messages : [];
-        return messages as Array<{ messageId?: unknown; content?: unknown; createTime?: unknown }>;
-      },
-      accessPolicyRef: 'deployment:topic-search',
-    });
-
-    topicSearchRuntime = createTopicRuntime({
-      readConfig: () => readGlobalConfig().topicSearch,
-      source,
-      resolveEnricher: () => clients.enricher,
-      resolveEmbedder: () => clients.embedder,
-      // 已知目录 = 当前聚合到的 thread 话题数；用它判断 coverage 是否 partial。
-      knownTopicCount: () => {
-        const keys = new Set<string>();
-        for (const row of aggregator.getSessions()) {
-          if (!row.chatId || !row.rootMessageId || row.scope === 'chat') continue;
-          keys.add(`${row.chatId}::${row.rootMessageId}`);
-        }
-        return keys.size;
-      },
-      onReport: (report, slotId) =>
-        logger.info(
-          `[topic-search] ${slotId} checked=${report.topicsChecked} updated=${report.topicsUpdated} skipped=${report.topicsSkipped} failed=${report.topicsFailed}`,
-        ),
-      onError: (error, slotId) =>
-        logger.warn(`[topic-search] ${slotId} 失败：${error instanceof Error ? error.message : String(error)}`),
-    });
-    topicSearchRuntime.start();
-
-    // 只读检索端点：独立 listener，固定 127.0.0.1 + 动态端口 + 复用 CLI HMAC。
-    topicSearchApi = await startTopicSearchApi({ runtime: topicSearchRuntime });
-    logger.info(`[topic-search] 已启动，检索端点 127.0.0.1:${topicSearchApi.port}`);
+    const runtime = await ensureTopicSearchRuntime();
+    if (!runtime) return;
+    runtime.start();
+    if (runtime.isRunning()) logger.info('[topic-search] 后台增量整理已启动');
   } catch (error) {
     logger.warn(
       `[topic-search] 启动失败：${error instanceof Error ? error.message : String(error)}（聊天主链路不受影响）`,
     );
-    topicSearchRuntime = undefined;
-    topicSearchApi = undefined;
   }
 }
 
@@ -8369,8 +8437,7 @@ function stopTopicSearch(): void {
     // 退出路径不抛：定时器停不下来也要让进程继续关。
   }
   topicSearchRuntime = undefined;
-  void topicSearchApi?.close().catch(() => {});
-  topicSearchApi = undefined;
+  topicSearchRuntimePromise = undefined;
 }
 
 // Graceful shutdown

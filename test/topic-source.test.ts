@@ -86,7 +86,7 @@ describe('增量切分（同毫秒不能丢消息）', () => {
   });
 });
 
-describe('daemon 源：只取尾部窗口时的覆盖判定', () => {
+describe('daemon 源：增量契约的完整性判定', () => {
   const sessions = [
     { sessionId: 's1', chatId: 'oc_1', rootMessageId: 'om_1', title: '话题一', larkAppId: 'app_a', lastMessageAt: 10 },
     { sessionId: 's2', chatId: 'oc_1', rootMessageId: 'om_1', title: '话题一', larkAppId: 'app_b', lastMessageAt: 20 },
@@ -94,12 +94,19 @@ describe('daemon 源：只取尾部窗口时的覆盖判定', () => {
     { sessionId: 's4', chatId: 'oc_3', rootMessageId: 'om_3', scope: 'chat', title: '整群会话', larkAppId: 'app_a' },
   ];
 
-  function build(history: Record<string, Array<{ messageId: string; createTime: number }>>) {
-    const fetchHistory = vi.fn(async (session: { sessionId: string }, limit: number) => {
-      const all = history[session.sessionId] ?? [];
-      void limit;
-      return all;
-    });
+  const entry = {
+    chatId: 'oc_1',
+    rootMessageId: 'om_1',
+    title: '话题一',
+    accessPolicyRef: 'deployment:topic-search',
+  };
+
+  function build(page: { messages?: unknown[]; complete?: boolean; nativeThreadId?: string }) {
+    const fetchHistory = vi.fn(async () => ({
+      messages: page.messages ?? [],
+      complete: page.complete ?? true,
+      ...(page.nativeThreadId ? { nativeThreadId: page.nativeThreadId } : {}),
+    }));
     const source = createDaemonTopicSource({
       listSessions: () => sessions,
       fetchHistory,
@@ -111,52 +118,61 @@ describe('daemon 源：只取尾部窗口时的覆盖判定', () => {
   }
 
   it('同一话题的多个 bot 会话只产出一个话题，并挑最活跃的来源', async () => {
-    const { source } = build({});
+    const { source, fetchHistory } = build({});
     const topics = await source.discoverTopics();
     expect(topics.map(topic => `${topic.chatId}:${topic.rootMessageId}`).sort()).toEqual(['oc_1:om_1', 'oc_2:om_2']);
-    const { fetchHistory } = build({});
-    const local = createDaemonTopicSource({
-      listSessions: () => sessions,
-      fetchHistory,
-      accessPolicyRef: 'deployment:topic-search',
-      windowSize: 2,
-      maxWindow: 2,
-    });
-    await local.discoverTopics();
-    await local.readMessages(
-      { chatId: 'oc_1', rootMessageId: 'om_1', title: '话题一', accessPolicyRef: 'deployment:topic-search' },
-      { limit: 1 },
+    await source.readMessages(entry, { limit: 1 });
+    expect(fetchHistory).toHaveBeenCalledWith(
+      { sessionId: 's2', larkAppId: 'app_b' },
+      expect.objectContaining({ limit: expect.any(Number) }),
     );
-    expect(fetchHistory).toHaveBeenCalledWith({ sessionId: 's2', larkAppId: 'app_b' }, expect.any(Number));
   });
 
-  it('窗口取满且没覆盖到游标 → truncated（上层据此不推进游标）', async () => {
+  it('把游标边界传给 daemon（由它提前停止），而不是自己按「最新 N 条」猜', async () => {
+    const { source, fetchHistory } = build({ messages: [] });
+    await source.readMessages(entry, {
+      limit: 1,
+      after: { createTime: '2026-10-01T00:00:00.000Z', messageIds: ['om_100'] },
+    });
+    expect(fetchHistory).toHaveBeenCalledWith(
+      { sessionId: 's2', larkAppId: 'app_b' },
+      {
+        limit: expect.any(Number),
+        after: { createTime: '2026-10-01T00:00:00.000Z', messageIds: ['om_100'] },
+      },
+    );
+  });
+
+  it('daemon 回报 complete=false → truncated（上层据此不推进游标）', async () => {
     const { source } = build({
-      s2: [
-        { messageId: 'om_101', createTime: Date.parse('2026-10-01T00:01:01.000Z') },
-        { messageId: 'om_102', createTime: Date.parse('2026-10-01T00:01:02.000Z') },
+      complete: false,
+      messages: [
+        { messageId: 'om_101', createTime: Date.parse('2026-10-01T00:01:01.000Z'), content: 'x' },
       ],
     });
-    const page = await source.readMessages(
-      { chatId: 'oc_1', rootMessageId: 'om_1', title: '话题一', accessPolicyRef: 'deployment:topic-search' },
-      { limit: 1, after: { createTime: '2026-10-01T00:00:00.000Z', messageIds: ['om_100'] } },
-    );
-    expect(page.messages).toHaveLength(2);
+    const page = await source.readMessages(entry, {
+      limit: 1,
+      after: { createTime: '2026-10-01T00:00:00.000Z', messageIds: ['om_100'] },
+    });
+    expect(page.messages).toHaveLength(1);
     expect(page.truncated).toBe(true);
   });
 
-  it('窗口覆盖到游标时不算截断（可以正常提交）', async () => {
+  it('complete=true 时可以正常提交，并带回原生话题 id', async () => {
     const { source } = build({
-      s2: [
-        { messageId: 'om_100', createTime: Date.parse('2026-10-01T00:00:00.000Z') },
-        { messageId: 'om_101', createTime: Date.parse('2026-10-01T00:01:00.000Z') },
+      complete: true,
+      nativeThreadId: 'omt_1',
+      messages: [
+        { messageId: 'om_100', createTime: Date.parse('2026-10-01T00:00:00.000Z'), content: 'a' },
+        { messageId: 'om_101', createTime: Date.parse('2026-10-01T00:01:00.000Z'), content: 'b' },
       ],
     });
-    const page = await source.readMessages(
-      { chatId: 'oc_1', rootMessageId: 'om_1', title: '话题一', accessPolicyRef: 'deployment:topic-search' },
-      { limit: 1, after: { createTime: '2026-10-01T00:00:00.000Z', messageIds: ['om_100'] } },
-    );
+    const page = await source.readMessages(entry, {
+      limit: 1,
+      after: { createTime: '2026-10-01T00:00:00.000Z', messageIds: ['om_100'] },
+    });
     expect(page.truncated).toBe(false);
+    expect(page.nativeThreadId).toBe('omt_1');
   });
 
   it('话题没有可用读取来源时报错，而不是返回空批次', async () => {

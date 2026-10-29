@@ -1,173 +1,208 @@
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { IncomingMessage } from 'node:http';
+import { describe, expect, it, vi } from 'vitest';
 
-import { cliAuthBind, signCliAuth } from '../src/dashboard/auth.js';
-import { loopbackFetch } from '../src/core/loopback-fetch.js';
-import { TopicSearchError } from '../src/topic/search.js';
-import type { TopicRuntime } from '../src/topic/runtime.js';
 import {
-  startTopicSearchApi,
-  topicSearchEndpointPath,
-  TOPIC_SEARCH_HEALTH_PATH,
-  TOPIC_SEARCH_PATH,
-  type TopicSearchApiHandle,
+  handleTopicSearchRequest,
+  parseTopicSearchRequestBody,
+  TOPIC_SEARCH_ROUTE,
+  type TopicSearchRouteDeps,
 } from '../src/dashboard/topic-search-api.js';
+import { TopicSearchError } from '../src/topic/search.js';
+import { TOPIC_SEARCH_DEFAULT_CONFIG, type ResolvedTopicSearchConfig } from '../src/topic/config.js';
 
-const SECRET = 'test-dashboard-secret';
+const enabledConfig: ResolvedTopicSearchConfig = {
+  ...TOPIC_SEARCH_DEFAULT_CONFIG,
+  enabled: true,
+  allowedChatIds: ['oc_1'],
+  llmModelRef: 'topic-enricher',
+};
 
-function fakeRuntime(overrides: {
-  enabled?: boolean;
-  allowedChatIds?: string[];
-  search?: (query: unknown, caller: unknown) => Promise<unknown>;
-} = {}): TopicRuntime {
-  const enabled = overrides.enabled ?? true;
-  const allowedChatIds = overrides.allowedChatIds ?? ['oc_1'];
+const searchResult = {
+  items: [
+    {
+      topicKey: 'thread:oc_1:om_1',
+      title: '跨 bot owner 校验',
+      matches: [{ summaryId: 's1', text: '命中摘要', sourceMessageIds: ['om_1'] }],
+      updatedAt: '2026-10-01T00:00:00.000Z',
+    },
+  ],
+  effectiveMode: 'keyword' as const,
+  degradedReasons: [],
+  coverage: { state: 'complete' as const, unindexedKnownTopics: 0 },
+  nextCursor: null,
+};
+
+function deps(overrides: Partial<TopicSearchRouteDeps> = {}): TopicSearchRouteDeps {
   return {
-    config: () => ({
-      config: { enabled, allowedChatIds },
-      issues: [],
-    }),
-    search: vi.fn(
-      overrides.search ??
-        (async () => ({
-          items: [
-            { topicKey: 'thread:oc_1:om_1', title: '话题', matches: [], updatedAt: '2026-10-01T00:00:00.000Z' },
-          ],
-          effectiveMode: 'keyword',
-          degradedReasons: [],
-          coverage: { state: 'complete', unindexedKnownTopics: 0 },
-          nextCursor: null,
-        })),
-    ),
-  } as unknown as TopicRuntime;
-}
-
-function signedHeaders(port: number, secret = SECRET): HeadersInit {
-  const auth = signCliAuth(secret, cliAuthBind('POST', TOPIC_SEARCH_PATH, port));
-  return {
-    'content-type': 'application/json',
-    'x-botmux-cli-ts': auth.ts,
-    'x-botmux-cli-nonce': auth.nonce,
-    'x-botmux-cli-auth': auth.sig,
+    authorize: () => ({ ok: true, allowedChatIds: ['oc_1'] }),
+    search: vi.fn(async () => searchResult),
+    config: () => enabledConfig,
+    // 注入 body 读取，测试里完全绕开真实 socket。
+    readJsonBody: async () => ({ query: 'owner' }),
+    now: () => '2026-10-01T00:00:00.000Z',
+    ...overrides,
   };
 }
 
-let handle: TopicSearchApiHandle | undefined;
-let dir: string;
+function url(pathname = TOPIC_SEARCH_ROUTE): URL {
+  return new URL(pathname, 'http://127.0.0.1:1');
+}
 
-afterEach(async () => {
-  await handle?.close();
-  handle = undefined;
-  if (dir) rmSync(dir, { recursive: true, force: true });
+const req = (method = 'POST') => ({ method } as unknown as IncomingMessage);
+
+describe('话题检索路由：路由与鉴权', () => {
+  it('不是这个路径时返回 null（交给 Dashboard 后续路由）', async () => {
+    expect(await handleTopicSearchRequest(req(), url('/api/sessions'), deps())).toBeNull();
+  });
+
+  it('非 POST 返回 405', async () => {
+    const result = await handleTopicSearchRequest(req('GET'), url(), deps());
+    expect(result).toMatchObject({ status: 405, body: { ok: false, error: 'method_not_allowed' } });
+  });
+
+  it('访问决定为拒绝时原样透传状态与错误码（未登录/越权）', async () => {
+    const denied = await handleTopicSearchRequest(
+      req(),
+      url(),
+      deps({ authorize: () => ({ ok: false, status: 403, error: 'sensitive_history_denied' }) }),
+    );
+    expect(denied).toMatchObject({ status: 403, body: { ok: false, error: 'sensitive_history_denied' } });
+  });
+
+  it('功能未启用时返回 403 disabled（页面据此回退原列表）', async () => {
+    const result = await handleTopicSearchRequest(
+      req(),
+      url(),
+      deps({ config: () => ({ ...enabledConfig, enabled: false }) }),
+    );
+    expect(result).toMatchObject({ status: 403, body: { ok: false, error: 'disabled' } });
+  });
 });
 
-describe('本机检索端点', () => {
-  it('写端点发现文件，关闭时删除', async () => {
-    dir = mkdtempSync(join(tmpdir(), 'topic-api-test-'));
-    handle = await startTopicSearchApi({ runtime: fakeRuntime(), dataDir: dir, secret: SECRET });
-    expect(handle.port).toBeGreaterThan(0);
-    const endpointPath = topicSearchEndpointPath(dir);
-    expect(existsSync(endpointPath)).toBe(true);
-    await handle.close();
-    handle = undefined;
-    expect(existsSync(endpointPath)).toBe(false);
+describe('话题检索路由：请求校验', () => {
+  it('body 不是 JSON 时 400，超限时 413', async () => {
+    const badJson = await handleTopicSearchRequest(
+      req(),
+      url(),
+      deps({
+        readJsonBody: async () => {
+          throw new Error('bad');
+        },
+      }),
+    );
+    expect(badJson).toMatchObject({ status: 400, body: { ok: false, error: 'bad_json' } });
+
+    const tooLarge = await handleTopicSearchRequest(
+      req(),
+      url(),
+      deps({
+        readJsonBody: async () => {
+          throw new Error('body_too_large');
+        },
+      }),
+    );
+    expect(tooLarge).toMatchObject({ status: 413, body: { ok: false, error: 'body_too_large' } });
   });
 
-  it('缺少签名头或签名不对一律 401', async () => {
-    dir = mkdtempSync(join(tmpdir(), 'topic-api-test-'));
-    handle = await startTopicSearchApi({ runtime: fakeRuntime(), dataDir: dir, secret: SECRET });
-    const url = `http://127.0.0.1:${handle.port}${TOPIC_SEARCH_PATH}`;
-
-    const noHeaders = await loopbackFetch(url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: '{"query":"owner"}',
-    });
-    expect(noHeaders.status).toBe(401);
-
-    const badSig = await loopbackFetch(url, {
-      method: 'POST',
-      headers: signedHeaders(handle.port, 'a-different-secret'),
-      body: '{"query":"owner"}',
-    });
-    expect(badSig.status).toBe(401);
-    expect((await badSig.json()).reason).toBe('sig_mismatch');
+  it('空/超长 query、limit 越界、未知 mode、filters 形状错误各有明确错误码', () => {
+    for (const body of [
+      {},
+      { query: '   ' },
+      { query: 'x'.repeat(201) },
+      { query: 'ok', limit: 0 },
+      { query: 'ok', limit: 51 },
+      { query: 'ok', mode: 'semantic' },
+      { query: 'ok', filters: { chatIds: 'oc_1' } },
+      { query: 'ok', filters: { sourceFrom: 42 } },
+      { query: 'ok', cursor: 7 },
+    ]) {
+      expect(() => parseTopicSearchRequestBody(body), JSON.stringify(body)).toThrow(TopicSearchError);
+    }
   });
 
-  it('签名正确时返回检索结果；健康检查不需要签名', async () => {
-    dir = mkdtempSync(join(tmpdir(), 'topic-api-test-'));
-    const runtime = fakeRuntime();
-    handle = await startTopicSearchApi({ runtime, dataDir: dir, secret: SECRET });
-
-    const health = await loopbackFetch(`http://127.0.0.1:${handle.port}${TOPIC_SEARCH_HEALTH_PATH}`, {
-      method: 'GET',
+  it('合法请求解析出规范化的查询对象', () => {
+    expect(
+      parseTopicSearchRequestBody({
+        query: '  跨 bot owner  ',
+        mode: 'hybrid',
+        limit: 3,
+        filters: { chatIds: ['oc_1'], sourceFrom: '2026-10-01T00:00:00Z', sourceTo: null },
+        cursor: null,
+      }),
+    ).toEqual({
+      query: '跨 bot owner',
+      mode: 'hybrid',
+      limit: 3,
+      filters: { chatIds: ['oc_1'], sourceFrom: '2026-10-01T00:00:00Z', sourceTo: null },
+      cursor: null,
     });
-    expect(health.status).toBe(200);
+  });
+});
 
-    const response = await loopbackFetch(`http://127.0.0.1:${handle.port}${TOPIC_SEARCH_PATH}`, {
-      method: 'POST',
-      headers: signedHeaders(handle.port),
-      body: JSON.stringify({ query: 'owner', mode: 'keyword', limit: 3 }),
-    });
-    expect(response.status).toBe(200);
-    const payload = (await response.json()) as { ok: boolean; items: unknown[]; effectiveMode: string };
-    expect(payload.ok).toBe(true);
-    expect(payload.items).toHaveLength(1);
-    expect(payload.effectiveMode).toBe('keyword');
-    expect(runtime.search).toHaveBeenCalledWith({ query: 'owner', mode: 'keyword', limit: 3 }, { allowedChatIds: ['oc_1'] });
+describe('话题检索路由：响应与错误映射', () => {
+  it('成功时返回 ok + 检索结果，并把访问范围传给 SearchService', async () => {
+    const search = vi.fn(async () => searchResult);
+    const result = await handleTopicSearchRequest(
+      req(),
+      url(),
+      deps({
+        search,
+        authorize: () => ({ ok: true, allowedChatIds: ['oc_1', 'oc_2'] }),
+        readJsonBody: async () => ({ query: 'owner', mode: 'keyword', limit: 2 }),
+      }),
+    );
+    expect(result?.status).toBe(200);
+    expect(result?.body).toMatchObject({ ok: true, generatedAt: '2026-10-01T00:00:00.000Z', ...searchResult });
+    expect(search).toHaveBeenCalledWith(
+      { query: 'owner', mode: 'keyword', limit: 2 },
+      { allowedChatIds: ['oc_1', 'oc_2'] },
+    );
   });
 
-  it('功能未启用返回 403，非法查询返回 400，越权过滤返回 403', async () => {
-    dir = mkdtempSync(join(tmpdir(), 'topic-api-test-'));
-    handle = await startTopicSearchApi({
-      runtime: fakeRuntime({ enabled: false }),
-      dataDir: dir,
-      secret: SECRET,
-    });
-    const disabled = await loopbackFetch(`http://127.0.0.1:${handle.port}${TOPIC_SEARCH_PATH}`, {
-      method: 'POST',
-      headers: signedHeaders(handle.port),
-      body: '{"query":"owner"}',
-    });
-    expect(disabled.status).toBe(403);
-    await handle.close();
-    handle = undefined;
-
-    handle = await startTopicSearchApi({
-      runtime: fakeRuntime({
+  it('检索层错误映射为 403/429/400，未知异常映射 503 且不泄露细节', async () => {
+    const forbidden = await handleTopicSearchRequest(
+      req(),
+      url(),
+      deps({
         search: async () => {
           throw new TopicSearchError('forbidden', 'nope');
         },
       }),
-      dataDir: dir,
-      secret: SECRET,
-    });
-    const forbidden = await loopbackFetch(`http://127.0.0.1:${handle.port}${TOPIC_SEARCH_PATH}`, {
-      method: 'POST',
-      headers: signedHeaders(handle.port),
-      body: '{"query":"owner","filters":{"chatIds":["oc_9"]}}',
-    });
-    expect(forbidden.status).toBe(403);
-    expect((await forbidden.json()).error).toBe('forbidden');
+    );
+    expect(forbidden).toMatchObject({ status: 403, body: { error: 'forbidden' } });
 
-    const invalid = await loopbackFetch(`http://127.0.0.1:${handle.port}${TOPIC_SEARCH_PATH}`, {
-      method: 'POST',
-      headers: signedHeaders(handle.port),
-      body: '{"query":""}',
-    });
-    expect(invalid.status).toBe(400);
-  });
+    const budget = await handleTopicSearchRequest(
+      req(),
+      url(),
+      deps({
+        search: async () => {
+          throw new TopicSearchError('budget_exceeded', 'too much');
+        },
+      }),
+    );
+    expect(budget).toMatchObject({ status: 429, body: { error: 'budget_exceeded' } });
 
-  it('其它路径 404，GET 检索路径 405', async () => {
-    dir = mkdtempSync(join(tmpdir(), 'topic-api-test-'));
-    handle = await startTopicSearchApi({ runtime: fakeRuntime(), dataDir: dir, secret: SECRET });
-    const notFound = await loopbackFetch(`http://127.0.0.1:${handle.port}/api/nope`, { method: 'GET' });
-    expect(notFound.status).toBe(404);
-    const wrongMethod = await loopbackFetch(`http://127.0.0.1:${handle.port}${TOPIC_SEARCH_PATH}`, {
-      method: 'GET',
-    });
-    expect(wrongMethod.status).toBe(405);
+    const cursor = await handleTopicSearchRequest(
+      req(),
+      url(),
+      deps({
+        search: async () => {
+          throw new TopicSearchError('invalid_cursor', 'stale');
+        },
+      }),
+    );
+    expect(cursor).toMatchObject({ status: 400, body: { error: 'invalid_cursor' } });
+
+    const boom = await handleTopicSearchRequest(
+      req(),
+      url(),
+      deps({
+        search: async () => {
+          throw new Error('sqlite: /Users/someone/.botmux/topic-search.sqlite is locked');
+        },
+      }),
+    );
+    expect(boom).toMatchObject({ status: 503, body: { ok: false, error: 'search_unavailable' } });
+    expect(JSON.stringify(boom?.body)).not.toContain('.botmux');
   });
 });

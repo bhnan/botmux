@@ -73,6 +73,7 @@ export {
   createDaemonTopicSource,
   DAEMON_HISTORY_MAX_LIMIT,
   type DaemonHistoryMessage,
+  type DaemonHistoryPage,
   type DaemonTopicSourceDeps,
   type TopicSourceSessionRow,
 } from './daemon-source.js';
