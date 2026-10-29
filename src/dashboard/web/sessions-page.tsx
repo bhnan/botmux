@@ -142,9 +142,32 @@ type FiltersState = {
   showUnknownChats: boolean;
   active: boolean;
   cli: Set<string>;
+  /** 话题时间口径：'' = 不限；两种口径互斥，不隐式组合。 */
+  topicTimeField: '' | 'created' | 'latestMessage';
+  /** 本地日期（YYYY-MM-DD），提交时换算成带时区的 ISO。 */
+  topicTimeFrom: string;
+  topicTimeTo: string;
 };
 
 type ChatFilterOption = { value: string; label: string };
+
+/** 本地日期 → 带时区 ISO；截止日包含当天 23:59:59.999。 */
+function topicTimeFilterFromFilters(filters: FiltersState): TopicSearchTimeFilter | null {
+  if (!filters.topicTimeField) return null;
+  const fromDate = filters.topicTimeFrom.trim();
+  const toDate = filters.topicTimeTo.trim();
+  if (!fromDate && !toDate) return null;
+  const parse = (value: string, endOfDay: boolean): string | null => {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+    const date = new Date(`${value}T${endOfDay ? '23:59:59.999' : '00:00:00.000'}`);
+    return Number.isNaN(date.getTime()) ? null : date.toISOString();
+  };
+  const from = fromDate ? parse(fromDate, false) : null;
+  const to = toDate ? parse(toDate, true) : null;
+  if (!from && !to) return null;
+  if (from && to && Date.parse(from) > Date.parse(to)) return null;
+  return { field: filters.topicTimeField, from, to };
+}
 
 type ChatBotsMap = Map<string, { botIds: Set<string>; observedNames: Set<string> }>;
 
@@ -674,6 +697,9 @@ function SessionsFilterDrawer(props: {
       showUnknownChats: false,
       active: true,
       cli: new Set(CLI_FILTER_OPTIONS),
+      topicTimeField: '',
+      topicTimeFrom: '',
+      topicTimeTo: '',
     }));
   };
   return (
@@ -769,6 +795,36 @@ function SessionsFilterDrawer(props: {
             </div>
           </div>
         </div>
+        <div className="sessions-filter-field">
+          <span className="sessions-filter-label">{t('sessions.topicTime.label')}</span>
+          <select
+            value={props.filters.topicTimeField}
+            onChange={event => props.setFilters(prev => ({
+              ...prev,
+              topicTimeField: event.currentTarget.value as FiltersState['topicTimeField'],
+            }))}
+          >
+            <option value="">{t('sessions.topicTime.any')}</option>
+            <option value="created">{t('sessions.topicTime.created')}</option>
+            <option value="latestMessage">{t('sessions.topicTime.latestMessage')}</option>
+          </select>
+          <div className="sessions-topic-time-range">
+            <input
+              type="date"
+              aria-label={t('sessions.topicTime.from')}
+              value={props.filters.topicTimeFrom}
+              onChange={event => props.setFilters(prev => ({ ...prev, topicTimeFrom: event.currentTarget.value }))}
+            />
+            <span>{t('sessions.topicTime.to')}</span>
+            <input
+              type="date"
+              aria-label={t('sessions.topicTime.to')}
+              value={props.filters.topicTimeTo}
+              onChange={event => props.setFilters(prev => ({ ...prev, topicTimeTo: event.currentTarget.value }))}
+            />
+          </div>
+          <span className="sessions-filter-hint">{t('sessions.topicTime.hint')}</span>
+        </div>
         <div className="sessions-filter-toggles">
           <label className="filter-toggle">
             <input
@@ -863,6 +919,7 @@ function SessionsFilters(props: {
     props.filters.botTriggeredTopics,
     props.filters.showUnknownChats,
     !props.filters.active,
+    Boolean(props.filters.topicTimeField && (props.filters.topicTimeFrom || props.filters.topicTimeTo)),
   ].filter(Boolean).length;
 
   return (
@@ -1714,6 +1771,12 @@ export type TopicSearchMatch = {
   sourceMessageIds: string[];
 };
 
+export type TopicSearchTimeFilter = {
+  field: 'created' | 'latestMessage';
+  from?: string | null;
+  to?: string | null;
+};
+
 export type TopicSearchHit = {
   topicKey: string;
   title: string;
@@ -1721,12 +1784,16 @@ export type TopicSearchHit = {
   matches: TopicSearchMatch[];
   updatedAt: string;
   sourceThroughAt?: string;
+  topicCreatedAt?: string;
+  latestMessageAt?: string;
+  timeMetadata?: 'synced' | 'partial' | 'unknown';
   degraded?: string[];
 };
 
 export type TopicSearchCoverage = {
   state: 'complete' | 'partial';
   unindexedKnownTopics: number;
+  unknownTimeTopics: number;
 };
 
 export type TopicSearchStatus = 'idle' | 'loading' | 'ready' | 'error' | 'disabled';
@@ -1734,6 +1801,9 @@ export type TopicSearchStatus = 'idle' | 'loading' | 'ready' | 'error' | 'disabl
 export type TopicSearchViewState = {
   status: TopicSearchStatus;
   query: string;
+  /** Stable signature of the selected topic-time filter (null = none). */
+  timeFilterKey: string;
+  timeFilter: TopicSearchTimeFilter | null;
   requestId: number;
   items: TopicSearchHit[];
   coverage: TopicSearchCoverage;
@@ -1744,12 +1814,18 @@ export type TopicSearchViewState = {
   loadMoreFailed: boolean;
 };
 
+export function topicTimeFilterKey(filter: TopicSearchTimeFilter | null): string {
+  return filter ? JSON.stringify({ field: filter.field, from: filter.from ?? null, to: filter.to ?? null }) : '';
+}
+
 export const initialTopicSearchState: TopicSearchViewState = {
   status: 'idle',
   query: '',
+  timeFilterKey: '',
+  timeFilter: null,
   requestId: 0,
   items: [],
-  coverage: { state: 'complete', unindexedKnownTopics: 0 },
+  coverage: { state: 'complete', unindexedKnownTopics: 0, unknownTimeTopics: 0 },
   degradedReasons: [],
   nextCursor: null,
   loadingMore: false,
@@ -1757,10 +1833,17 @@ export const initialTopicSearchState: TopicSearchViewState = {
 };
 
 export type TopicSearchAction =
-  | { type: 'start'; query: string; requestId: number }
+  | {
+    type: 'start';
+    query: string;
+    timeFilter: TopicSearchTimeFilter | null;
+    timeFilterKey: string;
+    requestId: number;
+  }
   | {
     type: 'success';
     query: string;
+    timeFilterKey: string;
     requestId: number;
     items: TopicSearchHit[];
     coverage: TopicSearchCoverage;
@@ -1770,18 +1853,19 @@ export type TopicSearchAction =
   | {
     type: 'moreSuccess';
     query: string;
+    timeFilterKey: string;
     requestId: number;
     items: TopicSearchHit[];
     coverage: TopicSearchCoverage;
     degradedReasons: string[];
     nextCursor: string | null;
   }
-  | { type: 'moreStart'; query: string; requestId: number }
-  | { type: 'moreFailure'; query: string; requestId: number }
+  | { type: 'moreStart'; query: string; timeFilterKey: string; requestId: number }
+  | { type: 'moreFailure'; query: string; timeFilterKey: string; requestId: number }
   /** Scope refusal for a page-local narrowing filter: fall back to the original
    * local list instead of showing an error the user cannot act on. */
-  | { type: 'fallback'; query: string; requestId: number }
-  | { type: 'failure'; query: string; requestId: number; disabled: boolean }
+  | { type: 'fallback'; query: string; timeFilterKey: string; requestId: number }
+  | { type: 'failure'; query: string; timeFilterKey: string; requestId: number; disabled: boolean }
   | { type: 'reset' };
 
 function topicSearchActionIsCurrent(
@@ -1790,16 +1874,18 @@ function topicSearchActionIsCurrent(
 ): boolean {
   return state.status === 'loading'
     && state.requestId === action.requestId
-    && state.query === action.query;
+    && state.query === action.query
+    && (state.timeFilterKey ?? '') === (action.timeFilterKey ?? '');
 }
 
 function topicSearchMoreIsCurrent(
   state: TopicSearchViewState,
-  action: { query: string; requestId: number },
+  action: { query: string; timeFilterKey: string; requestId: number },
 ): boolean {
   return state.status === 'ready'
     && state.requestId === action.requestId
-    && state.query === action.query;
+    && state.query === action.query
+    && (state.timeFilterKey ?? '') === (action.timeFilterKey ?? '');
 }
 
 /** Request-scoped reducer: a response only lands while its query/request id is
@@ -1817,6 +1903,8 @@ export function topicSearchReducer(
         ...initialTopicSearchState,
         status: 'loading',
         query: action.query,
+        timeFilter: action.timeFilter ?? null,
+        timeFilterKey: action.timeFilterKey ?? '',
         requestId: action.requestId,
       };
     case 'success':
@@ -1887,6 +1975,8 @@ export type TopicSearchRequestOptions = {
   cursor?: string | null;
   /** Narrow the query to one chat (server-side `filters.chatIds`). */
   chatId?: string;
+  /** Explicit topic-time filter; omitted = no time filter. */
+  timeFilter?: TopicSearchTimeFilter | null;
   fetchImpl?: (input: any, init?: any) => Promise<any>;
 };
 
@@ -1901,8 +1991,13 @@ function topicSearchPageFromBody(body: any): {
     ? {
       state: 'partial',
       unindexedKnownTopics: Math.max(0, Number(body.coverage.unindexedKnownTopics) || 0),
+      unknownTimeTopics: Math.max(0, Number(body.coverage.unknownTimeTopics) || 0),
     }
-    : { state: 'complete', unindexedKnownTopics: 0 };
+    : {
+      state: 'complete',
+      unindexedKnownTopics: 0,
+      unknownTimeTopics: Math.max(0, Number(body.coverage?.unknownTimeTopics) || 0),
+    };
   const degradedReasons = Array.isArray(body.degradedReasons)
     ? body.degradedReasons.map((reason: unknown) => String(reason))
     : [];
@@ -1918,13 +2013,16 @@ export async function requestTopicSearch(
   options: TopicSearchRequestOptions = {},
 ): Promise<TopicSearchAction | null> {
   const trimmed = query.trim();
-  if (!trimmed) return null;
+  const timeFilter = options.timeFilter ?? null;
+  const timeFilterKey = topicTimeFilterKey(timeFilter);
+  if (!trimmed && !timeFilter) return null;
   const cursor = options.cursor ?? null;
   const fetchImpl = options.fetchImpl ?? fetch;
   const chatId = options.chatId?.trim() ?? '';
   const body: Record<string, unknown> = { query: trimmed, limit: 30 };
   if (cursor) body.cursor = cursor;
   if (chatId) body.filters = { chatIds: [chatId] };
+  if (timeFilter) body.timeFilter = timeFilter;
   try {
     const response = await fetchImpl('/api/topic-search', {
       method: 'POST',
@@ -1936,32 +2034,33 @@ export async function requestTopicSearch(
     const responseBody = await response.json().catch(() => null);
     if (response.status === 403 && responseBody?.error === 'disabled') {
       return cursor
-        ? { type: 'moreFailure', query: trimmed, requestId }
-        : { type: 'failure', query: trimmed, requestId, disabled: true };
+        ? { type: 'moreFailure', query: trimmed, timeFilterKey, requestId }
+        : { type: 'failure', query: trimmed, timeFilterKey, requestId, disabled: true };
     }
     if (response.status === 403 && responseBody?.error === 'forbidden') {
       // A page-local chat filter can point outside the indexed scope. That is
       // not an error the user can fix: keep the original local filtering.
       return cursor
-        ? { type: 'moreFailure', query: trimmed, requestId }
-        : { type: 'fallback', query: trimmed, requestId };
+        ? { type: 'moreFailure', query: trimmed, timeFilterKey, requestId }
+        : { type: 'fallback', query: trimmed, timeFilterKey, requestId };
     }
     if (!response.ok || responseBody?.ok !== true) {
       return cursor
-        ? { type: 'moreFailure', query: trimmed, requestId }
-        : { type: 'failure', query: trimmed, requestId, disabled: false };
+        ? { type: 'moreFailure', query: trimmed, timeFilterKey, requestId }
+        : { type: 'failure', query: trimmed, timeFilterKey, requestId, disabled: false };
     }
     const page = topicSearchPageFromBody(responseBody);
     return {
       type: cursor ? 'moreSuccess' : 'success',
       query: trimmed,
+      timeFilterKey,
       requestId,
       ...page,
     };
   } catch {
     return cursor
-      ? { type: 'moreFailure', query: trimmed, requestId }
-      : { type: 'failure', query: trimmed, requestId, disabled: false };
+      ? { type: 'moreFailure', query: trimmed, timeFilterKey, requestId }
+      : { type: 'failure', query: trimmed, timeFilterKey, requestId, disabled: false };
   }
 }
 
@@ -2004,7 +2103,8 @@ function TopicSearchBanner(props: {
   if (search.status !== 'ready') return null;
   const partial = search.coverage.state === 'partial';
   const degraded = search.degradedReasons.length > 0;
-  if (!partial && !degraded) return null;
+  const unknownTime = search.coverage.unknownTimeTopics > 0;
+  if (!partial && !degraded && !unknownTime) return null;
   return (
     <div
       className="sessions-topic-search-notes"
@@ -2014,6 +2114,11 @@ function TopicSearchBanner(props: {
       {partial ? (
         <p className="sessions-topic-search-note">
           {t('sessions.topic.partial', { count: search.coverage.unindexedKnownTopics })}
+        </p>
+      ) : null}
+      {unknownTime ? (
+        <p className="sessions-topic-search-note" data-search-unknown-time={search.coverage.unknownTimeTopics}>
+          {t('sessions.topic.timeUnknown', { count: search.coverage.unknownTimeTopics })}
         </p>
       ) : null}
       {degraded ? (
@@ -2047,6 +2152,16 @@ function TopicSearchHitDetails(props: {
         </p>
       ))}
       <div className="session-topic-hit-meta">
+        {hit.topicCreatedAt ? (
+          <span className="session-topic-updated" data-search-created-at={hit.topicCreatedAt}>
+            {t('sessions.topic.timeCreated')}: {relTime(Date.parse(hit.topicCreatedAt))}
+          </span>
+        ) : null}
+        {hit.latestMessageAt ? (
+          <span className="session-topic-updated" data-search-latest-at={hit.latestMessageAt}>
+            {t('sessions.topic.timeLatest')}: {relTime(Date.parse(hit.latestMessageAt))}
+          </span>
+        ) : null}
         <span className="session-topic-updated">
           {t('sessions.topic.updatedAt')}: {relTime(Date.parse(hit.updatedAt))}
         </span>
@@ -3237,6 +3352,9 @@ function SessionsPage(): React.JSX.Element {
     showUnknownChats: readStoredSessionsShowUnknownChats(windowStorage()),
     active: true,
     cli: new Set(CLI_FILTER_OPTIONS),
+    topicTimeField: '',
+    topicTimeFrom: '',
+    topicTimeTo: '',
   });
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [sortKey, setSortKey] = useState('lastMessageAt');
@@ -3344,22 +3462,38 @@ function SessionsPage(): React.JSX.Element {
   // server-side narrowing filter; unindexed chats fall back to local filtering.
   const trimmedTopicQuery = filters.q.trim();
   const topicSearchChatId = filters.chat;
+  const topicSearchTimeFilter = topicTimeFilterFromFilters(filters);
+  const topicSearchTimeFilterKey = topicTimeFilterKey(topicSearchTimeFilter);
+  const hasTopicSearchCriteria = Boolean(trimmedTopicQuery || topicSearchTimeFilter);
   useEffect(() => {
-    if (!trimmedTopicQuery || viewMode !== 'topics') {
+    if (!hasTopicSearchCriteria || viewMode !== 'topics') {
       dispatchTopicSearch({ type: 'reset' });
       return;
     }
     const requestId = ++topicSearchRequestRef.current;
-    dispatchTopicSearch({ type: 'start', query: trimmedTopicQuery, requestId });
+    dispatchTopicSearch({
+      type: 'start',
+      query: trimmedTopicQuery,
+      timeFilter: topicSearchTimeFilter,
+      timeFilterKey: topicSearchTimeFilterKey,
+      requestId,
+    });
     let cancelled = false;
     void (async () => {
       const action = await requestTopicSearch(trimmedTopicQuery, requestId, {
         ...(topicSearchChatId ? { chatId: topicSearchChatId } : {}),
+        ...(topicSearchTimeFilter ? { timeFilter: topicSearchTimeFilter } : {}),
       });
       if (!cancelled && action) dispatchTopicSearch(action);
     })();
     return () => { cancelled = true; };
-  }, [trimmedTopicQuery, viewMode, topicSearchRetry, topicSearchChatId]);
+  }, [
+    trimmedTopicQuery,
+    viewMode,
+    topicSearchRetry,
+    topicSearchChatId,
+    topicSearchTimeFilterKey,
+  ]);
 
   // Pagination keeps the same request id: a result for a query that has since
   // been replaced is dropped by the reducer, but pages of the current query
@@ -3368,11 +3502,17 @@ function SessionsPage(): React.JSX.Element {
     if (topicSearch.status !== 'ready' || !topicSearch.nextCursor) return;
     const requestId = topicSearch.requestId;
     const cursor = topicSearch.nextCursor;
-    dispatchTopicSearch({ type: 'moreStart', query: topicSearch.query, requestId });
+    dispatchTopicSearch({
+      type: 'moreStart',
+      query: topicSearch.query,
+      timeFilterKey: topicSearch.timeFilterKey,
+      requestId,
+    });
     void (async () => {
       const action = await requestTopicSearch(topicSearch.query, requestId, {
         cursor,
         ...(topicSearchChatId ? { chatId: topicSearchChatId } : {}),
+        ...(topicSearch.timeFilter ? { timeFilter: topicSearch.timeFilter } : {}),
       });
       if (action) dispatchTopicSearch(action);
     })();
@@ -3380,7 +3520,10 @@ function SessionsPage(): React.JSX.Element {
 
   // Only a result that belongs to the query currently in the box may replace
   // the local list. A late response for an older query never reaches the view.
-  const topicSearchView = viewMode === 'topics' && trimmedTopicQuery && topicSearch.query === trimmedTopicQuery
+  const topicSearchView = viewMode === 'topics'
+    && hasTopicSearchCriteria
+    && topicSearch.query === trimmedTopicQuery
+    && topicSearch.timeFilterKey === topicSearchTimeFilterKey
     ? topicSearch
     : undefined;
 

@@ -20,6 +20,8 @@ import {
   type TopicSearchQuery,
   type TopicSearchResponse,
   type TopicSearchService,
+  type TopicTimeField,
+  type TopicTimeFilter,
 } from '../topic/search.js';
 import type { ResolvedTopicSearchConfig } from '../topic/config.js';
 
@@ -96,6 +98,34 @@ function parseFilters(raw: unknown): TopicSearchFilters | undefined {
   return filters;
 }
 
+function parseTimeFilter(raw: unknown): TopicTimeFilter | undefined {
+  if (raw === undefined) return undefined;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new TopicSearchError('invalid_filter', 'timeFilter must be an object');
+  }
+  const record = raw as Record<string, unknown>;
+  if (record.field !== 'created' && record.field !== 'latestMessage') {
+    throw new TopicSearchError('invalid_filter', 'timeFilter.field must be created/latestMessage');
+  }
+  const filter: TopicTimeFilter = { field: record.field as TopicTimeField };
+  for (const key of ['from', 'to'] as const) {
+    const value = record[key];
+    if (value === undefined) continue;
+    if (value !== null && typeof value !== 'string') {
+      throw new TopicSearchError('invalid_filter', `timeFilter.${key} must be an ISO-8601 string or null`);
+    }
+    if (typeof value === 'string' && Number.isNaN(Date.parse(value))) {
+      throw new TopicSearchError('invalid_filter', `timeFilter.${key} must be an ISO-8601 timestamp`);
+    }
+    filter[key] = value as string | null;
+  }
+  if (!filter.from && !filter.to) {
+    // 只选了口径、没给范围：视为未启用时间筛选，避免静默按「全部时间」返回。
+    return undefined;
+  }
+  return filter;
+}
+
 /** 请求体 → 查询对象。纯函数，便于直接测错误码。 */
 export function parseTopicSearchRequestBody(body: unknown): TopicSearchQuery {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
@@ -103,8 +133,14 @@ export function parseTopicSearchRequestBody(body: unknown): TopicSearchQuery {
   }
   const record = body as Record<string, unknown>;
   const query = typeof record.query === 'string' ? record.query.trim() : '';
-  if (!query) throw new TopicSearchError('invalid_query', 'query must not be empty');
+  if (record.query !== undefined && typeof record.query !== 'string') {
+    throw new TopicSearchError('invalid_query', 'query must be a string');
+  }
   if (query.length > MAX_QUERY_CHARS) throw new TopicSearchError('invalid_query', 'query is too long');
+  const timeFilter = parseTimeFilter(record.timeFilter);
+  if (!query && !timeFilter) {
+    throw new TopicSearchError('invalid_query', 'query or timeFilter is required');
+  }
 
   let limit: number | undefined;
   if (record.limit !== undefined) {
@@ -130,6 +166,7 @@ export function parseTopicSearchRequestBody(body: unknown): TopicSearchQuery {
   return {
     query,
     ...(filters ? { filters } : {}),
+    ...(timeFilter ? { timeFilter } : {}),
     ...(mode ? { mode: mode as TopicSearchMode } : {}),
     ...(limit === undefined ? {} : { limit }),
     ...(cursor === undefined ? {} : { cursor: cursor as string | null }),

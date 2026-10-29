@@ -8352,7 +8352,13 @@ async function ensureTopicSearchRuntime(): Promise<import('./topic/runtime.js').
                 throw Object.assign(new Error(`topic_messages http_${upstream.status}`), { code: 'source_read_failed' });
               }
               const body = (await upstream.json().catch(() => null)) as
-                | { messages?: unknown; complete?: unknown; nativeThreadId?: unknown; verifiedThread?: unknown }
+                | {
+                  messages?: unknown;
+                  complete?: unknown;
+                  nativeThreadId?: unknown;
+                  verifiedThread?: unknown;
+                  topicCreatedAt?: unknown;
+                }
                 | null;
               return parseDaemonHistoryBody(body);
             },

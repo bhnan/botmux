@@ -57,6 +57,8 @@ export interface DaemonHistoryPage {
   nativeThreadId?: string;
   /** false = 退化成按 root_id 扫群，回复可能缺席 → 不能据此判删除。 */
   verifiedThread?: boolean;
+  /** 根消息创建时间（话题创建时间），ISO-8601；缺失 = 未同步。 */
+  topicCreatedAt?: string;
 }
 
 export interface DaemonTopicSourceDeps {
@@ -90,6 +92,7 @@ export function parseDaemonHistoryBody(body: unknown): DaemonHistoryPage {
     messages: Array.isArray(record.messages) ? record.messages as DaemonHistoryMessage[] : [],
     complete: record.complete === true,
     ...(typeof record.nativeThreadId === 'string' ? { nativeThreadId: record.nativeThreadId } : {}),
+    ...(typeof record.topicCreatedAt === 'string' ? { topicCreatedAt: record.topicCreatedAt } : {}),
     verifiedThread: record.verifiedThread === true,
   };
 }
@@ -194,8 +197,11 @@ export function createDaemonTopicSource(deps: DaemonTopicSourceDeps): TopicHisto
     );
     // daemon 侧已经按边界提前停止；`complete` 是唯一的完整性判据，不再靠
     // 「窗口是否取满 + 时间戳比较」去猜（那会在同毫秒多条消息时判断错）。
+    const latest = messages.length > 0 ? messages[messages.length - 1].createTime : undefined;
     return {
       messages,
+      ...(latest ? { latestMessageAt: latest } : {}),
+      ...(page.topicCreatedAt ? { topicCreatedAt: page.topicCreatedAt } : {}),
       truncated: !page.complete,
       verifiedThread: page.verifiedThread === true,
       // 原生话题 id 只接受 `omt_*` 形状：它只用于跳转，形状不对就当作没有，

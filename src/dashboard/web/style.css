@@ -33825,6 +33825,32 @@ body:has(.workbench-route-host) { min-width: 0; }
   font-size: var(--fs-13);
 }
 
+.sessions-topic-time-range {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: var(--fs-12);
+}
+
+.sessions-topic-time-range input {
+  width: 100%;
+  height: var(--button-height);
+  padding: 0 var(--sp-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background-color: var(--surface-raised);
+  color: var(--fg);
+  font-size: var(--fs-12);
+}
+
+.sessions-filter-hint {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
 .sessions-filter-cli {
   display: grid;
   gap: var(--sp-2);

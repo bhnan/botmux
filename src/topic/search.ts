@@ -37,13 +37,26 @@ export class TopicSearchError extends Error {
 
 export interface TopicSearchFilters {
   chatIds?: string[];
+  /** @deprecated 旧参数：等价于 `timeFilter.field=latestMessage`，会带降级标记。 */
   sourceFrom?: string | null;
+  /** @deprecated 同 `sourceFrom`。 */
   sourceTo?: string | null;
 }
 
+export type TopicTimeField = 'created' | 'latestMessage';
+
+/** 话题时间筛选：两种口径互斥，由调用方明确选择；不隐式组合。 */
+export interface TopicTimeFilter {
+  field: TopicTimeField;
+  from?: string | null;
+  to?: string | null;
+}
+
 export interface TopicSearchQuery {
+  /** 关键词；纯日期筛选时可为空字符串。 */
   query: string;
   filters?: TopicSearchFilters;
+  timeFilter?: TopicTimeFilter;
   mode?: TopicSearchMode;
   limit?: number;
   cursor?: string | null;
@@ -70,7 +83,13 @@ export interface TopicSearchItem {
   url?: string;
   matches: TopicSearchMatch[];
   updatedAt: string;
+  /** 成功摘要边界（保留原语义，不用于日期筛选）。 */
   sourceThroughAt?: string;
+  /** 来源系统的话题创建时间；缺失 = 未知。 */
+  topicCreatedAt?: string;
+  /** 来源系统观察到的最新消息时间；缺失 = 未知。 */
+  latestMessageAt?: string;
+  timeMetadata: 'synced' | 'partial' | 'unknown';
   /** 结果对调用者的可用性说明（例如该话题向量尚未回填）。 */
   degraded?: string[];
 }
@@ -79,7 +98,12 @@ export interface TopicSearchResponse {
   items: TopicSearchItem[];
   effectiveMode: 'keyword' | 'hybrid';
   degradedReasons: string[];
-  coverage: { state: 'complete' | 'partial'; unindexedKnownTopics: number };
+  coverage: {
+    state: 'complete' | 'partial';
+    unindexedKnownTopics: number;
+    /** 所选时间口径下时间未知、无法参与筛选的可见话题数。 */
+    unknownTimeTopics: number;
+  };
   nextCursor: string | null;
 }
 
@@ -125,12 +149,65 @@ function normalizeFilters(filters: TopicSearchFilters | undefined): {
   };
 }
 
+function normalizeTimeFilter(
+  raw: TopicTimeFilter | undefined,
+  legacy: { sourceFrom: string | null; sourceTo: string | null },
+): { filter: TopicTimeFilter | null; legacyMapped: boolean } {
+  if (raw !== undefined) {
+    if (legacy.sourceFrom || legacy.sourceTo) {
+      throw new TopicSearchError(
+        'invalid_filter',
+        'timeFilter cannot be combined with legacy sourceFrom/sourceTo',
+      );
+    }
+    if (raw.field !== 'created' && raw.field !== 'latestMessage') {
+      throw new TopicSearchError('invalid_filter', 'timeFilter.field must be created/latestMessage');
+    }
+    const from = raw.from ?? null;
+    const to = raw.to ?? null;
+    for (const [key, value] of [['from', from], ['to', to]] as const) {
+      if (value !== null && Number.isNaN(Date.parse(value))) {
+        throw new TopicSearchError('invalid_filter', `timeFilter.${key} must be an ISO-8601 timestamp`);
+      }
+    }
+    if (from && to && Date.parse(from) > Date.parse(to)) {
+      throw new TopicSearchError('invalid_filter', 'timeFilter.from must not be after timeFilter.to');
+    }
+    if (!from && !to) return { filter: null, legacyMapped: false };
+    return { filter: { field: raw.field, from, to }, legacyMapped: false };
+  }
+  if (legacy.sourceFrom || legacy.sourceTo) {
+    // 旧参数没有「口径」概念；按最新消息时间解释并明确标记降级，避免静默改变语义。
+    return {
+      filter: { field: 'latestMessage', from: legacy.sourceFrom, to: legacy.sourceTo },
+      legacyMapped: true,
+    };
+  }
+  return { filter: null, legacyMapped: false };
+}
+
+function topicTimeOf(topic: Topic, field: TopicTimeField): string | undefined {
+  return field === 'created' ? topic.topicCreatedAt : topic.latestMessageAt;
+}
+
+function passesTopicTimeFilter(topic: Topic, filter: TopicTimeFilter | null): boolean {
+  if (!filter) return true;
+  const value = topicTimeOf(topic, filter.field);
+  if (!value) return false;
+  const at = Date.parse(value);
+  if (Number.isNaN(at)) return false;
+  if (filter.from && at < Date.parse(filter.from)) return false;
+  if (filter.to && at > Date.parse(filter.to)) return false;
+  return true;
+}
+
 function cursorSignature(input: {
   query: string;
   mode: string;
   chatIds: readonly string[];
-  sourceFrom: string | null;
-  sourceTo: string | null;
+  timeField: TopicTimeField | null;
+  timeFrom: string | null;
+  timeTo: string | null;
   indexVersion: string;
 }): string {
   return JSON.stringify(input);
@@ -174,23 +251,6 @@ function chatIdOf(topic: Topic): string {
   return parseTopicKey(topic.topicKey)?.chatId ?? topic.chatId;
 }
 
-/** 源消息时间过滤：只用 `sourceThroughAt`（源侧推进的时间），不用摘要生成时间。 */
-function passesSourceTimeFilter(topic: Topic, sourceFrom: string | null, sourceTo: string | null): boolean {
-  if (!sourceFrom && !sourceTo) return true;
-  const sourceThrough = topic.sourceThroughAt ? Date.parse(topic.sourceThroughAt) : NaN;
-  if (Number.isNaN(sourceThrough)) {
-    // 没有源时间就断言覆盖会造假：带时间过滤时排除它，并让 coverage 表达不确定性。
-    return false;
-  }
-  if (sourceFrom && sourceThrough < Date.parse(sourceFrom)) return false;
-  if (sourceTo && sourceThrough > Date.parse(sourceTo)) return false;
-  // 覆盖起点晚于筛选上界：该话题没有任何消息落在这个时间窗内，不能凭
-  // sourceThroughAt（最后一条）就把它当成窗口内的命中。
-  const coverageStart = topic.coverageStartAt ? Date.parse(topic.coverageStartAt) : NaN;
-  if (sourceTo && !Number.isNaN(coverageStart) && coverageStart > Date.parse(sourceTo)) return false;
-  return true;
-}
-
 function bestVectorMatches(
   topic: Topic,
   queryVector: number[],
@@ -214,7 +274,6 @@ export function createTopicSearchService(deps: TopicSearchDeps): TopicSearchServ
   return {
     async search(query, caller) {
       const rawQuery = typeof query?.query === 'string' ? query.query.trim() : '';
-      if (!rawQuery) throw new TopicSearchError('invalid_query', 'query must not be empty');
       if (rawQuery.length > MAX_QUERY_CHARS) {
         throw new TopicSearchError('invalid_query', 'query is too long');
       }
@@ -232,7 +291,7 @@ export function createTopicSearchService(deps: TopicSearchDeps): TopicSearchServ
           items: [],
           effectiveMode: 'keyword',
           degradedReasons: ['no_authorized_scope'],
-          coverage: { state: 'partial', unindexedKnownTopics: 0 },
+          coverage: { state: 'partial', unindexedKnownTopics: 0, unknownTimeTopics: 0 },
           nextCursor: null,
         };
       }
@@ -247,25 +306,36 @@ export function createTopicSearchService(deps: TopicSearchDeps): TopicSearchServ
       if (filters.sourceTo && Number.isNaN(Date.parse(filters.sourceTo))) {
         throw new TopicSearchError('invalid_filter', 'sourceTo must be an ISO-8601 timestamp');
       }
-
+      const timeFilter = normalizeTimeFilter(query.timeFilter, {
+        sourceFrom: filters.sourceFrom,
+        sourceTo: filters.sourceTo,
+      });
+      const effectiveTimeFilter = timeFilter.filter;
       const requestedMode = query.mode ?? 'auto';
       const tokens = tokenizeQuery(rawQuery);
-      if (tokens.length === 0) throw new TopicSearchError('invalid_query', 'query has no searchable token');
+      if (tokens.length === 0 && !effectiveTimeFilter) {
+        throw new TopicSearchError('invalid_query', 'query must not be empty unless a time filter is provided');
+      }
 
-      // 候选 = 可见范围 + 群过滤 + 来源时间过滤。**先过滤再计预算**：否则范围外
+      // 候选 = 可见范围 + 群过滤 + 所选话题时间口径。**先过滤再计预算**：否则范围外
       // 或明显不匹配的记录会先占满 maxCandidates，把合法历史结果挤掉。
       const allTopics = deps.store.listTopics();
       const visibleTopics = visible
         ? allTopics.filter(topic => visible.has(chatIdOf(topic)))
         : allTopics;
-      const scopedTopics = visibleTopics
-        .filter(topic => filters.chatIds.length === 0 || filters.chatIds.includes(chatIdOf(topic)))
-        .filter(topic => passesSourceTimeFilter(topic, filters.sourceFrom, filters.sourceTo));
+      const chatScopedTopics = visibleTopics
+        .filter(topic => filters.chatIds.length === 0 || filters.chatIds.includes(chatIdOf(topic)));
+      const unknownTimeTopics = effectiveTimeFilter
+        ? chatScopedTopics.filter(topic => !topicTimeOf(topic, effectiveTimeFilter.field)).length
+        : 0;
+      const scopedTopics = chatScopedTopics.filter(topic => passesTopicTimeFilter(topic, effectiveTimeFilter));
       const budgetExceeded = scopedTopics.length > maxCandidates;
       const candidates = scopedTopics.slice(0, maxCandidates);
 
       const degradedReasons: string[] = [];
       if (budgetExceeded) degradedReasons.push('candidate_budget_truncated');
+      if (timeFilter.legacyMapped) degradedReasons.push('legacy_time_filter_mapped');
+      if (unknownTimeTopics > 0) degradedReasons.push('time_metadata_unknown');
 
       const indexVersion = JSON.stringify({
         topics: candidates.length,
@@ -274,13 +344,18 @@ export function createTopicSearchService(deps: TopicSearchDeps): TopicSearchServ
           return Number.isNaN(parsed) ? max : Math.max(max, parsed);
         }, 0),
         summaries: candidates.reduce((total, topic) => total + topic.summaries.length, 0),
+        latestMessageAt: candidates.reduce((max, topic) => {
+          const parsed = topic.latestMessageAt ? Date.parse(topic.latestMessageAt) : NaN;
+          return Number.isNaN(parsed) ? max : Math.max(max, parsed);
+        }, 0),
       });
       const signature = cursorSignature({
         query: normalizeKeywordText(rawQuery),
         mode: requestedMode,
         chatIds: filters.chatIds,
-        sourceFrom: filters.sourceFrom,
-        sourceTo: filters.sourceTo,
+        timeField: effectiveTimeFilter?.field ?? null,
+        timeFrom: effectiveTimeFilter?.from ?? null,
+        timeTo: effectiveTimeFilter?.to ?? null,
         indexVersion,
       });
       let offset = 0;
@@ -293,19 +368,22 @@ export function createTopicSearchService(deps: TopicSearchDeps): TopicSearchServ
         offset = cursor.offset;
       }
 
-      // 关键词通道
+      // 关键词通道（纯日期筛选时没有关键词，直接跳过）
+      const hasTokens = tokens.length > 0;
       const keywordScores = new Map<string, { topic: Topic; match: KeywordTopicMatch }>();
-      for (const topic of candidates) {
-        const match = matchTopicByKeyword(topic, tokens);
-        if (!match) continue;
-        keywordScores.set(topic.topicKey, { topic, match });
+      if (hasTokens) {
+        for (const topic of candidates) {
+          const match = matchTopicByKeyword(topic, tokens);
+          if (!match) continue;
+          keywordScores.set(topic.topicKey, { topic, match });
+        }
       }
       const keywordRanked: RankedKey[] = [...keywordScores.entries()]
         .map(([key, entry]) => ({ key, score: entry.match.score }))
         .sort((a, b) => b.score - a.score || a.key.localeCompare(b.key));
 
-      // 向量通道（可选）
-      const wantVector = requestedMode === 'hybrid' || requestedMode === 'auto';
+      // 向量通道（可选；必须有查询词）
+      const wantVector = hasTokens && (requestedMode === 'hybrid' || requestedMode === 'auto');
       let vectorRanked: RankedKey[] | null = null;
       let vectorMatchesByTopic = new Map<string, Array<{ summary: TopicSummary; score: number }>>();
       if (wantVector) {
@@ -341,16 +419,28 @@ export function createTopicSearchService(deps: TopicSearchDeps): TopicSearchServ
       const effectiveMode: 'keyword' | 'hybrid' =
         requestedMode === 'keyword' || !vectorRanked || vectorRanked.length === 0 ? 'keyword' : 'hybrid';
 
-      let fused: Map<string, number>;
-      if (effectiveMode === 'hybrid' && vectorRanked) {
-        fused = reciprocalRankFusion([keywordRanked, vectorRanked]);
+      let ordered: string[];
+      if (!hasTokens && effectiveTimeFilter) {
+        // 纯日期筛选：按用户所选口径倒序（最新在前），同值按 topicKey 稳定排序。
+        const field = effectiveTimeFilter.field;
+        ordered = [...candidates]
+          .sort((a, b) => {
+            const left = Date.parse(topicTimeOf(a, field) ?? '') || 0;
+            const right = Date.parse(topicTimeOf(b, field) ?? '') || 0;
+            return right - left || a.topicKey.localeCompare(b.topicKey);
+          })
+          .map(topic => topic.topicKey);
       } else {
-        fused = new Map(keywordRanked.map(entry => [entry.key, entry.score]));
+        let fused: Map<string, number>;
+        if (effectiveMode === 'hybrid' && vectorRanked) {
+          fused = reciprocalRankFusion([keywordRanked, vectorRanked]);
+        } else {
+          fused = new Map(keywordRanked.map(entry => [entry.key, entry.score]));
+        }
+        ordered = [...fused.entries()]
+          .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+          .map(([key]) => key);
       }
-
-      const ordered = [...fused.entries()]
-        .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-        .map(([key]) => key);
       const page = ordered.slice(offset, offset + limit);
       const nextCursor =
         ordered.length > offset + limit
@@ -394,6 +484,9 @@ export function createTopicSearchService(deps: TopicSearchDeps): TopicSearchServ
           matches,
           updatedAt: topic.updatedAt,
           ...(topic.sourceThroughAt ? { sourceThroughAt: topic.sourceThroughAt } : {}),
+          ...(topic.topicCreatedAt ? { topicCreatedAt: topic.topicCreatedAt } : {}),
+          ...(topic.latestMessageAt ? { latestMessageAt: topic.latestMessageAt } : {}),
+          timeMetadata: topic.timeMetadata,
           ...(pendingVectors > 0 ? { degraded: ['embedding_pending'] } : {}),
         });
       }
@@ -415,7 +508,11 @@ export function createTopicSearchService(deps: TopicSearchDeps): TopicSearchServ
         items,
         effectiveMode,
         degradedReasons: [...new Set(degradedReasons)],
-        coverage: { state: coverageState, unindexedKnownTopics: unindexed },
+        coverage: {
+          state: coverageState,
+          unindexedKnownTopics: unindexed,
+          unknownTimeTopics,
+        },
         nextCursor,
       };
     },

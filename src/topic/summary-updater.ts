@@ -206,6 +206,17 @@ export async function updateTopicFromSource(
     (earliest, message) => (!earliest || message.createTime < earliest ? message.createTime : earliest),
     '',
   );
+  // 来源时间元数据与摘要成功与否解耦：本轮读到了新消息就先记最新消息时间，
+  // 即使随后模型失败/分页截断，日期筛选也能如实反映「已观察到的最新消息」。
+  const latestObservedAt = normalized.length > 0 ? normalized[normalized.length - 1].createTime : undefined;
+  if (page.topicCreatedAt || latestObservedAt) {
+    deps.store.recordSourceMetadata({
+      topicKey,
+      now: checkedAt,
+      ...(page.topicCreatedAt ? { topicCreatedAt: page.topicCreatedAt } : {}),
+      ...(latestObservedAt ? { latestMessageAt: latestObservedAt } : {}),
+    });
+  }
   const sourceMessageTimes: Record<string, string> = {};
   for (const message of normalized) sourceMessageTimes[message.messageId] = message.createTime;
 

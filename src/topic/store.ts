@@ -48,6 +48,8 @@ interface TopicRow {
   summarized_through_cursor: string | null;
   coverage_start_at: string | null;
   source_through_at: string | null;
+  topic_created_at: string | null;
+  latest_message_at: string | null;
   last_checked_at: string | null;
   updated_at: string;
 }
@@ -82,6 +84,8 @@ CREATE TABLE IF NOT EXISTS topics (
   summarized_through_cursor TEXT,
   coverage_start_at TEXT,
   source_through_at TEXT,
+  topic_created_at TEXT,
+  latest_message_at TEXT,
   last_checked_at TEXT,
   updated_at TEXT NOT NULL
 );
@@ -251,6 +255,16 @@ export interface TopicStore {
   }): { invalidated: number; revision: number; epoch: number };
   /** 当前 topic 的删除 epoch（每次失效递增）。 */
   deletionEpoch(topicKey: string): number;
+  /**
+   * 来源时间元数据：话题创建时间只写一次；最新消息时间只前进。
+   * 不递增 revision，不影响摘要 CAS；读取失败/缺失时保持原值（unknown 而不是伪造）。
+   */
+  recordSourceMetadata(input: {
+    topicKey: string;
+    now: string;
+    topicCreatedAt?: string;
+    latestMessageAt?: string;
+  }): void;
   /** 某时间点之后仍未失效的摘要来源（用于重叠窗口核查删除）。 */
   summariesReferencingSince(
     topicKey: string,
@@ -299,6 +313,15 @@ export function openTopicStore(options: OpenTopicStoreOptions = {}): TopicStore 
   db.exec('PRAGMA journal_mode = WAL;');
   db.exec('PRAGMA synchronous = NORMAL;');
   db.exec(SCHEMA_SQL);
+
+  // 旧库补列：CREATE TABLE IF NOT EXISTS 不会给已有表加字段。
+  function ensureTopicColumn(name: string, definition: string): void {
+    const columns = db.prepare('PRAGMA table_info(topics)').all() as Array<{ name: string }>;
+    if (columns.some(column => column.name === name)) return;
+    db.exec(`ALTER TABLE topics ADD COLUMN ${name} ${definition}`);
+  }
+  ensureTopicColumn('topic_created_at', 'TEXT');
+  ensureTopicColumn('latest_message_at', 'TEXT');
 
   function inTransaction<T>(operation: () => T): T {
     db.exec('BEGIN IMMEDIATE');
@@ -423,6 +446,14 @@ export function openTopicStore(options: OpenTopicStoreOptions = {}): TopicStore 
       ...(row.summarized_through_cursor ? { summarizedThroughCursor: row.summarized_through_cursor } : {}),
       ...(row.coverage_start_at ? { coverageStartAt: row.coverage_start_at } : {}),
       ...(row.source_through_at ? { sourceThroughAt: row.source_through_at } : {}),
+      ...(row.topic_created_at ? { topicCreatedAt: row.topic_created_at } : {}),
+      ...(row.latest_message_at ? { latestMessageAt: row.latest_message_at } : {}),
+      timeMetadata:
+        row.topic_created_at && row.latest_message_at
+          ? 'synced'
+          : row.topic_created_at || row.latest_message_at
+            ? 'partial'
+            : 'unknown',
       ...(row.last_checked_at ? { lastCheckedAt: row.last_checked_at } : {}),
       updatedAt: row.updated_at,
     };
@@ -675,6 +706,19 @@ export function openTopicStore(options: OpenTopicStoreOptions = {}): TopicStore 
         ).run(nextRevision, input.now, input.topicKey);
         return { invalidated: affected.length, revision: nextRevision, epoch };
       });
+    },
+
+    recordSourceMetadata(input) {
+      const topicCreatedAt = input.topicCreatedAt?.trim() || null;
+      const latestMessageAt = input.latestMessageAt?.trim() || null;
+      if (!topicCreatedAt && !latestMessageAt) return;
+      db.prepare(
+        `UPDATE topics
+            SET topic_created_at = COALESCE(topic_created_at, ?),
+                latest_message_at = CASE
+                  WHEN latest_message_at IS NULL OR latest_message_at < ? THEN ? ELSE latest_message_at END
+          WHERE topic_key = ?`,
+      ).run(topicCreatedAt, latestMessageAt, latestMessageAt, input.topicKey);
     },
 
     deletionEpoch(topicKey) {

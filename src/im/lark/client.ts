@@ -2277,15 +2277,28 @@ export async function listThreadMessagesWithContext(larkAppId: string, chatId: s
 
 /** Get the thread_id (omt_xxx) from the root message via message.get. */
 async function resolveThreadId(c: any, rootMessageId: string): Promise<string | undefined> {
+  return (await resolveRootMessageMeta(c, rootMessageId)).threadId;
+}
+
+/** 根消息的 thread id + create_time。create_time 就是「话题创建时间」，与摘要进度无关。 */
+async function resolveRootMessageMeta(
+  c: any,
+  rootMessageId: string,
+): Promise<{ threadId?: string; createTime?: number }> {
   try {
     const res = await larkGet(c, `/open-apis/im/v1/messages/${encodeURIComponent(rootMessageId)}`);
     if (res.code === 0) {
-      return res.data?.items?.[0]?.thread_id;
+      const item = res.data?.items?.[0];
+      const createTime = Number(item?.create_time);
+      return {
+        ...(typeof item?.thread_id === 'string' && item.thread_id ? { threadId: item.thread_id } : {}),
+        ...(Number.isFinite(createTime) && createTime > 0 ? { createTime } : {}),
+      };
     }
   } catch {
-    // Ignore — fallback to chat scan
+    // Ignore — fallback to chat scan; 时间字段保持未知，不用摘要时间伪装。
   }
-  return undefined;
+  return {};
 }
 
 /** Lark message.list rejects page_size > 50 with field_violations (max 50).
@@ -2426,6 +2439,8 @@ export interface ThreadIncrementResult {
   /** 时间正序（旧 → 新）返回。 */
   messages: any[];
   threadId?: string;
+  /** 根消息 create_time（毫秒）；缺失 = 根消息不可读/未同步。 */
+  rootCreateTime?: number;
   /** true = 确认是 thread 容器；false = 退化成按 root_id 扫群（可能不完整）。 */
   verifiedThread: boolean;
   /**
@@ -2456,7 +2471,8 @@ export async function listThreadMessagesIncremental(
   const pageSize = Math.min(Math.max(Math.floor(options.pageSize ?? LARK_MESSAGE_LIST_MAX_PAGE), 1), LARK_MESSAGE_LIST_MAX_PAGE);
   const boundaryIds = new Set(options.afterMessageIds ?? []);
   const results: any[] = [];
-  const threadId = await resolveThreadId(c, rootMessageId);
+  const rootMeta = await resolveRootMessageMeta(c, rootMessageId);
+  const threadId = rootMeta.threadId;
   let verifiedThread = Boolean(threadId);
   let complete = false;
 
@@ -2492,7 +2508,13 @@ export async function listThreadMessagesIncremental(
   if (!complete && results.length < maxMessages) complete = true;
 
   results.sort((left, right) => String(left?.create_time ?? '').localeCompare(String(right?.create_time ?? '')));
-  return { messages: results, threadId, verifiedThread, complete };
+  return {
+    messages: results,
+    ...(threadId ? { threadId } : {}),
+    ...(rootMeta.createTime ? { rootCreateTime: rootMeta.createTime } : {}),
+    verifiedThread,
+    complete,
+  };
 }
 
 export interface ChatMessageScanOptions {

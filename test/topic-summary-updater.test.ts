@@ -286,6 +286,65 @@ describe('增量摘要更新', () => {
       encodeCursor({ createTime: '2026-10-01T00:00:01.000Z', messageIds: ['om_0'] }),
     );
   });
+  it('模型失败仍记录已观察到的最新消息时间，成功摘要游标保持不变', async () => {
+    const day1 = { messageId: 'om_day1', createTime: '2026-10-01T08:00:00.000Z', text: '话题创建' };
+    const first = await updateTopicFromSource(
+      {
+        store,
+        source: fakeSource([{ messages: [day1], topicCreatedAt: day1.createTime }]),
+        enricher: fakeEnricher([
+          { op: 'add', text: '话题创建', keywords: ['创建'], sourceMessageIds: ['om_day1'] },
+        ]),
+        now: () => '2026-10-01T09:00:00.000Z',
+      },
+      entry,
+      {},
+    );
+    expect(first.status).toBe('committed');
+    const afterFirst = store.getTopic('thread:oc_1:om_1')!;
+    expect(afterFirst.topicCreatedAt).toBe(day1.createTime);
+    expect(afterFirst.latestMessageAt).toBe(day1.createTime);
+    const successCursor = afterFirst.summarizedThroughCursor;
+
+    // 10 月 3 日读到新消息，但模型失败：最新消息时间要更新，成功游标不动。
+    const day3 = { messageId: 'om_day3', createTime: '2026-10-03T08:00:00.000Z', text: '新消息' };
+    const second = await updateTopicFromSource(
+      {
+        store,
+        source: fakeSource([{ messages: [day1, day3] }]),
+        enricher: fakeEnricher(async () => {
+          throw Object.assign(new Error('model down'), { code: 'timeout' });
+        }),
+        now: () => '2026-10-03T09:00:00.000Z',
+      },
+      entry,
+      {},
+    );
+    expect(second.status).toBe('failed');
+    expect(second.cursorAdvanced).toBe(false);
+    const afterSecond = store.getTopic('thread:oc_1:om_1')!;
+    expect(afterSecond.latestMessageAt).toBe(day3.createTime);
+    expect(afterSecond.summarizedThroughCursor).toBe(successCursor);
+    expect(afterSecond.sourceThroughAt).toBe(day1.createTime);
+
+    const search = createTopicSearchService({ store });
+    const byCreated = await search.search({
+      query: '',
+      timeFilter: { field: 'created', from: '2026-10-01T00:00:00Z', to: '2026-10-02T23:59:59Z' },
+    }, {});
+    expect(byCreated.items).toHaveLength(1);
+    const latestNotInOldRange = await search.search({
+      query: '',
+      timeFilter: { field: 'latestMessage', from: '2026-10-01T00:00:00Z', to: '2026-10-02T23:59:59Z' },
+    }, {});
+    expect(latestNotInOldRange.items).toEqual([]);
+    const latestOnDay3 = await search.search({
+      query: '',
+      timeFilter: { field: 'latestMessage', from: '2026-10-03T00:00:00Z', to: '2026-10-03T23:59:59Z' },
+    }, {});
+    expect(latestOnDay3.items).toHaveLength(1);
+  });
+
   it('sourceThroughAt / coverageStartAt 取消息时间，而不是处理时刻', async () => {
     const older = { messageId: 'om_old', createTime: '2026-09-20T08:00:00.000Z', text: '九月决定' };
     const newer = { messageId: 'om_new', createTime: '2026-09-21T08:00:00.000Z', text: '九月补充' };

@@ -1306,6 +1306,12 @@ export interface Topic {
   /** CAS 版本号：每次成功提交摘要/游标递增。 */
   revision: number;
   summaries: TopicSummary[];
+  /** 来源系统的话题创建时间（通常是根消息 createTime）。缺失 = 未同步/未知。 */
+  topicCreatedAt?: string;
+  /** 来源系统观察到的最新消息时间；与摘要成功游标、摘要生成时间无关。 */
+  latestMessageAt?: string;
+  /** 时间元数据同步状态：两个时间都已知为 synced，缺一为 partial，都缺为 unknown。 */
+  timeMetadata: 'synced' | 'partial' | 'unknown';
   /** 上次**成功**摘要到的源消息边界（不透明，不能按字典序比较）。 */
   summarizedThroughCursor?: string;
   /** 摘要覆盖范围的起点（ISO-8601 UTC）。 */

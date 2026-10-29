@@ -7,6 +7,7 @@ import {
   initialTopicSearchState,
   requestTopicSearch,
   topicSearchReducer,
+  topicTimeFilterKey,
   type TopicSearchAction,
   type TopicSearchHit,
   type TopicSearchViewState,
@@ -127,7 +128,7 @@ describe('topic content search request handling', () => {
     })) as unknown as typeof fetch;
 
     const action = await requestTopicSearch('needle', 7, { fetchImpl });
-    expect(action).toEqual({ type: 'failure', query: 'needle', requestId: 7, disabled: true });
+    expect(action).toEqual({ type: 'failure', query: 'needle', timeFilterKey: '', requestId: 7, disabled: true });
 
     const state = apply(
       apply(initialTopicSearchState, { type: 'start', query: 'needle', requestId: 7 }),
@@ -280,6 +281,76 @@ describe('topic content search request handling', () => {
     expect(state.nextCursor).toBe('cursor-2');
   });
 
+  it('纯日期筛选：空关键词也发请求，并携带 timeFilter 与独立 key', async () => {
+    const fetchImpl = vi.fn(async () => ({
+      status: 200,
+      ok: true,
+      json: async () => ({
+        ok: true,
+        effectiveMode: 'keyword',
+        coverage: { state: 'complete', unindexedKnownTopics: 0, unknownTimeTopics: 0 },
+        degradedReasons: [],
+        items: [hit({
+          topicKey: 'thread:oc:om_1',
+          topicCreatedAt: '2026-10-01T00:00:00.000Z',
+          latestMessageAt: '2026-10-03T00:00:00.000Z',
+          timeMetadata: 'synced',
+        })],
+        nextCursor: null,
+      }),
+    })) as unknown as typeof fetch;
+    const timeFilter = {
+      field: 'created' as const,
+      from: '2026-10-01T00:00:00.000Z',
+      to: '2026-10-02T23:59:59.999Z',
+    };
+    const action = await requestTopicSearch('', 21, { timeFilter, fetchImpl });
+    const body = JSON.parse(String((fetchImpl as any).mock.calls[0][1].body));
+    expect(body.query).toBe('');
+    expect(body.timeFilter).toEqual(timeFilter);
+    expect(action).toMatchObject({
+      type: 'success',
+      query: '',
+      timeFilterKey: topicTimeFilterKey(timeFilter),
+    });
+
+    const state = apply(
+      apply(initialTopicSearchState, {
+        type: 'start',
+        query: '',
+        timeFilter,
+        timeFilterKey: topicTimeFilterKey(timeFilter),
+        requestId: 21,
+      }),
+      action!,
+    );
+    expect(state.status).toBe('ready');
+    expect(state.items[0].latestMessageAt).toBe('2026-10-03T00:00:00.000Z');
+  });
+
+  it('时间口径切换后的旧响应不会污染新结果', () => {
+    const filterA = { field: 'created' as const, from: '2026-10-01T00:00:00.000Z' };
+    const filterB = { field: 'latestMessage' as const, from: '2026-10-01T00:00:00.000Z' };
+    const state = apply(initialTopicSearchState, {
+      type: 'start',
+      query: '',
+      timeFilter: filterB,
+      timeFilterKey: topicTimeFilterKey(filterB),
+      requestId: 22,
+    });
+    const stale = apply(state, {
+      type: 'success',
+      query: '',
+      timeFilterKey: topicTimeFilterKey(filterA),
+      requestId: 22,
+      items: [hit({ topicKey: 'thread:oc:om_old' })],
+      coverage: { state: 'complete', unindexedKnownTopics: 0, unknownTimeTopics: 0 },
+      degradedReasons: [],
+      nextCursor: null,
+    });
+    expect(stale).toBe(state);
+  });
+
   it('sends the page chat filter and falls back to local filtering when it is outside the indexed scope', async () => {
     const fetchImpl = vi.fn(async () => ({
       status: 403,
@@ -290,7 +361,7 @@ describe('topic content search request handling', () => {
     const action = await requestTopicSearch('needle', 11, { chatId: 'oc_other', fetchImpl });
     expect(JSON.parse(String((fetchImpl as any).mock.calls[0][1].body)).filters)
       .toEqual({ chatIds: ['oc_other'] });
-    expect(action).toEqual({ type: 'fallback', query: 'needle', requestId: 11 });
+    expect(action).toEqual({ type: 'fallback', query: 'needle', timeFilterKey: '', requestId: 11 });
 
     const state = apply(
       apply(initialTopicSearchState, { type: 'start', query: 'needle', requestId: 11 }),
@@ -394,6 +465,28 @@ describe('topic content search results view', () => {
 
     expect(html).not.toContain('a filtered-out topic');
     expect(html).not.toContain('data-search-only="true"');
+  });
+
+  it('展示话题创建/最新消息时间，并明确时间未同步数量', () => {
+    const html = renderTopics({
+      rows: [],
+      relationRows: [],
+      search: readyState(
+        [hit({
+          topicKey: 'thread:oc:om_timed',
+          title: 'timed topic',
+          topicCreatedAt: '2026-10-01T00:00:00.000Z',
+          latestMessageAt: '2026-10-03T00:00:00.000Z',
+          timeMetadata: 'synced',
+        })],
+        { coverage: { state: 'partial', unindexedKnownTopics: 0, unknownTimeTopics: 2 } },
+      ),
+    });
+    expect(html).toContain('data-search-created-at="2026-10-01T00:00:00.000Z"');
+    expect(html).toContain('data-search-latest-at="2026-10-03T00:00:00.000Z"');
+    expect(html).toContain(t('sessions.topic.timeCreated'));
+    expect(html).toContain(t('sessions.topic.timeLatest'));
+    expect(html).toContain(t('sessions.topic.timeUnknown', { count: 2 }));
   });
 
   it('surfaces partial coverage and degraded reasons', () => {

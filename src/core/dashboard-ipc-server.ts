@@ -5035,6 +5035,7 @@ ipcRoute('GET', '/api/topics/messages', async (req, res) => {
       complete: result.complete,
       verifiedThread: result.verifiedThread,
       ...(result.threadId ? { nativeThreadId: result.threadId } : {}),
+      ...(result.rootCreateTime ? { topicCreatedAt: new Date(result.rootCreateTime).toISOString() } : {}),
       messages: result.messages.map((message: any) => ({
         messageId: message?.message_id,
         createTime: Number(message?.create_time) || undefined,

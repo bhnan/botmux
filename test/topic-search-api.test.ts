@@ -165,6 +165,44 @@ describe('话题检索路由：响应与错误映射', () => {
     expect(search).toHaveBeenCalledWith({ query: 'owner' }, {});
   });
 
+  it('纯日期筛选：空关键词 + timeFilter 合法，并原样传给 SearchService', async () => {
+    const search = vi.fn(async () => searchResult);
+    const timeFilter = {
+      field: 'latestMessage' as const,
+      from: '2026-10-01T00:00:00.000Z',
+      to: '2026-10-02T23:59:59.999Z',
+    };
+    const result = await handleTopicSearchRequest(
+      req(),
+      url(),
+      deps({
+        search,
+        readJsonBody: async () => ({ query: '', timeFilter }),
+      }),
+    );
+    expect(result?.status).toBe(200);
+    expect(search).toHaveBeenCalledWith({ query: '', timeFilter }, {});
+  });
+
+  it('空关键词且没有 timeFilter 仍是 invalid_query；timeFilter 形状错误有明确错误码', () => {
+    expect(() => parseTopicSearchRequestBody({ query: '' })).toThrowError(
+      expect.objectContaining({ code: 'invalid_query' }),
+    );
+    expect(() => parseTopicSearchRequestBody({
+      query: '',
+      timeFilter: { field: 'updatedAt', from: '2026-10-01T00:00:00Z' },
+    })).toThrowError(expect.objectContaining({ code: 'invalid_filter' }));
+    expect(() => parseTopicSearchRequestBody({
+      query: '',
+      timeFilter: { field: 'created', from: 'not-a-date' },
+    })).toThrowError(expect.objectContaining({ code: 'invalid_filter' }));
+    // 只选口径没给范围：视为未启用时间筛选 → 空关键词仍拒绝。
+    expect(() => parseTopicSearchRequestBody({
+      query: '',
+      timeFilter: { field: 'created' },
+    })).toThrowError(expect.objectContaining({ code: 'invalid_query' }));
+  });
+
   it('检索层错误映射为 403/429/400，未知异常映射 503 且不泄露细节', async () => {
     const forbidden = await handleTopicSearchRequest(
       req(),

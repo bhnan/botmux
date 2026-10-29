@@ -48,6 +48,10 @@ export interface TopicHistoryReadOptions {
 
 export interface TopicHistoryPage {
   messages: TopicSourceMessage[];
+  /** 来源系统的话题创建时间（根消息 createTime）；缺失 = 未同步/未知。 */
+  topicCreatedAt?: string;
+  /** 来源系统本次观察到的最新消息时间；由实现按返回消息计算。 */
+  latestMessageAt?: string;
   /**
    * 是否确认读取的是原生话题容器。false = 退化成按 root_id 扫群，
    * 回复类消息可能天然缺席 —— 此时禁止把「缺席」判成删除。

@@ -153,6 +153,98 @@ describe('关键词检索', () => {
   });
 });
 
+describe('话题时间筛选', () => {
+  const meta = (root: 'om_1' | 'om_2' | 'om_3', created: string, latest: string) => {
+    const chatId = root === 'om_3' ? 'oc_2' : 'oc_1';
+    store.recordSourceMetadata({
+      topicKey: `thread:${chatId}:${root}`,
+      topicCreatedAt: created,
+      latestMessageAt: latest,
+      now: '2026-10-29T00:00:00.000Z',
+    });
+  };
+
+  it('创建时间与最新消息时间互相独立，日期筛选不依赖摘要进度', async () => {
+    meta('om_1', '2026-10-01T08:00:00.000Z', '2026-10-03T08:00:00.000Z');
+
+    const byCreated = await service().search({
+      query: '',
+      timeFilter: { field: 'created', from: '2026-10-01T00:00:00Z', to: '2026-10-02T23:59:59Z' },
+    }, {});
+    expect(byCreated.items.map(item => item.topicKey)).toEqual(['thread:oc_1:om_1']);
+    expect(byCreated.items[0].topicCreatedAt).toBe('2026-10-01T08:00:00.000Z');
+    expect(byCreated.items[0].latestMessageAt).toBe('2026-10-03T08:00:00.000Z');
+
+    const byLatestOldRange = await service().search({
+      query: '',
+      timeFilter: { field: 'latestMessage', from: '2026-10-01T00:00:00Z', to: '2026-10-02T23:59:59Z' },
+    }, {});
+    expect(byLatestOldRange.items).toEqual([]);
+
+    const byLatestDay3 = await service().search({
+      query: '',
+      timeFilter: { field: 'latestMessage', from: '2026-10-03T00:00:00Z', to: '2026-10-03T23:59:59Z' },
+    }, {});
+    expect(byLatestDay3.items.map(item => item.topicKey)).toEqual(['thread:oc_1:om_1']);
+    // 纯日期结果没有关键词命中片段，但仍有话题与时间元数据。
+    expect(byLatestDay3.items[0].matches).toEqual([]);
+  });
+
+  it('纯日期筛选可翻页，游标绑定所选时间口径与范围', async () => {
+    meta('om_1', '2026-10-01T00:00:00.000Z', '2026-10-03T00:00:00.000Z');
+    meta('om_2', '2026-10-01T00:00:00.000Z', '2026-10-04T00:00:00.000Z');
+    const first = await service().search({
+      query: '',
+      limit: 1,
+      timeFilter: { field: 'latestMessage', from: '2026-10-01T00:00:00Z', to: '2026-10-05T00:00:00Z' },
+    }, {});
+    expect(first.items.map(item => item.topicKey)).toEqual(['thread:oc_1:om_2']);
+    expect(first.nextCursor).toBeTruthy();
+
+    const second = await service().search({
+      query: '',
+      limit: 1,
+      cursor: first.nextCursor,
+      timeFilter: { field: 'latestMessage', from: '2026-10-01T00:00:00Z', to: '2026-10-05T00:00:00Z' },
+    }, {});
+    expect(second.items.map(item => item.topicKey)).toEqual(['thread:oc_1:om_1']);
+
+    await expect(service().search({
+      query: '',
+      limit: 1,
+      cursor: first.nextCursor,
+      timeFilter: { field: 'created', from: '2026-10-01T00:00:00Z', to: '2026-10-05T00:00:00Z' },
+    }, {})).rejects.toMatchObject({ code: 'invalid_cursor' });
+  });
+
+  it('时间未知的话题被排除，并在 coverage 里明确计数', async () => {
+    meta('om_1', '2026-10-01T00:00:00.000Z', '2026-10-03T00:00:00.000Z');
+    const result = await service().search({
+      query: '',
+      timeFilter: { field: 'latestMessage', from: '2026-10-03T00:00:00Z', to: '2026-10-03T23:59:59Z' },
+    }, {});
+    expect(result.items.map(item => item.topicKey)).toEqual(['thread:oc_1:om_1']);
+    expect(result.coverage.unknownTimeTopics).toBe(2);
+    expect(result.degradedReasons).toContain('time_metadata_unknown');
+  });
+
+  it('旧 sourceFrom/sourceTo 按最新消息时间兼容，并明确标记降级', async () => {
+    meta('om_1', '2026-10-01T00:00:00.000Z', '2026-10-03T00:00:00.000Z');
+    const result = await service().search({
+      query: 'owner',
+      filters: { sourceFrom: '2026-10-03T00:00:00Z', sourceTo: '2026-10-03T23:59:59Z' },
+    }, {});
+    expect(result.items.map(item => item.topicKey)).toEqual(['thread:oc_1:om_1']);
+    expect(result.degradedReasons).toContain('legacy_time_filter_mapped');
+
+    await expect(service().search({
+      query: 'owner',
+      filters: { sourceFrom: '2026-10-03T00:00:00Z' },
+      timeFilter: { field: 'created', from: '2026-10-01T00:00:00Z' },
+    }, {})).rejects.toMatchObject({ code: 'invalid_filter' });
+  });
+});
+
 describe('混合召回与降级', () => {
   it('auto + 有向量时用 hybrid；查询向量不可用则降级为关键词并说明原因', async () => {
     const summaryId = store.getTopic('thread:oc_1:om_1')!.summaries[0].id;

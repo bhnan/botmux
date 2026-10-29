@@ -143,6 +143,70 @@ describe('runtime 装配', () => {
     expect(store.listTopics()).toHaveLength(0);
   });
 
+  it('停用不截断已接纳批次：并发 2、批次 3，队列中的第 3 个也正常提交', async () => {
+    const entries = [
+      { ...entry, rootMessageId: 'om_1' },
+      { ...entry, rootMessageId: 'om_2' },
+      { ...entry, rootMessageId: 'om_3' },
+    ];
+    let enabled = true;
+    let started = 0;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const readMessages = vi.fn(async (target: { rootMessageId: string }) => ({
+      messages: [{
+        messageId: `msg_${target.rootMessageId}`,
+        createTime: '2026-10-01T00:00:01.000Z',
+        text: `讨论 ${target.rootMessageId}`,
+      }],
+      truncated: false,
+      verifiedThread: true,
+    }));
+    const enrich = vi.fn(async (request: { newMessages: Array<{ messageId: string }> }) => {
+      started += 1;
+      if (started === 2) {
+        // 前两个已进入模型调用，此时管理员关闭功能。
+        enabled = false;
+        release();
+      }
+      await gate;
+      return {
+        mutations: request.newMessages.map(message => ({
+          op: 'add' as const,
+          text: '摘要',
+          keywords: [],
+          sourceMessageIds: [message.messageId],
+        })),
+        generatorKey: 'test-model@v1',
+      };
+    });
+    const rt = runtime({
+      readConfig: () => ({
+        enabled,
+        allowedChatIds: ['oc_1'],
+        llmModelRef: 'topic-enricher',
+        maxTopicsPerRun: 3,
+        maxConcurrentTopics: 2,
+      }),
+      source: { discoverTopics: async () => entries, readMessages } as never,
+      resolveEnricher: () => ({ generatorKey: 'test-model@v1', enrich }),
+      now: () => '2026-10-01T00:00:00.000Z',
+    });
+
+    const report = await rt.runOnce();
+    expect(enrich).toHaveBeenCalledTimes(3);
+    expect(report.topicsUpdated).toBe(3);
+    for (const target of ['om_1', 'om_2', 'om_3']) {
+      expect(store.getTopic(`thread:oc_1:${target}`)!.summaries).toHaveLength(1);
+    }
+
+    // 下一轮：拒绝接纳新批次，不再读源/调模型。
+    const readsBefore = readMessages.mock.calls.length;
+    await expect(rt.runOnce()).rejects.toMatchObject({ code: 'disabled' });
+    expect(readMessages.mock.calls.length).toBe(readsBefore);
+    expect(enrich).toHaveBeenCalledTimes(3);
+  });
+
   it('群移出更新范围后，已保留的历史话题仍可检索', async () => {
     const first = runtime();
     await first.runOnce();

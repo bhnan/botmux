@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { openTopicStore, topicStorePath, type TopicStore } from '../src/topic/store.js';
 import { decodeCursor, encodeCursor } from '../src/topic/source.js';
+import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import { summaryContentHash } from '../src/topic/vector.js';
 
 let dir: string;
@@ -300,6 +301,51 @@ describe('Topic 存储', () => {
     expect(reopened).toMatchObject({ status: 'blocked', reason: 'tombstoned' });
     expect(store.getTopic('thread:oc_1:om_1')!.summaries.map(summary => summary.text))
       .toEqual(['存活消息摘要']);
+  });
+
+  it('来源时间元数据独立保存：创建时间只写一次、最新消息只前进，且不涨 revision', () => {
+    const before = store.getTopic('thread:oc_1:om_1')!;
+    expect(before.timeMetadata).toBe('unknown');
+    expect(before.topicCreatedAt).toBeUndefined();
+    expect(before.latestMessageAt).toBeUndefined();
+
+    store.recordSourceMetadata({
+      topicKey: 'thread:oc_1:om_1',
+      topicCreatedAt: '2026-10-01T00:00:00.000Z',
+      latestMessageAt: '2026-10-03T00:00:00.000Z',
+      now: '2026-10-03T00:00:00.000Z',
+    });
+    const synced = store.getTopic('thread:oc_1:om_1')!;
+    expect(synced.topicCreatedAt).toBe('2026-10-01T00:00:00.000Z');
+    expect(synced.latestMessageAt).toBe('2026-10-03T00:00:00.000Z');
+    expect(synced.timeMetadata).toBe('synced');
+    expect(synced.revision).toBe(before.revision);
+
+    // 更旧的「最新消息」不覆盖；创建时间不被后写覆盖。
+    store.recordSourceMetadata({
+      topicKey: 'thread:oc_1:om_1',
+      topicCreatedAt: '2026-09-01T00:00:00.000Z',
+      latestMessageAt: '2026-10-02T00:00:00.000Z',
+      now: '2026-10-04T00:00:00.000Z',
+    });
+    const after = store.getTopic('thread:oc_1:om_1')!;
+    expect(after.topicCreatedAt).toBe('2026-10-01T00:00:00.000Z');
+    expect(after.latestMessageAt).toBe('2026-10-03T00:00:00.000Z');
+    expect(after.revision).toBe(before.revision);
+  });
+
+  it('旧库缺时间列时打开会自动补列（unknown 而不是伪造时间）', () => {
+    store.close();
+    const dbPath = join(dir, 'topics.sqlite');
+    const raw = openDatabaseSyncOrThrow(dbPath);
+    raw.exec('ALTER TABLE topics DROP COLUMN latest_message_at');
+    raw.exec('ALTER TABLE topics DROP COLUMN topic_created_at');
+    raw.close();
+    store = openTopicStore({ path: dbPath });
+    const topic = store.getTopic('thread:oc_1:om_1')!;
+    expect(topic.timeMetadata).toBe('unknown');
+    expect(topic.topicCreatedAt).toBeUndefined();
+    expect(topic.latestMessageAt).toBeUndefined();
   });
 
   it('迟到的旧批次不能把游标写回退', () => {
