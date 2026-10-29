@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { openTopicStore, topicStorePath, type TopicStore } from '../src/topic/store.js';
+import { decodeCursor, encodeCursor } from '../src/topic/source.js';
 import { summaryContentHash } from '../src/topic/vector.js';
 
 let dir: string;
@@ -256,9 +257,8 @@ describe('Topic 存储', () => {
       topicKey: 'thread:oc_1:om_1',
       expectedRevision: afterInvalidation.revision,
       mutations: [
-        // 读到删除前快照的模型结果：引用了已删消息 → 整条丢弃。
+        // 读到删除前快照的模型结果：只要有一条引用已删消息，整批作废。
         { op: 'add', text: '来自已删消息的摘要', keywords: [], sourceMessageIds: ['om_100', 'om_101'] },
-        // 只引用存活消息的摘要仍然保留。
         { op: 'add', text: '存活消息摘要', keywords: [], sourceMessageIds: ['om_102'] },
       ],
       nextCursor: 'cursor-2',
@@ -266,10 +266,24 @@ describe('Topic 存储', () => {
       generatorKey: 'test-model@v1',
       now: '2026-10-02T00:10:00.000Z',
     });
-    expect(late.status).toBe('committed');
-    if (late.status !== 'committed') return;
-    expect(late.applied).toEqual({ added: 1, updated: 0 });
-    expect(late.summaries.map(summary => summary.text)).toEqual(['存活消息摘要']);
+    expect(late).toMatchObject({ status: 'blocked', reason: 'tombstoned' });
+    expect(store.getTopic('thread:oc_1:om_1')!.summaries).toEqual([]);
+
+    // 只引用存活消息的批次仍可提交。
+    const live = store.commitSummaryMutation({
+      topicKey: 'thread:oc_1:om_1',
+      expectedRevision: store.getTopic('thread:oc_1:om_1')!.revision,
+      mutations: [{ op: 'add', text: '存活消息摘要', keywords: [], sourceMessageIds: ['om_102'] }],
+      nextCursor: 'cursor-2',
+      sourceThroughAt: '2026-10-02T00:10:00.000Z',
+      generatorKey: 'test-model@v1',
+      now: '2026-10-02T00:10:00.000Z',
+    });
+    expect(live.status).toBe('committed');
+    if (live.status === 'committed') {
+      expect(live.applied).toEqual({ added: 1, updated: 0 });
+      expect(live.summaries.map(summary => summary.text)).toEqual(['存活消息摘要']);
+    }
 
     // 墓碑跨重启仍然有效（不能只靠进程内集合）。
     store.close();
@@ -283,11 +297,102 @@ describe('Topic 存储', () => {
       generatorKey: 'test-model@v1',
       now: '2026-10-03T00:00:00.000Z',
     });
-    expect(reopened.status).toBe('committed');
-    if (reopened.status === 'committed') {
-      expect(reopened.applied).toEqual({ added: 0, updated: 0 });
-      expect(reopened.summaries.map(summary => summary.text)).toEqual(['存活消息摘要']);
-    }
+    expect(reopened).toMatchObject({ status: 'blocked', reason: 'tombstoned' });
+    expect(store.getTopic('thread:oc_1:om_1')!.summaries.map(summary => summary.text))
+      .toEqual(['存活消息摘要']);
+  });
+
+  it('迟到的旧批次不能把游标写回退', () => {
+    const later = encodeCursor({ createTime: '2026-10-02T05:00:00.000Z', messageIds: ['om_500'] });
+    const earlier = encodeCursor({ createTime: '2026-10-02T03:00:00.000Z', messageIds: ['om_300'] });
+    expect(store.commitSummaryMutation({
+      topicKey: 'thread:oc_1:om_1',
+      expectedRevision: 0,
+      mutations: [{ op: 'add', text: '较晚批次', keywords: [], sourceMessageIds: ['om_500'] }],
+      nextCursor: later,
+      sourceThroughAt: '2026-10-02T05:00:00.000Z',
+      generatorKey: 'test-model@v1',
+      now: '2026-10-02T05:00:00.000Z',
+    }).status).toBe('committed');
+
+    const late = store.commitSummaryMutation({
+      topicKey: 'thread:oc_1:om_1',
+      expectedRevision: store.getTopic('thread:oc_1:om_1')!.revision,
+      mutations: [{ op: 'add', text: '迟到的旧批次', keywords: [], sourceMessageIds: ['om_300'] }],
+      nextCursor: earlier,
+      sourceThroughAt: '2026-10-02T03:00:00.000Z',
+      generatorKey: 'test-model@v1',
+      now: '2026-10-02T05:10:00.000Z',
+    });
+    expect(late).toMatchObject({ status: 'blocked', reason: 'cursor_regressed' });
+    const topic = store.getTopic('thread:oc_1:om_1')!;
+    expect(decodeCursor(topic.summarizedThroughCursor)).toEqual({
+      createTime: '2026-10-02T05:00:00.000Z',
+      messageIds: ['om_500'],
+    });
+    expect(topic.summaries.map(summary => summary.text)).toEqual(['较晚批次']);
+  });
+
+  it('同一毫秒的游标取 id 并集，不丢同毫秒已处理消息', () => {
+    const first = encodeCursor({ createTime: '2026-10-02T05:00:00.000Z', messageIds: ['om_500'] });
+    const sameMs = encodeCursor({ createTime: '2026-10-02T05:00:00.000Z', messageIds: ['om_501'] });
+    store.commitSummaryMutation({
+      topicKey: 'thread:oc_1:om_1',
+      expectedRevision: 0,
+      mutations: [{ op: 'add', text: 'A', keywords: [], sourceMessageIds: ['om_500'] }],
+      nextCursor: first,
+      sourceThroughAt: '2026-10-02T05:00:00.000Z',
+      generatorKey: 'test-model@v1',
+      now: '2026-10-02T05:00:00.000Z',
+    });
+    store.commitSummaryMutation({
+      topicKey: 'thread:oc_1:om_1',
+      expectedRevision: store.getTopic('thread:oc_1:om_1')!.revision,
+      mutations: [{ op: 'add', text: 'B', keywords: [], sourceMessageIds: ['om_501'] }],
+      nextCursor: sameMs,
+      sourceThroughAt: '2026-10-02T05:00:00.000Z',
+      generatorKey: 'test-model@v1',
+      now: '2026-10-02T05:01:00.000Z',
+    });
+    expect(decodeCursor(store.getTopic('thread:oc_1:om_1')!.summarizedThroughCursor)).toEqual({
+      createTime: '2026-10-02T05:00:00.000Z',
+      messageIds: expect.arrayContaining(['om_500', 'om_501']),
+    });
+  });
+
+  it('enrich 期间发生删除（epoch 变化）时整批拒绝，不推进游标', () => {
+    const epochBefore = store.deletionEpoch('thread:oc_1:om_1');
+    store.invalidateSummariesForMessages({
+      topicKey: 'thread:oc_1:om_1',
+      messageIds: ['om_999'],
+      now: '2026-10-02T00:00:00.000Z',
+    });
+    expect(store.deletionEpoch('thread:oc_1:om_1')).toBe(epochBefore + 1);
+
+    const stale = store.commitSummaryMutation({
+      topicKey: 'thread:oc_1:om_1',
+      expectedRevision: store.getTopic('thread:oc_1:om_1')!.revision,
+      expectedDeletionEpoch: epochBefore,
+      mutations: [{ op: 'add', text: '基于删除前快照的摘要', keywords: [], sourceMessageIds: ['om_1'] }],
+      nextCursor: 'cursor-epoch',
+      sourceThroughAt: '2026-10-02T00:10:00.000Z',
+      generatorKey: 'test-model@v1',
+      now: '2026-10-02T00:10:00.000Z',
+    });
+    expect(stale).toMatchObject({ status: 'blocked', reason: 'stale_epoch' });
+    expect(store.getTopic('thread:oc_1:om_1')!.summaries).toEqual([]);
+
+    const fresh = store.commitSummaryMutation({
+      topicKey: 'thread:oc_1:om_1',
+      expectedRevision: store.getTopic('thread:oc_1:om_1')!.revision,
+      expectedDeletionEpoch: epochBefore + 1,
+      mutations: [{ op: 'add', text: '删除后的新摘要', keywords: [], sourceMessageIds: ['om_1'] }],
+      nextCursor: 'cursor-epoch',
+      sourceThroughAt: '2026-10-02T00:10:00.000Z',
+      generatorKey: 'test-model@v1',
+      now: '2026-10-02T00:10:00.000Z',
+    });
+    expect(fresh.status).toBe('committed');
   });
 
   it('没有摘要引用被删消息时不递增 revision，避免无谓 CAS 冲突', () => {
@@ -298,7 +403,8 @@ describe('Topic 存储', () => {
       messageIds: ['om_other'],
       now: '2026-10-02T00:00:00.000Z',
     });
-    expect(result).toEqual({ invalidated: 0, revision: before.revision });
+    // 墓碑/epoch 仍要记录（防止晚到写回），但不递增 revision，避免无谓 CAS 冲突。
+    expect(result).toEqual({ invalidated: 0, revision: before.revision, epoch: 1 });
     expect(store.getTopic('thread:oc_1:om_1')!.summaries).toHaveLength(1);
   });
 

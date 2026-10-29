@@ -36,8 +36,13 @@ export interface TopicSourceCursor {
 }
 
 export interface TopicHistoryReadOptions {
+  /**
+   * 读取边界。更新器会传一个**早于**成功游标的边界（重叠窗口），用来核查
+   * 已摘要消息是否被撤回；因此实现必须返回该边界之后的全部消息，且只有
+   * 真正覆盖到边界时才能把 `complete` 置为 true。
+   */
   after?: TopicSourceCursor;
-  /** 本次最多读取多少条新消息（源侧应把它翻成有界分页）。 */
+  /** 本次最多读取多少条消息（源侧应把它翻成有界分页）。 */
   limit: number;
 }
 

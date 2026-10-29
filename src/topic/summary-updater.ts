@@ -31,6 +31,10 @@ export interface SummaryUpdateLimits {
   maxExistingSummaries: number;
   /** 消息进 prompt 后的单条字符上限。 */
   maxMessageChars: number;
+  /** 删除核查窗口：向游标之前重叠多久（只读消息 id，不送模型、不动游标）。 */
+  recheckOverlapMs: number;
+  /** 核查窗口单次最多读多少条；被预算截断时放弃「缺失即删除」判断。 */
+  recheckLimit: number;
 }
 
 export const SUMMARY_UPDATE_DEFAULT_LIMITS: SummaryUpdateLimits = {
@@ -39,6 +43,8 @@ export const SUMMARY_UPDATE_DEFAULT_LIMITS: SummaryUpdateLimits = {
   maxMessagesPerBatch: 40,
   maxExistingSummaries: 20,
   maxMessageChars: 2_000,
+  recheckOverlapMs: 24 * 60 * 60_000,
+  recheckLimit: 200,
 };
 
 export type UpdateTopicStatus = 'no_increment' | 'committed' | 'conflict' | 'failed' | 'skipped';
@@ -165,11 +171,26 @@ export async function updateTopicFromSource(
   }
 
   const cursor = decodeCursor(topic.summarizedThroughCursor) ?? undefined;
+  // 删除核查必须看到「已摘要」的消息，而增量读取只返回游标之后。因此有游标时
+  // 把读取边界向过去重叠一段：重叠段只用于判断哪些旧消息消失了，不送模型
+  // （selectIncrement 仍按原游标切增量），也不会把游标往回写。
+  const overlapMs = Math.max(0, limits.recheckOverlapMs);
+  let recheckSinceIso: string | undefined;
+  let readAfter: typeof cursor;
+  if (cursor && overlapMs > 0) {
+    const cursorMs = Date.parse(cursor.createTime);
+    if (Number.isFinite(cursorMs)) {
+      recheckSinceIso = new Date(cursorMs - overlapMs).toISOString();
+      readAfter = { createTime: recheckSinceIso, messageIds: [] };
+    }
+  }
+  readAfter ??= cursor;
+
   let page;
   try {
     page = await deps.source.readMessages(entry, {
-      ...(cursor ? { after: cursor } : {}),
-      limit: limits.maxMessagesPerBatch,
+      ...(readAfter ? { after: readAfter } : {}),
+      limit: recheckSinceIso ? limits.recheckLimit : limits.maxMessagesPerBatch,
     });
   } catch {
     const checkedAt = now();
@@ -190,10 +211,24 @@ export async function updateTopicFromSource(
     };
   }
 
+  const normalized = normalizeSourceMessages(page.messages);
+  const checkedAt = now();
+  const sourceMessageTimes: Record<string, string> = {};
+  for (const message of normalized) sourceMessageTimes[message.messageId] = message.createTime;
+
+  let currentTopic = topic;
+  let invalidated = 0;
+  const invalidate = (messageIds: Iterable<string>): void => {
+    const ids = [...new Set(messageIds)].filter(Boolean);
+    if (ids.length === 0) return;
+    const result = deps.store.invalidateSummariesForMessages({ topicKey, messageIds: ids, now: checkedAt });
+    invalidated += result.invalidated;
+    if (result.invalidated > 0) currentTopic = deps.store.getTopic(topicKey) ?? currentTopic;
+  };
+
   if (page.truncated) {
-    // 源侧窗口没覆盖到游标：本轮**不摘要**（否则游标会跨过读不到的中间段）。
-    // 记成可重试失败，让运维看到 `source_window_too_narrow`，而不是静默丢消息。
-    const checkedAt = now();
+    // 窗口没覆盖到游标：本轮不摘要，但窗口里明确标了 deleted 的消息仍要立即失效。
+    invalidate(normalized.filter(message => message.deleted === true).map(message => message.messageId));
     deps.store.recordJobFailure({
       topicKey,
       errorCode: 'source_window_too_narrow',
@@ -207,11 +242,11 @@ export async function updateTopicFromSource(
       added: 0,
       updated: 0,
       cursorAdvanced: false,
+      ...(invalidated > 0 ? { invalidated } : {}),
       errorCode: 'source_window_too_narrow',
     };
   }
 
-  const checkedAt = now();
   if (page.nativeThreadId) {
     // 原生话题 id 只用于跳转，但需要在读到它的这一轮落库，否则页面拿不到入口。
     deps.store.upsertTopicDirectory({
@@ -224,25 +259,59 @@ export async function updateTopicFromSource(
       now: checkedAt,
     });
   }
-  const normalized = normalizeSourceMessages(page.messages);
+
   const selection = selectIncrement({ messages: normalized, cursor, limit: limits.maxMessagesPerBatch });
 
-  // 源侧确认删除的消息：先失效引用它们的摘要（连同向量），再走模型/提交。
-  // 顺序是有意的：模型超时或提交冲突时游标不推进，但已删除内容已不可检索。
-  let currentTopic = topic;
-  const deletedIds = selection.batch
-    .filter(message => message.deleted === true)
-    .map(message => message.messageId);
-  let invalidated = 0;
-  if (deletedIds.length > 0) {
-    const result = deps.store.invalidateSummariesForMessages({
-      topicKey,
-      messageIds: deletedIds,
-      now: checkedAt,
-    });
-    invalidated = result.invalidated;
-    if (invalidated > 0) currentTopic = deps.store.getTopic(topicKey) ?? topic;
+  // 删除检测的两种来源：
+  // 1. 源侧在本次读到的任意消息上标了 deleted（不只增量段）；
+  // 2. 重叠窗口内、之前已摘要过的来源消息在完整窗口里消失 —— 只有页面完整
+  //    （truncated=false）时才敢把「缺席」当删除，否则会把读不到的旧消息误删。
+  const deletedIds = new Set<string>();
+  for (const message of normalized) {
+    if (message.deleted === true) deletedIds.add(message.messageId);
   }
+  if (cursor && recheckSinceIso) {
+    const present = new Set(
+      normalized
+        .filter(message => message.createTime >= recheckSinceIso!)
+        .map(message => message.messageId),
+    );
+    for (const ref of deps.store.summariesReferencingSince(topicKey, recheckSinceIso)) {
+      if (ref.createTime > cursor.createTime) continue;
+      if (!present.has(ref.messageId)) deletedIds.add(ref.messageId);
+    }
+  }
+  invalidate(deletedIds);
+
+  const deletionEpoch = deps.store.deletionEpoch(topicKey);
+
+  const failAfterCommitError = (errorCode: string, batchSize: number): UpdateTopicOutcome => {
+    const at = now();
+    deps.store.recordJobFailure({
+      topicKey,
+      errorCode,
+      nextAttemptAt: computeRetryAtIso((deps.store.jobState(topicKey)?.attempts ?? 0) + 1, at),
+      now: at,
+    });
+    return {
+      topicKey,
+      status: 'failed',
+      batchSize,
+      added: 0,
+      updated: 0,
+      cursorAdvanced: false,
+      ...(invalidated > 0 ? { invalidated } : {}),
+      errorCode,
+    };
+  };
+
+  const commit = (input: Parameters<TopicStore['commitSummaryMutation']>[0]) => {
+    try {
+      return deps.store.commitSummaryMutation(input);
+    } catch {
+      return null;
+    }
+  };
 
   if (selection.batch.length === 0) {
     // 零增量：只记检查状态，零模型调用。
@@ -255,23 +324,28 @@ export async function updateTopicFromSource(
       added: 0,
       updated: 0,
       cursorAdvanced: false,
+      ...(invalidated > 0 ? { invalidated } : {}),
     };
   }
 
   // 已删除的消息不进摘要；但整批都是删除时仍要推进游标（否则会被永久重读）。
   const live = selection.batch.filter(message => message.deleted !== true);
-  const nextCursor = selection.nextCursor ? encodeCursor(selection.nextCursor) : topic.summarizedThroughCursor ?? '';
+  const nextCursor = selection.nextCursor ? encodeCursor(selection.nextCursor) : currentTopic.summarizedThroughCursor ?? '';
 
   if (live.length === 0) {
-    const result = deps.store.commitSummaryMutation({
+    const result = commit({
       topicKey,
       expectedRevision: currentTopic.revision,
+      expectedDeletionEpoch: deletionEpoch,
       mutations: [{ op: 'noop' }],
+      sourceMessageTimes,
       nextCursor,
       sourceThroughAt: checkedAt,
       generatorKey: deps.enricher.generatorKey,
       now: checkedAt,
     });
+    if (!result) return failAfterCommitError('commit_failed', selection.batch.length);
+    if (result.status === 'blocked') return failAfterCommitError(result.reason, selection.batch.length);
     const advanced = result.status === 'committed';
     if (advanced) deps.store.clearJobFailure(topicKey, checkedAt);
     return {
@@ -304,59 +378,66 @@ export async function updateTopicFromSource(
       added: 0,
       updated: 0,
       cursorAdvanced: false,
+      ...(invalidated > 0 ? { invalidated } : {}),
       errorCode: code,
     };
   }
 
-  const commit = deps.store.commitSummaryMutation({
+  const result = commit({
     topicKey,
     expectedRevision: currentTopic.revision,
+    expectedDeletionEpoch: deletionEpoch,
     mutations,
+    sourceMessageTimes,
     nextCursor,
     sourceThroughAt: checkedAt,
     generatorKey: deps.enricher.generatorKey,
     now: checkedAt,
   });
+  if (!result) return failAfterCommitError('commit_failed', selection.batch.length);
+  if (result.status === 'blocked') return failAfterCommitError(result.reason, selection.batch.length);
 
-  if (commit.status === 'committed') {
+  if (result.status === 'committed') {
     deps.store.clearJobFailure(topicKey, checkedAt);
-    const counts = commit.applied;
     return {
       topicKey,
       status: 'committed',
       batchSize: selection.batch.length,
-      added: counts.added,
-      updated: counts.updated,
+      added: result.applied.added,
+      updated: result.applied.updated,
       cursorAdvanced: true,
       ...(invalidated > 0 ? { invalidated } : {}),
     };
   }
 
-  if (commit.status === 'conflict') {
+  if (result.status === 'conflict') {
     // 冲突重读：把语义前提已变的 update 丢掉，再提交一次；不重跑模型（模型结果仍有效）。
     const fresh = deps.store.getTopic(topicKey);
     if (!fresh) {
       return { topicKey, status: 'conflict', batchSize: selection.batch.length, added: 0, updated: 0, cursorAdvanced: false };
     }
     const reconciled = reconcileMutationsAfterConflict(mutations, currentTopic, fresh);
-    const retried = deps.store.commitSummaryMutation({
+    const retried = commit({
       topicKey,
       expectedRevision: fresh.revision,
+      expectedDeletionEpoch: deps.store.deletionEpoch(topicKey),
       mutations: reconciled,
+      sourceMessageTimes,
       nextCursor,
       sourceThroughAt: checkedAt,
       generatorKey: deps.enricher.generatorKey,
       now: checkedAt,
     });
+    if (!retried) return failAfterCommitError('commit_failed', selection.batch.length);
+    if (retried.status === 'blocked') return failAfterCommitError(retried.reason, selection.batch.length);
     if (retried.status === 'committed') {
       deps.store.clearJobFailure(topicKey, checkedAt);
-      const counts = retried.applied;
       return {
         topicKey,
         status: 'committed',
         batchSize: selection.batch.length,
-        added: counts.added,
-        updated: counts.updated,
+        added: retried.applied.added,
+        updated: retried.applied.updated,
         cursorAdvanced: true,
         ...(invalidated > 0 ? { invalidated } : {}),
       };
@@ -372,15 +453,7 @@ export async function updateTopicFromSource(
     };
   }
 
-  return {
-    topicKey,
-    status: 'failed',
-    batchSize: selection.batch.length,
-    added: 0,
-    updated: 0,
-    cursorAdvanced: false,
-    errorCode: 'topic_missing',
-  };
+  return { topicKey, status: 'failed', batchSize: 0, added: 0, updated: 0, cursorAdvanced: false, errorCode: 'topic_missing' };
 }
 
 export interface EmbeddingBackfillResult {

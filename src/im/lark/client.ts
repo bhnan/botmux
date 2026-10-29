@@ -2487,8 +2487,9 @@ export async function listThreadMessagesIncremental(
     }
     if (complete || results.length >= maxMessages) break;
   }
-  // 没有边界（首轮回填）时，翻到容器开头就是完整覆盖。
-  if (options.afterTimeMs === undefined && results.length < maxMessages) complete = true;
+  // 翻到容器开头就是完整覆盖：没有给边界（首轮回填），或给定的边界早于容器里
+  // 第一条消息（重叠核查窗口比整个话题还长）都属于这种情况。
+  if (!complete && results.length < maxMessages) complete = true;
 
   results.sort((left, right) => String(left?.create_time ?? '').localeCompare(String(right?.create_time ?? '')));
   return { messages: results, threadId, verifiedThread, complete };

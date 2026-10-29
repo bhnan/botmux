@@ -107,6 +107,17 @@ describe('listThreadMessagesIncremental', () => {
     expect(ids(result.messages).slice(0, 2)).toEqual(['m001', 'm002']);
   });
 
+  it('边界早于容器第一条消息时，翻到开头也算完整覆盖（重叠核查窗口）', async () => {
+    const { listThreadMessagesIncremental } = await import('../src/im/lark/client.js');
+    const result = await listThreadMessagesIncremental('cli_x', 'oc_1', ROOT, {
+      maxMessages: 200,
+      afterTimeMs: BASE_MS - 24 * 60 * 60_000,
+      afterMessageIds: [],
+    });
+    expect(result.messages).toHaveLength(130);
+    expect(result.complete).toBe(true);
+  });
+
   it('遇到处理边界就停：只返回边界之后的增量，且不再多取一页', async () => {
     const { listThreadMessagesIncremental } = await import('../src/im/lark/client.js');
     const result = await listThreadMessagesIncremental('cli_x', 'oc_1', ROOT, {

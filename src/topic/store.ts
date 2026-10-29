@@ -22,6 +22,7 @@ import { resolveBotmuxDataDir } from '../core/data-dir.js';
 import { openDatabaseSyncOrThrow, sqliteEngineAvailable, type DatabaseSyncLike } from '../services/sqlite-compat.js';
 import type { Topic, TopicSummary } from '../types.js';
 import type { SummaryMutation } from './model-client.js';
+import { decodeCursor, encodeCursor } from './source.js';
 import { summaryContentHash } from './vector.js';
 
 const SCHEMA_VERSION = 1;
@@ -107,6 +108,16 @@ CREATE TABLE IF NOT EXISTS topic_deleted_messages (
   deleted_at TEXT NOT NULL,
   PRIMARY KEY (topic_key, message_id)
 );
+CREATE TABLE IF NOT EXISTS topic_summary_sources (
+  summary_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  create_time TEXT NOT NULL,
+  PRIMARY KEY (summary_id, message_id)
+);
+CREATE TABLE IF NOT EXISTS topic_deletion_epochs (
+  topic_key TEXT PRIMARY KEY,
+  epoch INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS topic_jobs (
   topic_key TEXT PRIMARY KEY,
   attempts INTEGER NOT NULL,
@@ -166,6 +177,10 @@ export interface CommitSummaryMutationInput {
   topicKey: string;
   expectedRevision: number;
   mutations: readonly SummaryMutation[];
+  /** 本批消息的 id → createTime；用于删除重叠窗口的后续核查。 */
+  sourceMessageTimes?: Readonly<Record<string, string>>;
+  /** 失效前捕获的删除 epoch；不一致说明期间发生了删除，整批不得落盘。 */
+  expectedDeletionEpoch?: number;
   /** 提交成功后写入的源游标（编码后的不透明字符串）。 */
   nextCursor: string;
   sourceThroughAt: string;
@@ -178,10 +193,15 @@ export type CommitSummaryMutationResult =
     status: 'committed';
     revision: number;
     summaries: TopicSummary[];
-    /** 实际落库的变更条数（被删除墓碑挡掉的 add/update 不计入）。 */
+    /** 实际落库的变更条数。 */
     applied: { added: number; updated: number };
   }
   | { status: 'conflict'; revision: number }
+  | {
+    status: 'blocked';
+    reason: 'tombstoned' | 'stale_epoch' | 'cursor_regressed';
+    revision: number;
+  }
   | { status: 'missing' };
 
 export interface SlotAcquireInput {
@@ -225,7 +245,14 @@ export interface TopicStore {
     topicKey: string;
     messageIds: readonly string[];
     now: string;
-  }): { invalidated: number; revision: number };
+  }): { invalidated: number; revision: number; epoch: number };
+  /** 当前 topic 的删除 epoch（每次失效递增）。 */
+  deletionEpoch(topicKey: string): number;
+  /** 某时间点之后仍未失效的摘要来源（用于重叠窗口核查删除）。 */
+  summariesReferencingSince(
+    topicKey: string,
+    sinceIso: string,
+  ): Array<{ summaryId: string; messageId: string; createTime: string }>;
   recordCheck(input: { topicKey: string; checkedAt: string; coverageStartAt?: string }): void;
   markSummaryEmbedding(input: {
     topicKey: string;
@@ -302,6 +329,50 @@ export function openTopicStore(options: OpenTopicStoreOptions = {}): TopicStore 
   function readEmbeddingRows(): Map<string, EmbeddingRow> {
     const rows = db.prepare('SELECT * FROM topic_summary_embeddings').all() as EmbeddingRow[];
     return new Map(rows.map(row => [row.summary_id, row]));
+  }
+
+  /**
+   * 游标合并：只允许前进。同一毫秒取两侧 id 并集（该毫秒上处理过的消息都要记下），
+   * 更早的边界一律视为迟到批次，由调用方整批丢弃。
+   */
+  function mergeCursor(
+    previous: string | null,
+    next: string,
+  ): { cursor: string; regressed: boolean } {
+    const before = decodeCursor(previous);
+    const after = decodeCursor(next);
+    if (!before || !after) return { cursor: next, regressed: false };
+    const order = after.createTime.localeCompare(before.createTime);
+    if (order < 0) return { cursor: previous ?? next, regressed: true };
+    if (order === 0) {
+      return {
+        cursor: encodeCursor({
+          createTime: after.createTime,
+          messageIds: [...new Set([...before.messageIds, ...after.messageIds])],
+        }),
+        regressed: false,
+      };
+    }
+    return { cursor: next, regressed: false };
+  }
+
+  /** 摘要 → 来源消息时间表：重叠窗口核查删除时，才知道哪些引用落在窗口内。 */
+  function replaceSummarySources(
+    summaryId: string,
+    messageIds: readonly string[],
+    previousTimes: ReadonlyMap<string, string>,
+    input: CommitSummaryMutationInput,
+  ): void {
+    db.prepare('DELETE FROM topic_summary_sources WHERE summary_id = ?').run(summaryId);
+    const insert = db.prepare(
+      `INSERT OR REPLACE INTO topic_summary_sources (summary_id, message_id, create_time)
+         VALUES (?, ?, ?)`,
+    );
+    for (const messageId of messageIds) {
+      const createTime =
+        input.sourceMessageTimes?.[messageId] ?? previousTimes.get(messageId) ?? input.sourceThroughAt;
+      insert.run(summaryId, messageId, createTime);
+    }
   }
 
   /**
@@ -434,30 +505,47 @@ export function openTopicStore(options: OpenTopicStoreOptions = {}): TopicStore 
           .prepare('SELECT * FROM topics WHERE topic_key = ?')
           .get(input.topicKey) as TopicRow | undefined;
         if (!row) return { status: 'missing' as const };
-        if (Number(row.revision) !== input.expectedRevision) {
-          return { status: 'conflict' as const, revision: Number(row.revision) };
+        const currentRevision = Number(row.revision);
+        if (currentRevision !== input.expectedRevision) {
+          return { status: 'conflict' as const, revision: currentRevision };
         }
 
-        // 删除墓碑：失效之后才到达的模型结果（并发/重试）不得把已删内容写回来。
-        // 只要变更引用了墓碑消息，整条 add/update 丢弃——改写来源 id 会让正文与
-        // 来源不一致，反而更难排查。
+        // 删除 epoch：enrich 期间只要发生过失效，这一批结果就基于旧快照，整批丢弃。
+        const epoch = store.deletionEpoch(input.topicKey);
+        if (input.expectedDeletionEpoch !== undefined && input.expectedDeletionEpoch !== epoch) {
+          return { status: 'blocked' as const, reason: 'stale_epoch' as const, revision: currentRevision };
+        }
+        // 墓碑兜底：跨进程/重启后 epoch 可能已被重置（话题重建），来源 id 仍能挡住回写。
         const tombstoned = new Set(
           (db.prepare('SELECT message_id FROM topic_deleted_messages WHERE topic_key = ?')
             .all(input.topicKey) as Array<{ message_id: string }>).map(entry => entry.message_id),
         );
+        const blockedByTombstone = input.mutations.some(mutation =>
+          mutation.op !== 'noop' && mutation.sourceMessageIds.some(id => tombstoned.has(id)));
+        if (blockedByTombstone) {
+          return { status: 'blocked' as const, reason: 'tombstoned' as const, revision: currentRevision };
+        }
+
+        // 游标只能前进：租约到期/多实例交叠时，迟到的旧批次绝不能把边界写回去，
+        // 否则下一轮会把已经摘要过的消息再摘要一次。
+        const merged = mergeCursor(row.summarized_through_cursor, input.nextCursor);
+        if (merged.regressed) {
+          return { status: 'blocked' as const, reason: 'cursor_regressed' as const, revision: currentRevision };
+        }
+        const nextCursor = merged.cursor;
+
         let appliedAdded = 0;
         let appliedUpdated = 0;
-
         for (const mutation of input.mutations) {
           if (mutation.op === 'noop') continue;
-          if (tombstoned.size > 0 && mutation.sourceMessageIds.some(id => tombstoned.has(id))) continue;
           if (mutation.op === 'add') {
+            const summaryId = `s_${randomUUID()}`;
             db.prepare(
               `INSERT INTO topic_summaries
                  (summary_id, topic_key, text, keywords, source_message_ids, updated_at, generator_key)
                VALUES (?, ?, ?, ?, ?, ?, ?)`,
             ).run(
-              `s_${randomUUID()}`,
+              summaryId,
               input.topicKey,
               mutation.text,
               JSON.stringify(mutation.keywords),
@@ -465,6 +553,7 @@ export function openTopicStore(options: OpenTopicStoreOptions = {}): TopicStore 
               input.now,
               input.generatorKey,
             );
+            replaceSummarySources(summaryId, mutation.sourceMessageIds, new Map(), input);
             appliedAdded += 1;
             continue;
           }
@@ -476,6 +565,11 @@ export function openTopicStore(options: OpenTopicStoreOptions = {}): TopicStore 
             // 不因为一条 update 丢掉整批已成功的摘要。
             continue;
           }
+          const previousTimes = new Map(
+            (db.prepare('SELECT message_id, create_time FROM topic_summary_sources WHERE summary_id = ?')
+              .all(mutation.id) as Array<{ message_id: string; create_time: string }>)
+              .map(entry => [entry.message_id, entry.create_time]),
+          );
           const textChanged = existing.text !== mutation.text;
           db.prepare(
             `UPDATE topic_summaries
@@ -490,6 +584,7 @@ export function openTopicStore(options: OpenTopicStoreOptions = {}): TopicStore 
             mutation.id,
             input.topicKey,
           );
+          replaceSummarySources(mutation.id, mutation.sourceMessageIds, previousTimes, input);
           appliedUpdated += 1;
           if (textChanged) {
             // 正文变了：旧向量对新正文无意义，直接删除（读路径还会按 hash 二次校验）。
@@ -497,13 +592,13 @@ export function openTopicStore(options: OpenTopicStoreOptions = {}): TopicStore 
           }
         }
 
-        const nextRevision = Number(row.revision) + 1;
+        const nextRevision = currentRevision + 1;
         db.prepare(
           `UPDATE topics
               SET revision = ?, summarized_through_cursor = ?, source_through_at = ?,
                   last_checked_at = ?, updated_at = ?
             WHERE topic_key = ?`,
-        ).run(nextRevision, input.nextCursor, input.sourceThroughAt, input.now, input.now, input.topicKey);
+        ).run(nextRevision, nextCursor, input.sourceThroughAt, input.now, input.now, input.topicKey);
 
         const topic = this.getTopic(input.topicKey);
         return {
@@ -521,8 +616,18 @@ export function openTopicStore(options: OpenTopicStoreOptions = {}): TopicStore 
         const row = db
           .prepare('SELECT * FROM topics WHERE topic_key = ?')
           .get(input.topicKey) as TopicRow | undefined;
-        if (!row) return { invalidated: 0, revision: 0 };
-        if (deleted.size === 0) return { invalidated: 0, revision: Number(row.revision) };
+        if (!row) return { invalidated: 0, revision: 0, epoch: 0 };
+        if (deleted.size === 0) {
+          return { invalidated: 0, revision: Number(row.revision), epoch: store.deletionEpoch(input.topicKey) };
+        }
+
+        // epoch 在墓碑之前递增：任何在失效之前读取状态的 enrich 结果，提交时都会
+        // 因 epoch 不匹配而整批作废。
+        db.prepare(
+          `INSERT INTO topic_deletion_epochs (topic_key, epoch) VALUES (?, 1)
+           ON CONFLICT(topic_key) DO UPDATE SET epoch = epoch + 1`,
+        ).run(input.topicKey);
+        const epoch = store.deletionEpoch(input.topicKey);
 
         // 先落墓碑，再删摘要：即使在删除摘要期间进程崩溃，后续提交也不会把
         // 同一条被删消息的内容写回来。
@@ -540,20 +645,39 @@ export function openTopicStore(options: OpenTopicStoreOptions = {}): TopicStore 
         }
         for (const id of affected) {
           db.prepare('DELETE FROM topic_summary_embeddings WHERE summary_id = ?').run(id);
+          db.prepare('DELETE FROM topic_summary_sources WHERE summary_id = ?').run(id);
           db.prepare('DELETE FROM topic_summaries WHERE summary_id = ? AND topic_key = ?').run(
             id,
             input.topicKey,
           );
         }
         if (affected.length === 0) {
-          return { invalidated: 0, revision: Number(row.revision) };
+          return { invalidated: 0, revision: Number(row.revision), epoch };
         }
         const nextRevision = Number(row.revision) + 1;
         db.prepare(
           'UPDATE topics SET revision = ?, updated_at = ? WHERE topic_key = ?',
         ).run(nextRevision, input.now, input.topicKey);
-        return { invalidated: affected.length, revision: nextRevision };
+        return { invalidated: affected.length, revision: nextRevision, epoch };
       });
+    },
+
+    deletionEpoch(topicKey) {
+      const row = db
+        .prepare('SELECT epoch FROM topic_deletion_epochs WHERE topic_key = ?')
+        .get(topicKey) as { epoch: number } | undefined;
+      return row ? Number(row.epoch) : 0;
+    },
+
+    summariesReferencingSince(topicKey, sinceIso) {
+      return (db.prepare(
+        `SELECT s.summary_id, ss.message_id, ss.create_time
+           FROM topic_summary_sources ss
+           JOIN topic_summaries s ON s.summary_id = ss.summary_id
+          WHERE s.topic_key = ? AND ss.create_time >= ?
+          ORDER BY ss.create_time`,
+      ).all(topicKey, sinceIso) as Array<{ summary_id: string; message_id: string; create_time: string }>)
+        .map(row => ({ summaryId: row.summary_id, messageId: row.message_id, createTime: row.create_time }));
     },
 
     recordCheck(input) {
@@ -738,11 +862,13 @@ export function openTopicStore(options: OpenTopicStoreOptions = {}): TopicStore 
         ).map(row => row.summary_id);
         for (const id of ids) {
           db.prepare('DELETE FROM topic_summary_embeddings WHERE summary_id = ?').run(id);
+          db.prepare('DELETE FROM topic_summary_sources WHERE summary_id = ?').run(id);
         }
         db.prepare('DELETE FROM topic_summaries WHERE topic_key = ?').run(topicKey);
         db.prepare('DELETE FROM topics WHERE topic_key = ?').run(topicKey);
         db.prepare('DELETE FROM topic_jobs WHERE topic_key = ?').run(topicKey);
         db.prepare('DELETE FROM topic_deleted_messages WHERE topic_key = ?').run(topicKey);
+        db.prepare('DELETE FROM topic_deletion_epochs WHERE topic_key = ?').run(topicKey);
       });
     },
 
