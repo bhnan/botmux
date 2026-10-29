@@ -194,6 +194,80 @@ describe('增量摘要更新', () => {
     expect(source.readMessages).not.toHaveBeenCalled();
     expect(enricher.enrich).not.toHaveBeenCalled();
   });
+
+  it('源侧确认删除：先失效引用摘要再提交，且整批都是删除时仍推进游标', async () => {
+    // 预置：摘要引用了 om_100，游标停在更早的 om_0。
+    store.upsertTopicDirectory({
+      topicKey: 'thread:oc_1:om_1',
+      chatId: 'oc_1',
+      rootMessageId: 'om_1',
+      title: entry.title,
+      accessPolicyRef: entry.accessPolicyRef,
+      now: '2026-10-01T00:00:00.000Z',
+      coverageStartAt: '2026-10-01T00:00:00.000Z',
+    });
+    const seeded = store.commitSummaryMutation({
+      topicKey: 'thread:oc_1:om_1',
+      expectedRevision: 0,
+      mutations: [{ op: 'add', text: '含 om_100 的旧摘要', keywords: [], sourceMessageIds: ['om_100'] }],
+      nextCursor: encodeCursor({ createTime: '2026-10-01T00:00:01.000Z', messageIds: ['om_0'] }),
+      sourceThroughAt: '2026-10-01T00:00:01.000Z',
+      generatorKey: 'test-model@v1',
+      now: '2026-10-01T00:00:01.000Z',
+    });
+    expect(seeded.status).toBe('committed');
+
+    const source = fakeSource([{
+      messages: [{ ...message('om_100', 2), deleted: true }],
+    }]);
+    const enricher = fakeEnricher([]);
+    const outcome = await updateTopicFromSource({ store, source, enricher }, entry, {});
+
+    expect(outcome.status).toBe('committed');
+    expect(outcome.cursorAdvanced).toBe(true);
+    expect(outcome.invalidated).toBe(1);
+    const topic = store.getTopic('thread:oc_1:om_1')!;
+    expect(topic.summaries).toEqual([]);
+    // 删除批也必须推进游标，否则会被永久重读。
+    expect(topic.summarizedThroughCursor).toBeTruthy();
+  });
+
+  it('模型失败不推进游标，但已确认删除的摘要仍然失效（不继续泄露）', async () => {
+    store.upsertTopicDirectory({
+      topicKey: 'thread:oc_1:om_1',
+      chatId: 'oc_1',
+      rootMessageId: 'om_1',
+      title: entry.title,
+      accessPolicyRef: entry.accessPolicyRef,
+      now: '2026-10-01T00:00:00.000Z',
+      coverageStartAt: '2026-10-01T00:00:00.000Z',
+    });
+    store.commitSummaryMutation({
+      topicKey: 'thread:oc_1:om_1',
+      expectedRevision: 0,
+      mutations: [{ op: 'add', text: '含 om_100 的旧摘要', keywords: [], sourceMessageIds: ['om_100'] }],
+      nextCursor: encodeCursor({ createTime: '2026-10-01T00:00:01.000Z', messageIds: ['om_0'] }),
+      sourceThroughAt: '2026-10-01T00:00:01.000Z',
+      generatorKey: 'test-model@v1',
+      now: '2026-10-01T00:00:01.000Z',
+    });
+
+    const source = fakeSource([{
+      messages: [{ ...message('om_100', 2), deleted: true }, message('om_101', 3)],
+    }]);
+    const enricher = fakeEnricher(async () => {
+      throw Object.assign(new Error('boom'), { code: 'timeout' });
+    });
+    const outcome = await updateTopicFromSource({ store, source, enricher }, entry, {});
+
+    expect(outcome.status).toBe('failed');
+    expect(outcome.cursorAdvanced).toBe(false);
+    const topic = store.getTopic('thread:oc_1:om_1')!;
+    expect(topic.summaries).toEqual([]);
+    expect(topic.summarizedThroughCursor).toBe(
+      encodeCursor({ createTime: '2026-10-01T00:00:01.000Z', messageIds: ['om_0'] }),
+    );
+  });
 });
 
 describe('失败退避与向量回填', () => {

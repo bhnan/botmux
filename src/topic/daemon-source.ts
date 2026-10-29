@@ -46,6 +46,8 @@ export interface DaemonHistoryMessage {
   createTime?: unknown;
   senderName?: unknown;
   msgType?: unknown;
+  /** 源侧确认已撤回/删除（飞书 message 资源的 `deleted`）。 */
+  deleted?: unknown;
 }
 
 export interface DaemonHistoryPage {
@@ -89,6 +91,7 @@ function toSourceMessage(raw: DaemonHistoryMessage): TopicSourceMessage | null {
     createTime: new Date(createTimeRaw).toISOString(),
     text,
     ...(senderName ? { senderName } : {}),
+    ...(raw.deleted === true ? { deleted: true } : {}),
   };
 }
 

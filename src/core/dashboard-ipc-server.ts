@@ -5042,6 +5042,7 @@ ipcRoute('GET', '/api/topics/messages', async (req, res) => {
         senderType: message?.sender?.sender_type,
         ...(message?.sender?.name ? { senderName: message.sender.name } : {}),
         msgType: message?.message_type,
+        ...(message?.deleted === true ? { deleted: true } : {}),
         content: contentTextForTopic(message),
       })),
     });

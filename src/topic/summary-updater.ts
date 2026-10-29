@@ -50,6 +50,8 @@ export interface UpdateTopicOutcome {
   added: number;
   updated: number;
   cursorAdvanced: boolean;
+  /** 本轮因源侧确认删除而失效的摘要条数。 */
+  invalidated?: number;
   errorCode?: string;
 }
 
@@ -235,6 +237,23 @@ export async function updateTopicFromSource(
   const normalized = normalizeSourceMessages(page.messages);
   const selection = selectIncrement({ messages: normalized, cursor, limit: limits.maxMessagesPerBatch });
 
+  // 源侧确认删除的消息：先失效引用它们的摘要（连同向量），再走模型/提交。
+  // 顺序是有意的：模型超时或提交冲突时游标不推进，但已删除内容已不可检索。
+  let currentTopic = topic;
+  const deletedIds = selection.batch
+    .filter(message => message.deleted === true)
+    .map(message => message.messageId);
+  let invalidated = 0;
+  if (deletedIds.length > 0) {
+    const result = deps.store.invalidateSummariesForMessages({
+      topicKey,
+      messageIds: deletedIds,
+      now: checkedAt,
+    });
+    invalidated = result.invalidated;
+    if (invalidated > 0) currentTopic = deps.store.getTopic(topicKey) ?? topic;
+  }
+
   if (selection.batch.length === 0) {
     // 零增量：只记检查状态，零模型调用。
     deps.store.recordCheck({ topicKey, checkedAt });
@@ -256,7 +275,7 @@ export async function updateTopicFromSource(
   if (live.length === 0) {
     const result = deps.store.commitSummaryMutation({
       topicKey,
-      expectedRevision: topic.revision,
+      expectedRevision: currentTopic.revision,
       mutations: [{ op: 'noop' }],
       nextCursor,
       sourceThroughAt: checkedAt,
@@ -272,12 +291,13 @@ export async function updateTopicFromSource(
       added: 0,
       updated: 0,
       cursorAdvanced: advanced,
+      ...(invalidated > 0 ? { invalidated } : {}),
     };
   }
 
   let mutations: SummaryMutation[];
   try {
-    const enrichment = await deps.enricher.enrich(buildRequest(topic, live, limits));
+    const enrichment = await deps.enricher.enrich(buildRequest(currentTopic, live, limits));
     mutations = enrichment.mutations;
   } catch (error) {
     const code = (error as { code?: string } | null)?.code ?? 'enrich_failed';
@@ -300,7 +320,7 @@ export async function updateTopicFromSource(
 
   const commit = deps.store.commitSummaryMutation({
     topicKey,
-    expectedRevision: topic.revision,
+    expectedRevision: currentTopic.revision,
     mutations,
     nextCursor,
     sourceThroughAt: checkedAt,
@@ -318,6 +338,7 @@ export async function updateTopicFromSource(
       added: counts.added,
       updated: counts.updated,
       cursorAdvanced: true,
+      ...(invalidated > 0 ? { invalidated } : {}),
     };
   }
 
@@ -327,7 +348,7 @@ export async function updateTopicFromSource(
     if (!fresh) {
       return { topicKey, status: 'conflict', batchSize: selection.batch.length, added: 0, updated: 0, cursorAdvanced: false };
     }
-    const reconciled = reconcileMutationsAfterConflict(mutations, topic, fresh);
+    const reconciled = reconcileMutationsAfterConflict(mutations, currentTopic, fresh);
     const retried = deps.store.commitSummaryMutation({
       topicKey,
       expectedRevision: fresh.revision,
@@ -347,6 +368,7 @@ export async function updateTopicFromSource(
         added: counts.added,
         updated: counts.updated,
         cursorAdvanced: true,
+        ...(invalidated > 0 ? { invalidated } : {}),
       };
     }
     return {

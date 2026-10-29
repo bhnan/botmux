@@ -212,6 +212,49 @@ describe('Topic 存储', () => {
     expect(store.getTopic('thread:oc_1:om_1')).not.toBeNull();
   });
 
+  it('源侧确认删除某条消息时失效引用它的摘要与向量，游标不动', () => {
+    const commit = addSummary('引用了 om_100 的摘要');
+    const summary = commit.status === 'committed' ? commit.summaries[0] : null;
+    expect(summary).not.toBeNull();
+    store.markSummaryEmbedding({
+      topicKey: 'thread:oc_1:om_1',
+      summaryId: summary!.id,
+      modelKey: 'test-model@v1',
+      contentHash: summaryContentHash(summary!.text),
+      vector: [1, 0, 0],
+      now: '2026-10-01T01:05:00.000Z',
+    });
+    const before = store.getTopic('thread:oc_1:om_1')!;
+    expect(before.summaries[0].embedding).toBeTruthy();
+
+    const result = store.invalidateSummariesForMessages({
+      topicKey: 'thread:oc_1:om_1',
+      messageIds: ['om_100'],
+      now: '2026-10-02T00:00:00.000Z',
+    });
+
+    expect(result.invalidated).toBe(1);
+    expect(result.revision).toBe(before.revision + 1);
+    const after = store.getTopic('thread:oc_1:om_1')!;
+    expect(after.summaries).toEqual([]);
+    // 游标必须保持原位置：失效不是「这批消息处理成功」。
+    expect(after.summarizedThroughCursor).toBe(before.summarizedThroughCursor);
+    // 向量任务也不能再把它当成待回填项。
+    expect(store.pendingEmbeddingTasks(10)).toEqual([]);
+  });
+
+  it('没有摘要引用被删消息时不递增 revision，避免无谓 CAS 冲突', () => {
+    addSummary('引用 om_100');
+    const before = store.getTopic('thread:oc_1:om_1')!;
+    const result = store.invalidateSummariesForMessages({
+      topicKey: 'thread:oc_1:om_1',
+      messageIds: ['om_other'],
+      now: '2026-10-02T00:00:00.000Z',
+    });
+    expect(result).toEqual({ invalidated: 0, revision: before.revision });
+    expect(store.getTopic('thread:oc_1:om_1')!.summaries).toHaveLength(1);
+  });
+
   it('删除话题连带删摘要与向量，不动其它话题', () => {
     addTopic('2026-10-01T00:00:00.000Z');
     store.upsertTopicDirectory({

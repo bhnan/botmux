@@ -204,6 +204,16 @@ export interface TopicStore {
   getTopic(topicKey: string): Topic | null;
   upsertTopicDirectory(input: TopicDirectoryInput): Topic;
   commitSummaryMutation(input: CommitSummaryMutationInput): CommitSummaryMutationResult;
+  /**
+   * 源侧确认某些消息已删除：删掉引用了它们的摘要（连同向量）。与摘要提交分开，
+   * 因此即使本轮模型调用失败，已删除内容也不会继续被检索到。
+   * 只递增 revision，不动游标 —— 游标推进仍由成功提交独占。
+   */
+  invalidateSummariesForMessages(input: {
+    topicKey: string;
+    messageIds: readonly string[];
+    now: string;
+  }): { invalidated: number; revision: number };
   recordCheck(input: { topicKey: string; checkedAt: string; coverageStartAt?: string }): void;
   markSummaryEmbedding(input: {
     topicKey: string;
@@ -476,6 +486,38 @@ export function openTopicStore(options: OpenTopicStoreOptions = {}): TopicStore 
           revision: nextRevision,
           summaries: topic?.summaries ?? [],
         };
+      });
+    },
+
+    invalidateSummariesForMessages(input) {
+      return inTransaction(() => {
+        const deleted = new Set(input.messageIds.map(id => id.trim()).filter(Boolean));
+        const row = db
+          .prepare('SELECT * FROM topics WHERE topic_key = ?')
+          .get(input.topicKey) as TopicRow | undefined;
+        if (!row) return { invalidated: 0, revision: 0 };
+        if (deleted.size === 0) return { invalidated: 0, revision: Number(row.revision) };
+
+        const affected: string[] = [];
+        for (const summary of readSummaryRows(input.topicKey)) {
+          const sourceIds = parseJsonArray(summary.source_message_ids, isString);
+          if (sourceIds.some(id => deleted.has(id))) affected.push(summary.summary_id);
+        }
+        for (const id of affected) {
+          db.prepare('DELETE FROM topic_summary_embeddings WHERE summary_id = ?').run(id);
+          db.prepare('DELETE FROM topic_summaries WHERE summary_id = ? AND topic_key = ?').run(
+            id,
+            input.topicKey,
+          );
+        }
+        if (affected.length === 0) {
+          return { invalidated: 0, revision: Number(row.revision) };
+        }
+        const nextRevision = Number(row.revision) + 1;
+        db.prepare(
+          'UPDATE topics SET revision = ?, updated_at = ? WHERE topic_key = ?',
+        ).run(nextRevision, input.now, input.topicKey);
+        return { invalidated: affected.length, revision: nextRevision };
       });
     },
 
