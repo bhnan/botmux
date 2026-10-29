@@ -1738,6 +1738,10 @@ export type TopicSearchViewState = {
   items: TopicSearchHit[];
   coverage: TopicSearchCoverage;
   degradedReasons: string[];
+  /** Opaque server cursor for the next page; null = no more results. */
+  nextCursor: string | null;
+  loadingMore: boolean;
+  loadMoreFailed: boolean;
 };
 
 export const initialTopicSearchState: TopicSearchViewState = {
@@ -1747,6 +1751,9 @@ export const initialTopicSearchState: TopicSearchViewState = {
   items: [],
   coverage: { state: 'complete', unindexedKnownTopics: 0 },
   degradedReasons: [],
+  nextCursor: null,
+  loadingMore: false,
+  loadMoreFailed: false,
 };
 
 export type TopicSearchAction =
@@ -1758,15 +1765,39 @@ export type TopicSearchAction =
     items: TopicSearchHit[];
     coverage: TopicSearchCoverage;
     degradedReasons: string[];
+    nextCursor: string | null;
   }
+  | {
+    type: 'moreSuccess';
+    query: string;
+    requestId: number;
+    items: TopicSearchHit[];
+    coverage: TopicSearchCoverage;
+    degradedReasons: string[];
+    nextCursor: string | null;
+  }
+  | { type: 'moreStart'; query: string; requestId: number }
+  | { type: 'moreFailure'; query: string; requestId: number }
+  /** Scope refusal for a page-local narrowing filter: fall back to the original
+   * local list instead of showing an error the user cannot act on. */
+  | { type: 'fallback'; query: string; requestId: number }
   | { type: 'failure'; query: string; requestId: number; disabled: boolean }
   | { type: 'reset' };
 
 function topicSearchActionIsCurrent(
   state: TopicSearchViewState,
-  action: Extract<TopicSearchAction, { type: 'success' | 'failure' }>,
+  action: Extract<TopicSearchAction, { type: 'success' | 'failure' | 'fallback' }>,
 ): boolean {
   return state.status === 'loading'
+    && state.requestId === action.requestId
+    && state.query === action.query;
+}
+
+function topicSearchMoreIsCurrent(
+  state: TopicSearchViewState,
+  action: { query: string; requestId: number },
+): boolean {
+  return state.status === 'ready'
     && state.requestId === action.requestId
     && state.query === action.query;
 }
@@ -1796,7 +1827,36 @@ export function topicSearchReducer(
         items: action.items,
         coverage: action.coverage,
         degradedReasons: action.degradedReasons,
+        nextCursor: action.nextCursor,
+        loadingMore: false,
+        loadMoreFailed: false,
       };
+    case 'moreStart':
+      if (!topicSearchMoreIsCurrent(state, action)) return state;
+      return { ...state, loadingMore: true, loadMoreFailed: false };
+    case 'moreSuccess': {
+      if (!topicSearchMoreIsCurrent(state, action)) return state;
+      // Pages are stable snapshots, but a topic whose revision changed between
+      // requests can appear twice: keep the first occurrence and its snippets.
+      const seen = new Set(state.items.map(item => item.topicKey));
+      const appended = action.items.filter(item => !seen.has(item.topicKey));
+      return {
+        ...state,
+        status: 'ready',
+        items: [...state.items, ...appended],
+        coverage: action.coverage,
+        degradedReasons: action.degradedReasons,
+        nextCursor: action.nextCursor,
+        loadingMore: false,
+        loadMoreFailed: false,
+      };
+    }
+    case 'moreFailure':
+      if (!topicSearchMoreIsCurrent(state, action)) return state;
+      return { ...state, loadingMore: false, loadMoreFailed: true };
+    case 'fallback':
+      if (!topicSearchActionIsCurrent(state, action)) return state;
+      return initialTopicSearchState;
     case 'failure':
       if (!topicSearchActionIsCurrent(state, action)) return state;
       return {
@@ -1822,43 +1882,86 @@ export function effectiveSessionSearchQuery(
   return q.toLowerCase();
 }
 
+export type TopicSearchRequestOptions = {
+  /** Server cursor from the previous page; omitted for the first page. */
+  cursor?: string | null;
+  /** Narrow the query to one chat (server-side `filters.chatIds`). */
+  chatId?: string;
+  fetchImpl?: (input: any, init?: any) => Promise<any>;
+};
+
+function topicSearchPageFromBody(body: any): {
+  items: TopicSearchHit[];
+  coverage: TopicSearchCoverage;
+  degradedReasons: string[];
+  nextCursor: string | null;
+} {
+  const items = Array.isArray(body.items) ? body.items as TopicSearchHit[] : [];
+  const coverage: TopicSearchCoverage = body.coverage?.state === 'partial'
+    ? {
+      state: 'partial',
+      unindexedKnownTopics: Math.max(0, Number(body.coverage.unindexedKnownTopics) || 0),
+    }
+    : { state: 'complete', unindexedKnownTopics: 0 };
+  const degradedReasons = Array.isArray(body.degradedReasons)
+    ? body.degradedReasons.map((reason: unknown) => String(reason))
+    : [];
+  const nextCursor = typeof body.nextCursor === 'string' && body.nextCursor ? body.nextCursor : null;
+  return { items, coverage, degradedReasons, nextCursor };
+}
+
 /** POST /api/topic-search → reducer action. `null` for a blank query, so the
  * caller can short-circuit before touching the network. */
 export async function requestTopicSearch(
   query: string,
   requestId: number,
-  fetchImpl: (input: any, init?: any) => Promise<any> = fetch,
+  options: TopicSearchRequestOptions = {},
 ): Promise<TopicSearchAction | null> {
   const trimmed = query.trim();
   if (!trimmed) return null;
+  const cursor = options.cursor ?? null;
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const chatId = options.chatId?.trim() ?? '';
+  const body: Record<string, unknown> = { query: trimmed, limit: 30 };
+  if (cursor) body.cursor = cursor;
+  if (chatId) body.filters = { chatIds: [chatId] };
   try {
     const response = await fetchImpl('/api/topic-search', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query: trimmed, limit: 30 }),
+      body: JSON.stringify(body),
     });
     // A 401 gate answers with HTML: `json()` throws and lands in the catch,
     // which must fall back to the local list rather than breaking the page.
-    const body = await response.json().catch(() => null);
-    if (response.status === 403 && body?.error === 'disabled') {
-      return { type: 'failure', query: trimmed, requestId, disabled: true };
+    const responseBody = await response.json().catch(() => null);
+    if (response.status === 403 && responseBody?.error === 'disabled') {
+      return cursor
+        ? { type: 'moreFailure', query: trimmed, requestId }
+        : { type: 'failure', query: trimmed, requestId, disabled: true };
     }
-    if (!response.ok || body?.ok !== true) {
-      return { type: 'failure', query: trimmed, requestId, disabled: false };
+    if (response.status === 403 && responseBody?.error === 'forbidden') {
+      // A page-local chat filter can point outside the indexed scope. That is
+      // not an error the user can fix: keep the original local filtering.
+      return cursor
+        ? { type: 'moreFailure', query: trimmed, requestId }
+        : { type: 'fallback', query: trimmed, requestId };
     }
-    const items = Array.isArray(body.items) ? body.items as TopicSearchHit[] : [];
-    const coverage: TopicSearchCoverage = body.coverage?.state === 'partial'
-      ? {
-        state: 'partial',
-        unindexedKnownTopics: Math.max(0, Number(body.coverage.unindexedKnownTopics) || 0),
-      }
-      : { state: 'complete', unindexedKnownTopics: 0 };
-    const degradedReasons = Array.isArray(body.degradedReasons)
-      ? body.degradedReasons.map((reason: unknown) => String(reason))
-      : [];
-    return { type: 'success', query: trimmed, requestId, items, coverage, degradedReasons };
+    if (!response.ok || responseBody?.ok !== true) {
+      return cursor
+        ? { type: 'moreFailure', query: trimmed, requestId }
+        : { type: 'failure', query: trimmed, requestId, disabled: false };
+    }
+    const page = topicSearchPageFromBody(responseBody);
+    return {
+      type: cursor ? 'moreSuccess' : 'success',
+      query: trimmed,
+      requestId,
+      ...page,
+    };
   } catch {
-    return { type: 'failure', query: trimmed, requestId, disabled: false };
+    return cursor
+      ? { type: 'moreFailure', query: trimmed, requestId }
+      : { type: 'failure', query: trimmed, requestId, disabled: false };
   }
 }
 
@@ -1870,6 +1973,7 @@ type TopicGroupsViewProps = {
   /** Content-search state. Absent ⇒ the original local-filter-only view. */
   search?: TopicSearchViewState;
   onSearchRetry?: () => void;
+  onSearchMore?: () => void;
   onToggleSelect: (row: SessionRow) => void;
   onOpen: (row: SessionRow) => void;
   onHistory: (row: SessionRow) => void;
@@ -2109,6 +2213,22 @@ function TopicGroupsViewBase(props: TopicGroupsViewProps): React.JSX.Element {
           {searchHits ? t('sessions.topic.searchEmpty') : t('sessions.topic.empty')}
         </div>
       )}
+      {props.search?.status === 'ready' && props.search.nextCursor ? (
+        <div className="sessions-topic-search-more">
+          <button
+            type="button"
+            data-search-more=""
+            disabled={props.search.loadingMore}
+            onClick={props.onSearchMore}
+          >
+            {props.search.loadingMore
+              ? t('sessions.topic.searching')
+              : props.search.loadMoreFailed
+                ? t('sessions.topic.searchRetry')
+                : t('sessions.topic.loadMore')}
+          </button>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -3220,8 +3340,10 @@ function SessionsPage(): React.JSX.Element {
 
   // Content search runs from the topics view. Blank queries never reach the
   // API (the server answers 400), and every superseded request is ignored by
-  // the reducer's request-id guard.
+  // the reducer's request-id guard. The page chat filter is sent as a
+  // server-side narrowing filter; unindexed chats fall back to local filtering.
   const trimmedTopicQuery = filters.q.trim();
+  const topicSearchChatId = filters.chat;
   useEffect(() => {
     if (!trimmedTopicQuery || viewMode !== 'topics') {
       dispatchTopicSearch({ type: 'reset' });
@@ -3231,11 +3353,30 @@ function SessionsPage(): React.JSX.Element {
     dispatchTopicSearch({ type: 'start', query: trimmedTopicQuery, requestId });
     let cancelled = false;
     void (async () => {
-      const action = await requestTopicSearch(trimmedTopicQuery, requestId);
+      const action = await requestTopicSearch(trimmedTopicQuery, requestId, {
+        ...(topicSearchChatId ? { chatId: topicSearchChatId } : {}),
+      });
       if (!cancelled && action) dispatchTopicSearch(action);
     })();
     return () => { cancelled = true; };
-  }, [trimmedTopicQuery, viewMode, topicSearchRetry]);
+  }, [trimmedTopicQuery, viewMode, topicSearchRetry, topicSearchChatId]);
+
+  // Pagination keeps the same request id: a result for a query that has since
+  // been replaced is dropped by the reducer, but pages of the current query
+  // append to what is already shown.
+  const loadMoreTopicSearch = useCallback(() => {
+    if (topicSearch.status !== 'ready' || !topicSearch.nextCursor) return;
+    const requestId = topicSearch.requestId;
+    const cursor = topicSearch.nextCursor;
+    dispatchTopicSearch({ type: 'moreStart', query: topicSearch.query, requestId });
+    void (async () => {
+      const action = await requestTopicSearch(topicSearch.query, requestId, {
+        cursor,
+        ...(topicSearchChatId ? { chatId: topicSearchChatId } : {}),
+      });
+      if (action) dispatchTopicSearch(action);
+    })();
+  }, [topicSearch, topicSearchChatId]);
 
   // Only a result that belongs to the query currently in the box may replace
   // the local list. A late response for an older query never reaches the view.
@@ -4304,6 +4445,7 @@ function SessionsPage(): React.JSX.Element {
           hidden={false}
           search={topicSearchView}
           onSearchRetry={retryTopicSearch}
+          onSearchMore={loadMoreTopicSearch}
           onToggleSelect={listOnToggleSelect}
           onOpen={listOnOpen}
           onHistory={openHistoryModal}

@@ -90,6 +90,7 @@ describe('topic content search request handling', () => {
       items: [hit({ topicKey: 'thread:oc:om_first' })],
       coverage: { state: 'complete', unindexedKnownTopics: 0 },
       degradedReasons: [],
+      nextCursor: null,
     });
     expect(stale).toBe(state);
     expect(stale.items).toEqual([]);
@@ -106,6 +107,7 @@ describe('topic content search request handling', () => {
       items: [hit({ topicKey: 'thread:oc:om_second' })],
       coverage: { state: 'complete', unindexedKnownTopics: 0 },
       degradedReasons: [],
+      nextCursor: null,
     });
     expect(applied.status).toBe('ready');
     expect(applied.items.map(item => item.topicKey)).toEqual(['thread:oc:om_second']);
@@ -113,7 +115,7 @@ describe('topic content search request handling', () => {
 
   it('short-circuits a blank query before touching the network', async () => {
     const fetchImpl = vi.fn();
-    await expect(requestTopicSearch('   ', 1, fetchImpl)).resolves.toBeNull();
+    await expect(requestTopicSearch('   ', 1, { fetchImpl })).resolves.toBeNull();
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
@@ -124,7 +126,7 @@ describe('topic content search request handling', () => {
       json: async () => ({ ok: false, error: 'disabled' }),
     })) as unknown as typeof fetch;
 
-    const action = await requestTopicSearch('needle', 7, fetchImpl);
+    const action = await requestTopicSearch('needle', 7, { fetchImpl });
     expect(action).toEqual({ type: 'failure', query: 'needle', requestId: 7, disabled: true });
 
     const state = apply(
@@ -142,7 +144,7 @@ describe('topic content search request handling', () => {
       ok: false,
       json: async () => ({ ok: false, error: 'unavailable' }),
     })) as unknown as typeof fetch;
-    expect(await requestTopicSearch('needle', 3, server)).toMatchObject({
+    expect(await requestTopicSearch('needle', 3, { fetchImpl: server })).toMatchObject({
       type: 'failure', disabled: false,
     });
 
@@ -152,11 +154,11 @@ describe('topic content search request handling', () => {
       ok: false,
       json: async () => { throw new SyntaxError('Unexpected token <'); },
     })) as unknown as typeof fetch;
-    const authAction = await requestTopicSearch('needle', 4, unauthorized);
+    const authAction = await requestTopicSearch('needle', 4, { fetchImpl: unauthorized });
     expect(authAction).toMatchObject({ type: 'failure', disabled: false });
 
     const offline = vi.fn(async () => { throw new Error('offline'); }) as unknown as typeof fetch;
-    const networkAction = await requestTopicSearch('needle', 5, offline);
+    const networkAction = await requestTopicSearch('needle', 5, { fetchImpl: offline });
     expect(networkAction).toMatchObject({ type: 'failure', disabled: false });
 
     const state = apply(
@@ -182,7 +184,7 @@ describe('topic content search request handling', () => {
       }),
     })) as unknown as typeof fetch;
 
-    const action = await requestTopicSearch('needle', 6, fetchImpl);
+    const action = await requestTopicSearch('needle', 6, { fetchImpl });
     expect(action).toMatchObject({
       type: 'success',
       query: 'needle',
@@ -201,6 +203,102 @@ describe('topic content search request handling', () => {
     expect(effectiveSessionSearchQuery('needle', state)).toBe('');
     // A blank query always keeps the original local behaviour.
     expect(effectiveSessionSearchQuery('  ', state)).toBe('');
+  });
+
+  it('pages through results with the server cursor and appends without duplicates', async () => {
+    const fetchImpl = vi.fn(async (_input: unknown, init?: { body?: string }) => {
+      const body = JSON.parse(String(init?.body ?? '{}')) as { cursor?: string };
+      const page = body.cursor
+        ? {
+          items: [hit({ topicKey: 'thread:oc:om_2' }), hit({ topicKey: 'thread:oc:om_3' })],
+          nextCursor: null,
+        }
+        : {
+          items: [hit({ topicKey: 'thread:oc:om_1' }), hit({ topicKey: 'thread:oc:om_2' })],
+          nextCursor: 'cursor-2',
+        };
+      return {
+        status: 200,
+        ok: true,
+        json: async () => ({
+          ok: true,
+          effectiveMode: 'keyword',
+          coverage: { state: 'complete', unindexedKnownTopics: 0 },
+          degradedReasons: [],
+          ...page,
+        }),
+      };
+    }) as unknown as typeof fetch;
+
+    let state = apply(initialTopicSearchState, { type: 'start', query: 'needle', requestId: 9 });
+    const first = await requestTopicSearch('needle', 9, { fetchImpl });
+    state = apply(state, first!);
+    expect(state.items.map(item => item.topicKey)).toEqual([
+      'thread:oc:om_1',
+      'thread:oc:om_2',
+    ]);
+    expect(state.nextCursor).toBe('cursor-2');
+    expect(JSON.parse(String((fetchImpl as any).mock.calls[0][1].body)).cursor).toBeUndefined();
+
+    state = apply(state, { type: 'moreStart', query: 'needle', requestId: 9 });
+    expect(state.loadingMore).toBe(true);
+    const second = await requestTopicSearch('needle', 9, { cursor: 'cursor-2', fetchImpl });
+    state = apply(state, second!);
+    // The duplicate om_2 arrives again on page 2 and must not render twice.
+    expect(state.items.map(item => item.topicKey)).toEqual([
+      'thread:oc:om_1',
+      'thread:oc:om_2',
+      'thread:oc:om_3',
+    ]);
+    expect(state.nextCursor).toBeNull();
+    expect(state.loadingMore).toBe(false);
+    expect(JSON.parse(String((fetchImpl as any).mock.calls[1][1].body)).cursor).toBe('cursor-2');
+  });
+
+  it('ignores an appended page after the query has been replaced', () => {
+    let state = readyState([hit({ topicKey: 'thread:oc:om_old' })], { nextCursor: 'cursor-2' });
+    state = apply(state, { type: 'start', query: 'new query', requestId: 2 });
+    const stale = apply(state, {
+      type: 'moreSuccess',
+      query: 'needle',
+      requestId: 1,
+      items: [hit({ topicKey: 'thread:oc:om_stale_page' })],
+      coverage: { state: 'complete', unindexedKnownTopics: 0 },
+      degradedReasons: [],
+      nextCursor: null,
+    });
+    expect(stale).toBe(state);
+  });
+
+  it('keeps the current page when loading more fails and allows a retry', () => {
+    let state = readyState([hit({ topicKey: 'thread:oc:om_1' })], { nextCursor: 'cursor-2' });
+    state = apply(state, { type: 'moreStart', query: 'needle', requestId: 1 });
+    state = apply(state, { type: 'moreFailure', query: 'needle', requestId: 1 });
+    expect(state.loadMoreFailed).toBe(true);
+    expect(state.loadingMore).toBe(false);
+    expect(state.items.map(item => item.topicKey)).toEqual(['thread:oc:om_1']);
+    expect(state.nextCursor).toBe('cursor-2');
+  });
+
+  it('sends the page chat filter and falls back to local filtering when it is outside the indexed scope', async () => {
+    const fetchImpl = vi.fn(async () => ({
+      status: 403,
+      ok: false,
+      json: async () => ({ ok: false, error: 'forbidden' }),
+    })) as unknown as typeof fetch;
+
+    const action = await requestTopicSearch('needle', 11, { chatId: 'oc_other', fetchImpl });
+    expect(JSON.parse(String((fetchImpl as any).mock.calls[0][1].body)).filters)
+      .toEqual({ chatIds: ['oc_other'] });
+    expect(action).toEqual({ type: 'fallback', query: 'needle', requestId: 11 });
+
+    const state = apply(
+      apply(initialTopicSearchState, { type: 'start', query: 'needle', requestId: 11 }),
+      action!,
+    );
+    expect(state.status).toBe('idle');
+    // The scope refusal is not an error banner: the local substring filter is back.
+    expect(effectiveSessionSearchQuery('Needle', state)).toBe('needle');
   });
 });
 
@@ -354,6 +452,24 @@ describe('topic content search results view', () => {
     expect(failed).toContain('sessions-topic-search-retry');
     expect(failed).toContain(t('sessions.topic.searchFailed'));
     expect(failed).toContain(t('sessions.topic.searchRetry'));
+  });
+
+  it('offers a load-more action only while the server reports another page', () => {
+    const withCursor = renderTopics({
+      rows: [],
+      relationRows: [],
+      search: readyState([hit({ topicKey: 'thread:oc:om_1' })], { nextCursor: 'cursor-2' }),
+      onSearchMore: () => {},
+    });
+    expect(withCursor).toContain('data-search-more');
+    expect(withCursor).toContain(t('sessions.topic.loadMore'));
+
+    const lastPage = renderTopics({
+      rows: [],
+      relationRows: [],
+      search: readyState([hit({ topicKey: 'thread:oc:om_1' })]),
+    });
+    expect(lastPage).not.toContain('data-search-more');
   });
 
   it('keeps the original local list when there is no query or no search state', () => {

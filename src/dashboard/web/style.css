@@ -2288,6 +2288,123 @@ button.primary {
   background: var(--surface);
 }
 
+/* ── Topic content search (Dashboard > Sessions > Topics) ─────────────────
+ * The search chrome sits above the topic groups and inside each hit. It only
+ * appears when a non-empty query is active, so the default view is unchanged.
+ */
+.sessions-topic-search-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-height: 44px;
+  padding: 8px 12px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.sessions-topic-search-state.error {
+  border-style: solid;
+  border-color: color-mix(in srgb, var(--warning) 38%, var(--border));
+  color: var(--warning);
+}
+
+.sessions-topic-search-retry,
+.sessions-topic-search-more button {
+  min-height: 28px;
+  padding: 4px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  background: var(--surface-raised);
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.sessions-topic-search-retry:hover,
+.sessions-topic-search-more button:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+}
+
+.sessions-topic-search-more button:disabled {
+  cursor: progress;
+  opacity: 0.7;
+}
+
+.sessions-topic-search-notes {
+  display: grid;
+  gap: 4px;
+  padding: 8px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: var(--surface-muted);
+}
+
+.sessions-topic-search-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.sessions-topic-search-note.degraded {
+  color: var(--warning);
+}
+
+.session-topic-hit {
+  display: grid;
+  gap: 6px;
+  margin: 10px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border-soft));
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--accent) 4%, var(--surface));
+}
+
+.session-topic-hit-match {
+  margin: 0;
+  color: var(--fg);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.session-topic-hit-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.session-topic-hit-link {
+  margin-left: auto;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent-strong);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.session-topic-hit-link:hover {
+  text-decoration: underline;
+}
+
+.sessions-topic-search-more {
+  display: flex;
+  justify-content: center;
+  padding: 4px 0 10px;
+}
+
 .session-board-column {
   --col-signal: var(--border);
   display: flex;
