@@ -58,7 +58,7 @@ The default is daily at 02:00 (`Asia/Shanghai`). An interval is also supported:
 
 Each run only processes topics with new messages; when there is no increment, no model is called. Summaries, keywords, and the success cursor commit together. Failures (model timeout, incomplete pagination, commit conflict) do not advance the cursor and are retried next run. Background work never blocks chatting, session recovery, or replies.
 
-Enabling/disabling the background schedule requires a Dashboard restart; the query endpoint reads the current config on every request.
+Disabling the background schedule takes effect on the next scheduler check (no restart needed; in-flight work completes); re-enabling from a disabled state requires a Dashboard restart. The query endpoint reads the current config on every request.
 
 ## In the page
 
@@ -78,7 +78,7 @@ Disable it with:
 { "topicSearch": { "enabled": false } }
 ```
 
-After a Dashboard restart the background job stops and the page falls back to the original search; existing data is retained. In-flight model tasks still finish, persist, and advance the successful cursor; re-enabling resumes from that cursor (including messages added while disabled) instead of redoing everything. To remove the index, disable the feature and delete `topic-search.sqlite*`; no session or Lark message is affected.
+After disabling, the next scheduler check stops new work and the page falls back to the original search; existing data is retained. In-flight model tasks still finish, persist, and advance the successful cursor; re-enabling (which requires a Dashboard restart) resumes from that cursor (including messages added while disabled) instead of redoing everything. To remove the index, disable the feature and delete `topic-search.sqlite*`; no session or Lark message is affected.
 
 ## Known limits
 
