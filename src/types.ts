@@ -1303,6 +1303,9 @@ export interface Topic {
   title: string;
   /** Authorization association; assigned by the host, never by the model. */
   accessPolicyRef: string;
+  /** Host-assigned read-routing hint: the lark app whose daemon can read
+   * this thread's history. Metadata only — not part of topic identity. */
+  sourceLarkAppId?: string;
   /** Optimistic-concurrency counter for summary mutations. */
   revision: number;
   summaries: TopicSummary[];

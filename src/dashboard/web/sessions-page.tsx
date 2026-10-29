@@ -1708,6 +1708,84 @@ const KANBAN_ICONS: SessionsKanbanIcons = {
   unlock: ICON.unlock,
 };
 
+// ─── Topic content search (spec 20261028-topic-search §6) ───────────────────
+// 内容检索命中「话题知识」而非 session 行文本。功能关闭/未登录 → idle，页面
+// 回退原字符串包含过滤；请求失败保留错误提示 + 重试入口，原列表仍可见。
+
+type TopicContentMatch = { summaryId: string; text: string; sourceMessageIds: string[] };
+type TopicContentItem = { topicKey: string; title: string; url: string; matches: TopicContentMatch[]; updatedAt: string; sourceThroughAt?: string };
+
+type TopicContentSearchState =
+  | { phase: 'idle' }
+  | { phase: 'loading' }
+  | {
+      phase: 'ok';
+      items: TopicContentItem[];
+      rankedKeys: string[];
+      matchesByTopic: Map<string, TopicContentMatch[]>;
+      coverageState: 'complete' | 'partial';
+      degraded: boolean;
+    }
+  | { phase: 'error' };
+
+function useTopicContentSearch(query: string, chatFilter: string, retryNonce: number): TopicContentSearchState {
+  const [state, setState] = useState<TopicContentSearchState>({ phase: 'idle' });
+  const seqRef = useRef(0);
+  useEffect(() => {
+    const q = query.trim();
+    if (!q) {
+      seqRef.current++;
+      setState({ phase: 'idle' });
+      return;
+    }
+    const seq = ++seqRef.current;
+    setState({ phase: 'loading' });
+    const timer = setTimeout(() => {
+      void (async () => {
+        try {
+          const response = await fetch('/api/topic-search', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              query: q,
+              mode: 'auto',
+              limit: 30,
+              ...(chatFilter ? { filters: { chatIds: [chatFilter] } } : {}),
+            }),
+          });
+          if (response.status === 401 || response.status === 403) {
+            // 未登录或功能关闭：静默回退原搜索，不当错误打扰
+            if (seqRef.current === seq) setState({ phase: 'idle' });
+            return;
+          }
+          const body = await response.json() as {
+            ok?: boolean;
+            result?: { items?: TopicContentItem[]; coverage?: { state?: 'complete' | 'partial' }; degradedReasons?: string[] };
+          };
+          if (seqRef.current !== seq) return; // 快速连续查询：丢弃过期响应
+          if (!response.ok || !body.ok || !body.result || !Array.isArray(body.result.items)) {
+            setState({ phase: 'error' });
+            return;
+          }
+          const items = body.result.items;
+          setState({
+            phase: 'ok',
+            items,
+            rankedKeys: items.map(item => item.topicKey),
+            matchesByTopic: new Map(items.map(item => [item.topicKey, item.matches ?? []])),
+            coverageState: body.result.coverage?.state ?? 'complete',
+            degraded: (body.result.degradedReasons ?? []).length > 0,
+          });
+        } catch {
+          if (seqRef.current === seq) setState({ phase: 'error' });
+        }
+      })();
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [query, chatFilter, retryNonce]);
+  return state;
+}
+
 type TopicGroupsViewProps = {
   rows: SessionRow[];
   relationRows?: SessionRow[];
@@ -1720,6 +1798,17 @@ type TopicGroupsViewProps = {
   onRestart: (row: SessionRow, button?: HTMLButtonElement) => void;
   onLock: (row: SessionRow, locked: boolean, button?: HTMLButtonElement) => void;
   onClose: (row: SessionRow, button?: HTMLButtonElement) => void;
+  /** 内容检索状态（null/undefined = 未启用，按原行为渲染）。 */
+  contentSearch?: {
+    loading: boolean;
+    error: boolean;
+    rankedKeys: string[];
+    items: TopicContentItem[];
+    matchesByTopic: Map<string, TopicContentMatch[]>;
+    coverageState: 'complete' | 'partial';
+    degraded: boolean;
+  } | null;
+  onRetryContentSearch?: () => void;
 };
 
 function topicGroupTitle(group: SessionTopicGroup<SessionRow>): string {
@@ -1731,13 +1820,39 @@ function topicGroupTitle(group: SessionTopicGroup<SessionRow>): string {
 
 function TopicGroupsViewBase(props: TopicGroupsViewProps): React.JSX.Element {
   useT();
-  const groups = useMemo(() => groupSessionsByTopic(props.rows), [props.rows]);
+  const content = props.contentSearch ?? null;
+  const groups = useMemo(() => {
+    const grouped = groupSessionsByTopic(props.rows);
+    if (!content?.rankedKeys.length) return grouped;
+    // 内容检索激活：按服务返回的话题顺序呈现（spec §6.2）
+    const rank = new Map(content.rankedKeys.map((key, index) => [key, index]));
+    return [...grouped].sort((a, b) => (rank.get(a.key) ?? Number.MAX_SAFE_INTEGER) - (rank.get(b.key) ?? Number.MAX_SAFE_INTEGER));
+  }, [props.rows, content]);
   const relationGroups = useMemo(
     () => new Map(groupSessionsByTopic(props.relationRows ?? props.rows).map(group => [group.key, group])),
     [props.relationRows, props.rows],
   );
+  const orphanItems = useMemo(() => {
+    if (!content) return [];
+    const groupKeys = new Set(groups.map(group => group.key));
+    // 已知话题目录里命中、但当前没有任何 session 行：仍展示标题/摘要/入口
+    return content.items.filter(item => !groupKeys.has(item.topicKey));
+  }, [content, groups]);
   return (
     <div id="sessions-topics" className="sessions-topic-view" hidden={props.hidden}>
+      {content ? (
+        <div className="sessions-topic-search-status" role="status">
+          {content.loading ? <span className="topic-chip">{t('sessions.topicSearch.loading')}</span> : null}
+          {content.error ? (
+            <>
+              <span className="topic-chip error">{t('sessions.topicSearch.error')}</span>
+              <button type="button" className="link" onClick={props.onRetryContentSearch}>{t('sessions.topicSearch.retry')}</button>
+            </>
+          ) : null}
+          {content.degraded ? <span className="topic-chip">{t('sessions.topicSearch.degraded')}</span> : null}
+          {content.coverageState === 'partial' ? <span className="topic-chip">{t('sessions.topicSearch.partial')}</span> : null}
+        </div>
+      ) : null}
       {groups.length ? groups.map(group => {
         // Member cards respect the current session filters. Header metadata is
         // derived from the complete store so a hidden closed sibling does not
@@ -1747,6 +1862,7 @@ function TopicGroupsViewBase(props: TopicGroupsViewProps): React.JSX.Element {
         const location = sessionLocationText(representative);
         const title = topicGroupTitle(relation);
         const anchor = relation.rootMessageId || relation.chatId;
+        const matches = content?.matchesByTopic.get(group.key) ?? [];
         return (
           <section
             key={group.key}
@@ -1781,6 +1897,13 @@ function TopicGroupsViewBase(props: TopicGroupsViewProps): React.JSX.Element {
                 <span className="session-topic-updated">{t('sessions.last')}: {relTime(relation.latestActivityAt)}</span>
               </div>
             </header>
+            {matches.length ? (
+              <div className="session-topic-matches" aria-label={t('sessions.topicSearch.matches')}>
+                {matches.slice(0, 3).map(match => (
+                  <p key={match.summaryId} className="session-topic-match">{match.text}</p>
+                ))}
+              </div>
+            ) : null}
             <div className="session-topic-members">
               {group.rows.map(row => (
                 <BoardCard
@@ -1802,7 +1925,33 @@ function TopicGroupsViewBase(props: TopicGroupsViewProps): React.JSX.Element {
             </div>
           </section>
         );
-      }) : <div className="sessions-topic-empty">{t('sessions.topic.empty')}</div>}
+      }) : (!content ? <div className="sessions-topic-empty">{t('sessions.topic.empty')}</div>
+        : <div className="sessions-topic-empty">{t('sessions.topicSearch.empty')}</div>)}
+      {content && orphanItems.length ? (
+        <section className="session-topic-group topic-orphans" data-orphan-count={orphanItems.length}>
+          <header>
+            <div className="session-topic-heading">
+              <h2>{t('sessions.topicSearch.orphans')}</h2>
+            </div>
+          </header>
+          <div className="session-topic-members">
+            {orphanItems.map(item => {
+              const matches = content.matchesByTopic.get(item.topicKey) ?? [];
+              return (
+                <div key={item.topicKey} className="topic-orphan-card" data-topic-key={item.topicKey}>
+                  <h3 title={item.title}>{item.title}</h3>
+                  {matches.slice(0, 2).map(match => (
+                    <p key={match.summaryId} className="session-topic-match">{match.text}</p>
+                  ))}
+                  <span className="session-topic-updated">{t('sessions.topicSearch.updated')}: {relTime(Date.parse(item.updatedAt))}</span>
+                  <a href={item.url} target="_blank" rel="noreferrer">{t('sessions.topicSearch.open')}</a>
+                  <code>{item.topicKey}</code>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      ) : null}
     </div>
   );
 }
@@ -2908,6 +3057,13 @@ function SessionsPage(): React.JSX.Element {
     setFilters(prev => ({ ...prev, chat: '' }));
   }, [chatOptions, filters.chat]);
 
+  const [topicSearchRetryNonce, setTopicSearchRetryNonce] = useState(0);
+  const topicContentSearch = useTopicContentSearch(filters.q, filters.chat, topicSearchRetryNonce);
+  const contentRankedKeys = useMemo(
+    () => (topicContentSearch.phase === 'ok' ? new Set(topicContentSearch.rankedKeys) : null),
+    [topicContentSearch],
+  );
+
   const rows = useMemo(() => {
     const q = filters.q.toLowerCase();
     const cli = [...filters.cli];
@@ -2926,14 +3082,17 @@ function SessionsPage(): React.JSX.Element {
       .filter(s => !filters.adopt || (filters.adopt === 'yes') === !!s.adopt)
       .filter(s => !filters.chat || String(s.chatId ?? '') === filters.chat)
       .filter(s => !filters.active || keepClosed || s.status !== 'closed')
-      .filter(s => !q || sessionSearchText(s).includes(q));
+      // 内容检索命中时不叠加旧的字符串包含过滤（spec §6.2）；未启用/失败时回退原过滤
+      .filter(s => !q || (contentRankedKeys
+        ? contentRankedKeys.has(sessionTopicKey(s))
+        : sessionSearchText(s).includes(q)));
     if (!acceptedTopicKeys) {
       return base.sort((a, b) => compareRows(a, b, sortKey, sortDir));
     }
     return base
       .filter(row => acceptedTopicKeys.has(sessionTopicKey(row)))
       .sort((a, b) => compareRows(a, b, sortKey, sortDir));
-  }, [filters, revision, sortDir, sortKey, storeRows, viewMode]);
+  }, [contentRankedKeys, filters, revision, sortDir, sortKey, storeRows, viewMode]);
   const runtimeCounts = useMemo(() => sessionRuntimeCounts(storeRows), [storeRows]);
 
   const rowsById = useMemo(() => new Map(storeRows.map(row => [row.sessionId, row])), [storeRows, revision]);
@@ -3974,6 +4133,24 @@ function SessionsPage(): React.JSX.Element {
           onRestart={listOnRestart}
           onLock={listOnLock}
           onClose={listOnClose}
+          contentSearch={filters.q.trim() ? {
+            loading: topicContentSearch.phase === 'loading',
+            error: topicContentSearch.phase === 'error',
+            ...(topicContentSearch.phase === 'ok' ? {
+              rankedKeys: topicContentSearch.rankedKeys,
+              items: topicContentSearch.items,
+              matchesByTopic: topicContentSearch.matchesByTopic,
+              coverageState: topicContentSearch.coverageState,
+              degraded: topicContentSearch.degraded,
+            } : {
+              rankedKeys: [],
+              items: [],
+              matchesByTopic: new Map<string, TopicContentMatch[]>(),
+              coverageState: 'complete' as const,
+              degraded: false,
+            }),
+          } : null}
+          onRetryContentSearch={() => setTopicSearchRetryNonce(nonce => nonce + 1)}
         />
         ) : null}
 

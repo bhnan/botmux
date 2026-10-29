@@ -366,6 +366,7 @@ import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { getBotSpecialties } from './services/bot-profile-store.js';
 import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
 import { startAutoCleanup, stopAutoCleanup, resolveCleanupHours, resolveCleanupIntervalMs } from './dashboard/auto-cleanup.js';
+import { startTopicSearchHost, stopTopicSearchHost, handleTopicSearchQuery } from './dashboard/topic-search-api.js';
 import {
   compatMachineIdForAuthenticatedRequest,
   handleDesktopCompat,
@@ -4616,9 +4617,43 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // 话题内容检索（spec 20261028-topic-search §6.2）：置于现有认证 gate 后、
+    // 不加入公开读白名单——未登录/只读访客一律 401；功能关闭 403 回退原列表。
+    if (req.method === 'POST' && url.pathname === '/api/topic-search') {
+      if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+      let body: unknown;
+      try {
+        body = await readJsonBody(req, 64 * 1024);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const b = (body ?? {}) as {
+        query?: unknown;
+        filters?: { chatIds?: unknown; sourceFrom?: unknown; sourceTo?: unknown };
+        mode?: unknown;
+        limit?: unknown;
+        cursor?: unknown;
+      };
+      const mode = b.mode === 'keyword' || b.mode === 'hybrid' || b.mode === 'auto' ? b.mode : 'auto';
+      const limit = typeof b.limit === 'number' ? b.limit : 20;
+      const outcome = await handleTopicSearchQuery({
+        query: typeof b.query === 'string' ? b.query : '',
+        ...(b.filters?.chatIds !== undefined || b.filters?.sourceFrom !== undefined || b.filters?.sourceTo !== undefined ? {
+          filters: {
+            ...(Array.isArray(b.filters?.chatIds) ? { chatIds: b.filters.chatIds.filter((id): id is string => typeof id === 'string') } : {}),
+            ...(typeof b.filters?.sourceFrom === 'string' ? { sourceFrom: b.filters.sourceFrom } : {}),
+            ...(typeof b.filters?.sourceTo === 'string' ? { sourceTo: b.filters.sourceTo } : {}),
+          },
+        } : {}),
+        mode,
+        limit,
+        ...(typeof b.cursor === 'string' ? { cursor: b.cursor } : {}),
+      });
+      return jsonRes(res, outcome.status, outcome.body);
+    }
+
     if (req.method === 'GET' && url.pathname === '/api/sessions') {
-      if (coordinationModeIsPrimary()) {
-        const daemons = registry.list();
+      if (coordinationModeIsPrimary()) {        const daemons = registry.list();
         if (daemons.length === 0) {
           return jsonRes(res, 503, { ok: false, error: 'daemon_session_snapshot_unavailable' });
         }
@@ -8112,6 +8147,19 @@ listenWithProbe({
     },
     log: (m) => logger.info(`[auto-cleanup] ${m}`),
   });
+
+  // 话题知识与统一检索（spec 20261028-topic-search）。默认关闭：配置未启用时
+  // startTopicSearchHost 返回 null，零后台任务零模型调用。挂 Dashboard 中心进程
+  // ——一个部署唯一的调度所有者；查询服务复用本进程认证（路由在上方 authed 区）。
+  startTopicSearchHost({
+    registry,
+    getSessions: () => aggregator.getSessions() as unknown as Array<Record<string, unknown>>,
+    dataDir: join(homedir(), '.botmux', 'topic-search'),
+  }).then(state => {
+    if (state) logger.info('[dashboard] topic-search host mounted');
+  }).catch(err => {
+    logger.warn(`[dashboard] topic-search host failed to start (feature stays off): ${(err as Error).message}`);
+  });
 }).catch((err) => {
   clearInterval(listenPendingWarn);
   if ((err as NodeJS.ErrnoException).code === LISTEN_RELEASE_WEDGED_CODE) {
@@ -8271,6 +8319,7 @@ function handlePlatformTeamSync(payload: PlatformTeamSyncMessage): void {
 function shutdown(): void {
   codexNotifierAbort.abort();
   stopAutoCleanup();
+  void stopTopicSearchHost();
   for (const sub of subs.values()) sub.off();
   subs.clear();
   registry.stop();

@@ -52,6 +52,7 @@ export interface EnsureTopicInput {
   title: string;
   accessPolicyRef: string;
   nativeThreadId?: string;
+  sourceLarkAppId?: string;
 }
 
 export interface CommitSummaryUpdateInput {
@@ -347,6 +348,7 @@ export class TopicStore {
       existing.title = input.title || existing.title;
       existing.accessPolicyRef = input.accessPolicyRef || existing.accessPolicyRef;
       if (input.nativeThreadId) existing.nativeThreadId = input.nativeThreadId;
+      if (input.sourceLarkAppId) existing.sourceLarkAppId = input.sourceLarkAppId;
       // chatId/rootMessageId are the identity; a mismatched call is a caller bug.
       if (existing.chatId !== input.chatId || existing.rootMessageId !== input.rootMessageId) {
         throw new TopicMutationValidationError('topic_identity_mismatch');

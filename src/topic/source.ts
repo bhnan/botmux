@@ -27,6 +27,10 @@ export interface SourceMessage {
   text: string;
 }
 
+/** What a reader receives: the routing identity plus the host-assigned read
+ * hint (which lark app's daemon can fetch this thread). */
+export type TopicReadTarget = TopicIdentity & { larkAppId?: string };
+
 export interface TopicHistoryWindow {
   messages: SourceMessage[];
   /** True when the read hit its budget — older messages exist but were not
@@ -133,4 +137,4 @@ export function findVanishedSourceRefs(window: TopicHistoryWindow, citedIds: rea
   return citedIds.filter(id => id && !observable.has(id));
 }
 
-export type TopicHistoryReader = (identity: TopicIdentity) => Promise<TopicHistoryWindow>;
+export type TopicHistoryReader = (target: TopicReadTarget) => Promise<TopicHistoryWindow>;

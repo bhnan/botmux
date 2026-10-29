@@ -2266,6 +2266,70 @@ button.primary {
   color: var(--warning);
 }
 
+/* 话题内容检索（spec 20261028-topic-search）：状态条 / 命中摘要片段 / 孤儿话题卡 */
+.sessions-topic-search-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px 0;
+  color: var(--muted);
+}
+
+.sessions-topic-search-status .link {
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  padding: 0;
+  text-decoration: underline;
+}
+
+.topic-chip.error {
+  border-color: color-mix(in srgb, var(--danger) 44%, var(--border));
+  color: var(--danger);
+}
+
+.session-topic-matches {
+  display: grid;
+  gap: 6px;
+  padding: 0 10px;
+}
+
+.session-topic-match {
+  margin: 0;
+  padding: 6px 10px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--fg);
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+  border-left: 2px solid var(--accent);
+  border-radius: 4px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.topic-orphan-card {
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+  font-size: 12px;
+}
+
+.topic-orphan-card h3 {
+  margin: 0;
+  font-size: 13px;
+}
+
+.topic-orphan-card code {
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
 .session-topic-members {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));

@@ -172,16 +172,18 @@ export class TopicSearchRuntime {
    * topics stay in the catalog by construction (ensure never deletes). */
   private discoverTopics(config: TopicSearchConfig, report: TickReport): void {
     const allowed = new Set(config.allowedChatIds);
-    const identities = new Map<string, { identity: TopicIdentity; title: string; nativeThreadId?: string; chatId: string }>();
+    const identities = new Map<string, { identity: TopicIdentity; title: string; nativeThreadId?: string; chatId: string; larkAppId?: string }>();
     for (const row of this.deps.discoverRows()) {
       const identity = topicIdentityFromSessionRow(row);
       if (!identity || !allowed.has(identity.chatId)) continue;
       if (!identities.has(identity.topicKey)) {
+        const larkAppId = typeof row.larkAppId === 'string' && row.larkAppId.trim() ? row.larkAppId.trim() : undefined;
         identities.set(identity.topicKey, {
           identity,
           title: typeof row.title === 'string' && row.title.trim() ? row.title.trim() : identity.rootMessageId,
           nativeThreadId: topicNativeThreadId(row),
           chatId: identity.chatId,
+          larkAppId,
         });
       }
     }
@@ -195,6 +197,7 @@ export class TopicSearchRuntime {
           title: entry.title,
           accessPolicyRef: `chat:${entry.chatId}`,
           ...(entry.nativeThreadId ? { nativeThreadId: entry.nativeThreadId } : {}),
+          ...(entry.larkAppId ? { sourceLarkAppId: entry.larkAppId } : {}),
         }, this.nowIso);
       } catch (error) {
         this.log.warn(`[topic-search] ensureTopic failed (skipped): ${(error as Error).message}`);
@@ -263,8 +266,8 @@ export class TopicSearchRuntime {
   /** Read + update one topic. Read failures surface as model_failed codes
    * with no store mutation beyond a retry-job enqueue (they must not block
    * other topics, spec §5.4). */
-  private async processOneTopic(config: TopicSearchConfig, topic: { topicKey: string; chatId: string; rootMessageId: string }, firstRunSinceMs: number): Promise<TopicUpdateOutcome> {
-    const identity: TopicIdentity = { topicKey: topic.topicKey, chatId: topic.chatId, rootMessageId: topic.rootMessageId };
+  private async processOneTopic(config: TopicSearchConfig, topic: { topicKey: string; chatId: string; rootMessageId: string; sourceLarkAppId?: string }, firstRunSinceMs: number): Promise<TopicUpdateOutcome> {
+    const identity = { topicKey: topic.topicKey, chatId: topic.chatId, rootMessageId: topic.rootMessageId, ...(topic.sourceLarkAppId ? { larkAppId: topic.sourceLarkAppId } : {}) };
     let window;
     try {
       window = await this.deps.readHistory(identity);
