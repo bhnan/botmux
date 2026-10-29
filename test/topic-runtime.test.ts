@@ -219,6 +219,82 @@ describe('runtime 装配', () => {
     expect(store.getTopic('thread:oc_1:om_3')!.summaries).toHaveLength(1);
   });
 
+  it('退避窗口内的失败项不参与本轮预算，预算留给可处理话题', async () => {
+    const failing = { ...entry, rootMessageId: 'om_fail' };
+    const healthy = { ...entry, rootMessageId: 'om_healthy' };
+    const keyOf = (target: { chatId: string; rootMessageId: string }) =>
+      `thread:${target.chatId}:${target.rootMessageId}`;
+
+    // 失败项：09:00:00 尝试失败，退避到 09:01:00。
+    store.upsertTopicDirectory({
+      topicKey: keyOf(failing),
+      chatId: failing.chatId,
+      rootMessageId: failing.rootMessageId,
+      title: failing.title,
+      accessPolicyRef: failing.accessPolicyRef,
+      now: '2026-10-01T09:00:00.000Z',
+    });
+    store.recordJobFailure({
+      topicKey: keyOf(failing),
+      errorCode: 'source_read_failed',
+      nextAttemptAt: '2026-10-01T09:01:00.000Z',
+      now: '2026-10-01T09:00:00.000Z',
+    });
+    // 健康项：09:00:10 刚被检查过，按 lastTouched 会排在失败项之后。
+    store.upsertTopicDirectory({
+      topicKey: keyOf(healthy),
+      chatId: healthy.chatId,
+      rootMessageId: healthy.rootMessageId,
+      title: healthy.title,
+      accessPolicyRef: healthy.accessPolicyRef,
+      now: '2026-10-01T09:00:10.000Z',
+    });
+    store.recordCheck({ topicKey: keyOf(healthy), checkedAt: '2026-10-01T09:00:10.000Z' });
+
+    const reads: string[] = [];
+    const readMessages = vi.fn(async (target: { rootMessageId: string }) => {
+      reads.push(target.rootMessageId);
+      return {
+        messages: [{
+          messageId: `msg_${target.rootMessageId}`,
+          createTime: '2026-10-01T09:00:15.000Z',
+          text: '新消息',
+        }],
+        truncated: false,
+        verifiedThread: true,
+      };
+    });
+    const rt = runtime({
+      readConfig: () => ({
+        enabled: true,
+        allowedChatIds: ['oc_1'],
+        llmModelRef: 'topic-enricher',
+        maxTopicsPerRun: 1,
+      }),
+      source: { discoverTopics: async () => [failing, healthy], readMessages } as never,
+      resolveEnricher: () => ({
+        generatorKey: 'test-model@v1',
+        enrich: async request => ({
+          mutations: request.newMessages.map(message => ({
+            op: 'add' as const,
+            text: '新消息',
+            keywords: [],
+            sourceMessageIds: [message.messageId],
+          })),
+          generatorKey: 'test-model@v1',
+        }),
+      }),
+      now: () => '2026-10-01T09:00:20.000Z',
+    });
+
+    const report = await rt.runOnce();
+    // 退避中的失败项不占预算：这一轮读的是健康话题，而不是撞一次 skipped。
+    expect(reads).toEqual(['om_healthy']);
+    expect(report.topicsChecked).toBe(1);
+    expect(report.topicsSkipped).toBe(0);
+    expect(store.getTopic(keyOf(healthy))!.lastCheckedAt).toBe('2026-10-01T09:00:20.000Z');
+  });
+
   it('停用期间在途任务正常提交，恢复后从成功游标增量续跑', async () => {
     let enabled = true;
     let clock = '2026-10-01T00:00:00.000Z';
