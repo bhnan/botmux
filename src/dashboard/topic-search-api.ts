@@ -79,8 +79,8 @@ async function readTopicWindowViaDaemon(
 
 interface HostState {
   runtime: TopicSearchRuntime;
-  service: TopicSearchService;
   config: TopicSearchConfig;
+  hostDeps: TopicSearchHostDeps;
 }
 
 let host: HostState | null = null;
@@ -106,17 +106,8 @@ export async function startTopicSearchHost(deps: TopicSearchHostDeps): Promise<H
         warn: message => logger.warn(`[topic-search] ${message}`),
       },
     });
-    const serviceOptions: ConstructorParameters<typeof TopicSearchService>[0] = {};
-    if (config.embedding.enabled) {
-      const embeddingModel = config.embedding.model;
-      serviceOptions.embedQuery = async text => embedSummaryText(embeddingModel, text, {
-        ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
-        ...(deps.env ? { env: deps.env } : {}),
-      });
-    }
-    const service = new TopicSearchService(serviceOptions);
     runtime.start();
-    host = { runtime, service, config };
+    host = { runtime, config, hostDeps: deps };
     logger.info('[topic-search] background runtime started');
     return host;
   })();
@@ -152,9 +143,25 @@ export async function handleTopicSearchQuery(input: TopicSearchInput): Promise<T
   if (!state) return { status: 403, body: { ok: false, error: 'topic_search_disabled' } };
   const config = resolveLiveConfig(readGlobalConfig().topicSearch);
   if (!config) return { status: 403, body: { ok: false, error: 'topic_search_disabled' } };
-  const candidates = state.runtime.topicStore.listTopics();
+  // Live authorization on the query path too: a chat removed from
+  // allowedChatIds stops being searchable immediately (spec §5.4 / A-10).
+  const allowed = new Set(config.allowedChatIds);
+  const candidates = state.runtime.topicStore.listTopics().filter(topic => allowed.has(topic.chatId));
+  // Embedding is resolved from the LIVE config per query — the query path
+  // must never keep sending embedding requests after the operator turned
+  // them off, nor stay keyword-only after they were turned on (复核 P2-7).
+  const serviceOptions: ConstructorParameters<typeof TopicSearchService>[0] = {};
+  if (config.embedding.enabled) {
+    const embeddingModel = config.embedding.model;
+    const embedFetch = state.hostDeps;
+    serviceOptions.embedQuery = async text => embedSummaryText(embeddingModel, text, {
+      ...(embedFetch.fetchImpl ? { fetchImpl: embedFetch.fetchImpl } : {}),
+      ...(embedFetch.env ? { env: embedFetch.env } : {}),
+    });
+  }
+  const service = new TopicSearchService(serviceOptions);
   try {
-    const result = await state.service.search(input, candidates);
+    const result = await service.search({ ...input, indexVersion: state.runtime.topicStore.catalogVersion() }, candidates);
     return { status: 200, body: { ok: true, result } };
   } catch (error) {
     const code = (error as { code?: string }).code ?? 'invalid_request';

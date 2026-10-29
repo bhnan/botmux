@@ -35,6 +35,10 @@ export const EVALUATE_INTERVAL_MS = 30_000;
  * after this and the next tick takes over (spec §5.4). */
 export const RUN_LEASE_TTL_MS = 30 * 60_000;
 export const EMBEDDING_JOBS_PER_TICK = 20;
+/** After a summary-retry job exhausts its backoff (dead), re-probe the topic
+ * at most this often from the fair scan — the backoff ceiling must hold even
+ * past job death (spec §5.4 指数退避且有上限). */
+export const DEAD_RESCAN_COOLDOWN_MS = 24 * 60 * 60_000;
 
 export interface TopicSearchRuntimeDeps {
   dataDir: string;
@@ -58,6 +62,10 @@ export interface TickReport {
   topicsProcessed: number;
   committed: number;
   noIncrement: number;
+  /** Topics whose cursor fell outside the readable window (mass deletion or
+   * window regression) — new messages are being SKIPPED; surfaced separately
+   * from a healthy no-increment so monitoring can tell them apart (复核 P2-6). */
+  skippedBeyondWindow: number;
   invalidated: number;
   failed: number;
   retried: number;
@@ -69,7 +77,7 @@ export interface TickReport {
 function emptyReport(ran: boolean, reason?: TickReport['reason']): TickReport {
   return {
     ran, ...(reason ? { reason } : {}),
-    discovered: 0, topicsProcessed: 0, committed: 0, noIncrement: 0,
+    discovered: 0, topicsProcessed: 0, committed: 0, noIncrement: 0, skippedBeyondWindow: 0,
     invalidated: 0, failed: 0, retried: 0, embeddingsProcessed: 0, embeddingsFailed: 0,
   };
 }
@@ -106,11 +114,14 @@ export class TopicSearchRuntime {
     if (this.stopped) return;
     const timers = this.deps.timers ?? { setTimeout, clearTimeout };
     this.timer = timers.setTimeout.call(undefined, () => {
-      void this.evaluateAndTick().finally(() => this.scheduleNextEvaluation());
+      void this.evaluateAndRun().finally(() => this.scheduleNextEvaluation());
     }, EVALUATE_INTERVAL_MS);
   }
 
-  private async evaluateAndTick(): Promise<TickReport> {
+  /** Slot evaluation + (when due) one tick. Public for tests and manual
+   * triggers; the evaluation loop and direct tick() calls share the same
+   * single-flight lease semantics. */
+  async evaluateAndRun(): Promise<TickReport> {
     const config = this.deps.getConfig();
     if (!config) return emptyReport(false, 'disabled');
     const lastRun = this.store.getScheduleState<{ slotId: string; atMs: number }>(LAST_RUN_KEY);
@@ -121,7 +132,15 @@ export class TopicSearchRuntime {
     });
     if (!decision.due) return emptyReport(false, 'not_due');
     const report = await this.tick({ slotId: decision.slotId, mergedMissedSlots: decision.mergedMissedSlots });
-    this.store.setScheduleState(LAST_RUN_KEY, { slotId: decision.slotId, atMs: this.now }, this.nowIso);
+    // Only the lease WINNER records the slot as run. A loser (lease_held)
+    // must leave LAST_RUN untouched: the holder may crash mid-slot, and the
+    // slot's work must stay pending for the next evaluation instead of being
+    // silently swallowed (复核 P2-4).
+    if (report.ran) {
+      this.store.setScheduleState(LAST_RUN_KEY, { slotId: decision.slotId, atMs: this.now }, this.nowIso);
+    } else if (report.reason === 'lease_held') {
+      this.log.info(`[topic-search] slot ${decision.slotId} skipped: deployment lease held elsewhere`);
+    }
     return report;
   }
 
@@ -212,9 +231,16 @@ export class TopicSearchRuntime {
   }
 
   /** Round-robin over the catalog so history topics are not starved by
-   * activity-based ordering (spec §5.2 step 3). */
-  private orderedTopicKeys(): string[] {
-    const keys = this.store.listTopics().map(t => t.topicKey).sort();
+   * activity-based ordering (spec §5.2 step 3). Only topics still inside the
+   * LIVE authorized chat scope are scanned — a chat removed from
+   * allowedChatIds stops being read/sent/committed immediately (spec §5.4
+   * 权限撤销后立即禁止读取; catalog rows are retained, not deleted). */
+  private orderedTopicKeys(config: TopicSearchConfig): string[] {
+    const allowed = new Set(config.allowedChatIds);
+    const keys = this.store.listTopics()
+      .filter(t => allowed.has(t.chatId))
+      .map(t => t.topicKey)
+      .sort();
     const cursor = this.currentScanCursor();
     if (!cursor) return keys;
     const index = keys.indexOf(cursor);
@@ -225,7 +251,7 @@ export class TopicSearchRuntime {
   /** Returns the LAST topicKey processed this run (undefined = none), which
    * becomes the fair-scan cursor for the next run. */
   private async scanTopics(config: TopicSearchConfig, report: TickReport): Promise<string | undefined> {
-    const ordered = this.orderedTopicKeys();
+    const ordered = this.orderedTopicKeys(config);
     const firstRunSinceMs = this.now - config.initialLookbackDays * 24 * 60 * 60_000;
     let lastProcessed: string | undefined;
     for (const topicKey of ordered) {
@@ -243,10 +269,16 @@ export class TopicSearchRuntime {
 
   /** A pending summary-retry job with a future next_attempt_at parks the
    * topic out of the fair scan: the scan must not bypass the failure
-   * backoff (spec §5.4 指数退避且有上限). */
+   * backoff (spec §5.4 指数退避且有上限). A DEAD job also parks the topic
+   * until a slow re-probe cooldown passes — otherwise an exhausted topic
+   * (e.g. a misconfigured endpoint) gets hammered on EVERY tick after
+   * backoff exhaustion. */
   private summaryRetryBlocked(topicKey: string): boolean {
     const job = this.store.getJob(this.summaryRetryJobKey(topicKey));
     if (!job) return false;
+    if (job.state === 'dead') {
+      return Date.parse(job.updatedAt) + DEAD_RESCAN_COOLDOWN_MS > this.now;
+    }
     if (job.state !== 'pending' && job.state !== 'failed' && job.state !== 'running') return false;
     return job.nextAttemptAt !== null && Date.parse(job.nextAttemptAt) > this.now;
   }
@@ -254,7 +286,14 @@ export class TopicSearchRuntime {
   private tallyOutcome(outcome: TopicUpdateOutcome, report: TickReport): void {
     switch (outcome.kind) {
       case 'committed': report.committed++; break;
-      case 'no_increment': report.noIncrement++; break;
+      case 'no_increment':
+        if (outcome.skippedReason === 'cursor_beyond_window') {
+          report.skippedBeyondWindow++;
+          this.log.warn(`[topic-search] cursor beyond window: topic is skipping new messages until the read window advances past its last processed boundary`);
+        } else {
+          report.noIncrement++;
+        }
+        break;
       case 'invalidated': report.invalidated++; break;
       case 'model_failed':
       case 'commit_conflict':
@@ -286,7 +325,11 @@ export class TopicSearchRuntime {
         ...(hasStoredCursor ? {} : { firstRunSinceMs }),
       },
     );
-    if (outcome.kind === 'committed' || outcome.kind === 'no_increment' || outcome.kind === 'invalidated') {
+    // A beyond-window skip could not even locate the cursor — do NOT refresh
+    // lastCheckedAt for it: a healthy-looking check time must not mask a
+    // topic that is silently skipping new messages (复核 P2-6).
+    if (outcome.kind === 'committed' || outcome.kind === 'invalidated'
+      || (outcome.kind === 'no_increment' && !outcome.skippedReason)) {
       try { this.store.recordHistoryCheck(topic.topicKey, this.nowIso); } catch { /* topic vanished concurrently */ }
     }
     if (outcome.kind === 'model_failed' || outcome.kind === 'commit_conflict') {
@@ -309,16 +352,21 @@ export class TopicSearchRuntime {
 
   private async enqueueSummaryRetry(topicKey: string, code: string): Promise<void> {
     try {
-      const { enqueued } = this.store.enqueueJob({
-        jobKey: this.summaryRetryJobKey(topicKey),
-        kind: 'summary',
-        topicKey,
-        now: this.nowIso,
-      });
-      // A fresh job would be claimable immediately; push it one backoff step
-      // out so even the first retry waits (spec §5.4 指数退避). An existing
-      // job keeps its own backoff state.
-      if (enqueued) this.store.finishJob(this.summaryRetryJobKey(topicKey), { ok: false, errorCode: code, now: this.nowIso });
+      const jobKey = this.summaryRetryJobKey(topicKey);
+      const { enqueued, job } = this.store.enqueueJob({ jobKey, kind: 'summary', topicKey, now: this.nowIso });
+      if (enqueued) {
+        // A fresh job would be claimable immediately; push it one backoff step
+        // out so even the first retry waits (spec §5.4 指数退避).
+        this.store.finishJob(jobKey, { ok: false, errorCode: code, now: this.nowIso });
+        return;
+      }
+      if (job.state === 'dead') {
+        // Re-arm the dead-job re-probe cooldown: finishJob keeps a dead job
+        // dead (attempts exhausted) but refreshes updated_at, which the scan
+        // blocker uses as the cooldown anchor.
+        this.store.finishJob(jobKey, { ok: false, errorCode: code, now: this.nowIso });
+      }
+      // An existing pending/failed job keeps its own backoff state.
     } catch { /* store failures must not mask the original outcome */ }
   }
 
@@ -335,8 +383,9 @@ export class TopicSearchRuntime {
     const jobs = this.store.claimDueJobs({
       now: this.nowIso, owner: this.store.owner, leaseTtlMs: RUN_LEASE_TTL_MS, limit: config.maxTopicsPerRun, kinds: ['summary'],
     });
-    for (const job of jobs) {
-      if (!this.deps.getConfig()) { this.finishClaimed(job, false, 'disabled'); return; }
+    for (let i = 0; i < jobs.length; i++) {
+      const job = jobs[i];
+      if (!this.deps.getConfig()) { this.releaseClaimedOnDisable(jobs.slice(i)); return; }
       const topic = this.store.getTopic(job.topicKey);
       if (!topic) { this.finishClaimed(job, true); continue; }
       const outcome = await this.processOneTopic(config, topic, this.now - config.initialLookbackDays * 24 * 60 * 60_000);
@@ -363,8 +412,9 @@ export class TopicSearchRuntime {
     const jobs = this.store.claimDueJobs({
       now: this.nowIso, owner: this.store.owner, leaseTtlMs: RUN_LEASE_TTL_MS, limit: EMBEDDING_JOBS_PER_TICK, kinds: ['embedding'],
     });
-    for (const job of jobs) {
-      if (!this.deps.getConfig()) { this.finishClaimed(job, false, 'disabled'); return; }
+    for (let i = 0; i < jobs.length; i++) {
+      const job = jobs[i];
+      if (!this.deps.getConfig()) { this.releaseClaimedOnDisable(jobs.slice(i)); return; }
       const payload = job.payload as { summaryId?: string; modelKey?: string; contentHash?: string };
       const topic = this.store.getTopic(job.topicKey);
       const summary = topic?.summaries.find(s => s.id === payload.summaryId);
@@ -392,6 +442,16 @@ export class TopicSearchRuntime {
         report.embeddingsFailed++;
       }
     }
+  }
+
+  /** Feature disabled mid-run: the abort is not the jobs' fault. Release
+   * every still-claimed job untouched — no attempt burned, no extra backoff,
+   * no 'running' residue waiting for lease expiry (复核 P2-5). */
+  private releaseClaimedOnDisable(claimed: readonly TopicJobRecord[]): void {
+    for (const job of claimed) {
+      try { this.store.releaseJobToPending(job.jobKey, this.nowIso); } catch { /* best effort */ }
+    }
+    this.log.warn(`[topic-search] disabled mid-run; ${claimed.length} claimed job(s) released untouched`);
   }
 
   // ─── Lifecycle ────────────────────────────────────────────────────────────

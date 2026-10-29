@@ -106,51 +106,38 @@ export async function updateTopicFromWindow(
   });
   if (!modelResult.ok) return { kind: 'model_failed', code: modelResult.code };
 
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const current = deps.store.getTopic(args.topicKey);
-    if (!current) return { kind: 'model_failed', code: 'topic_missing' };
-    // The mutations were validated against the state as of the model call.
-    // If a concurrent mutation (e.g. deletion invalidation) removed an update
-    // target since, the batch no longer applies: refresh the model context
-    // ONCE instead of throwing a validation error out of the commit.
-    const currentIds = new Set(current.summaries.map(s => s.id));
-    const stillValid = modelResult.mutations.every(m => m.op !== 'update' || currentIds.has(m.id));
-    if (!stillValid) {
-      if (attempt === 1) return { kind: 'commit_conflict' };
-      modelResult = await deps.callModel({
-        topicTitle: current.title,
-        oldSummaries: relevantOldSummaries(current),
-        newMessages: toModelMessages(sliced.batch),
-      });
-      if (!modelResult.ok) return { kind: 'model_failed', code: modelResult.code };
-      continue;
-    }
-    try {
-      const committed = deps.store.commitSummaryUpdate({
-        topicKey: args.topicKey,
-        expectedRevision: current.revision,
-        mutations: modelResult.mutations,
-        generatorKey: modelResult.generatorKey,
-        now: deps.now(),
-        summarizedThroughCursor: sliced.batchEndCursor,
-        sourceThroughAt: sliced.batch[sliced.batch.length - 1].createTimeMs !== undefined
-          ? new Date(sliced.batch[sliced.batch.length - 1].createTimeMs!).toISOString()
-          : current.sourceThroughAt,
-        ...(sliced.batchCoverageStartAt && !current.coverageStartAt ? { coverageStartAt: sliced.batchCoverageStartAt } : {}),
-        ...(options.embeddingModelKey ? { embeddingModelKey: options.embeddingModelKey } : {}),
-      });
-      return {
-        kind: 'committed',
-        revision: committed.revision,
-        added: modelResult.mutations.filter(m => m.op === 'add').length,
-        updated: modelResult.mutations.filter(m => m.op === 'update').length,
-        noop: modelResult.mutations.every(m => m.op === 'noop'),
-      };
-    } catch (error) {
-      if (!(error instanceof TopicRevisionConflictError)) throw error;
-      if (attempt === 1) return { kind: 'commit_conflict' };
-      // Lost a revision race with unchanged ids: re-read and retry the commit.
-    }
+  const current = deps.store.getTopic(args.topicKey);
+  if (!current) return { kind: 'model_failed', code: 'topic_missing' };
+  try {
+    const committed = deps.store.commitSummaryUpdate({
+      topicKey: args.topicKey,
+      expectedRevision: current.revision,
+      mutations: modelResult.mutations,
+      generatorKey: modelResult.generatorKey,
+      now: deps.now(),
+      summarizedThroughCursor: sliced.batchEndCursor,
+      sourceThroughAt: sliced.batch[sliced.batch.length - 1].createTimeMs !== undefined
+        ? new Date(sliced.batch[sliced.batch.length - 1].createTimeMs!).toISOString()
+        : current.sourceThroughAt,
+      ...(sliced.batchCoverageStartAt && !current.coverageStartAt ? { coverageStartAt: sliced.batchCoverageStartAt } : {}),
+      ...(options.embeddingModelKey ? { embeddingModelKey: options.embeddingModelKey } : {}),
+    });
+    return {
+      kind: 'committed',
+      revision: committed.revision,
+      added: modelResult.mutations.filter(m => m.op === 'add').length,
+      updated: modelResult.mutations.filter(m => m.op === 'update').length,
+      noop: modelResult.mutations.every(m => m.op === 'noop'),
+    };
+  } catch (error) {
+    if (!(error instanceof TopicRevisionConflictError)) throw error;
+    // A concurrent writer (another instance after lease expiry, or deletion
+    // invalidation) advanced the topic. NEVER replay the same mutations: they
+    // were generated for a state that no longer exists — replaying an add-only
+    // batch duplicates rows, and committing our stale batchEndCursor can move
+    // the cursor BACKWARDS past work the winner already did (spec §5.5 重试
+    // 不能重复添加已提交条目). Give up this round; the retry path re-slices
+    // from the winner's cursor with a fresh model call.
+    return { kind: 'commit_conflict' };
   }
-  return { kind: 'commit_conflict' };
 }

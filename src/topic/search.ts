@@ -37,6 +37,10 @@ export interface TopicSearchInput {
   mode: TopicSearchMode;
   limit: number;
   cursor?: string | null;
+  /** Index version the cursor was minted against (catalog fingerprint from
+   * the store). A page request whose version no longer matches is rejected
+   * with cursor_invalid — the ranking shifted under the pager (spec §6.2). */
+  indexVersion?: string;
 }
 
 export interface TopicSearchMatch {
@@ -84,6 +88,7 @@ function cursorSignature(input: TopicSearchInput): string {
     filters: input.filters ?? {},
     mode: input.mode,
     limit: input.limit,
+    indexVersion: input.indexVersion ?? '',
   })).digest('hex').slice(0, 16);
 }
 

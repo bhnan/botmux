@@ -104,53 +104,52 @@ describe('updateTopicFromWindow', () => {
     expect(stored.summarizedThroughCursor).toBeUndefined();
   });
 
-  it('CAS 冲突（并发新增摘要）：引用仍有效则按新 revision 重试提交', async () => {
+  it('CAS 冲突（并发新增摘要）：放弃本轮，绝不重放同批 mutations（防重复/游标回退，spec §5.5）', async () => {
     const topic = seedTopic();
-    let modelCalls = 0;
-    const outcome = await updateTopicFromWindow(deps(async input => {
-      modelCalls++;
-      if (modelCalls === 1) {
-        // 模型返回前并发提交：revision 被别人推进
-        store.commitSummaryUpdate({
-          topicKey: topic.topicKey, expectedRevision: store.getTopic(topic.topicKey)!.revision,
-          mutations: [{ op: 'add', text: '并发摘要', keywords: [], sourceMessageIds: ['om_0'] }],
-          generatorKey: 'other', now: T0,
-        });
-      }
-      return mutationFromModel([{ op: 'add', text: '我的摘要', keywords: ['k'], sourceMessageIds: ['om_1'] }]);
-    }), { topicKey: topic.topicKey, window: windowOf([m('om_1')]) }, { firstRunSinceMs: BASE - 1 });
-    expect(outcome).toMatchObject({ kind: 'committed' });
-    expect(modelCalls).toBe(1); // 引用未失效：不重调模型，仅重试提交
+    // 冲突注入点：包装 commitSummaryUpdate，在 updater 读取 revision 之后、
+    // 真正提交之前完成一次并发提交（另一实例抢先落库）
+    const racingStore = Object.create(store) as TopicStore;
+    racingStore.commitSummaryUpdate = input => {
+      // 先完成并发提交（revision 被抢先推进），再执行被包装的原提交（旧 revision → 冲突）
+      store.commitSummaryUpdate({
+        topicKey: topic.topicKey,
+        expectedRevision: store.getTopic(topic.topicKey)!.revision,
+        mutations: [{ op: 'add', text: '并发摘要', keywords: [], sourceMessageIds: ['om_0'] }],
+        generatorKey: 'other', now: T0,
+      });
+      return store.commitSummaryUpdate(input);
+    };
+    const outcome = await updateTopicFromWindow(
+      { store: racingStore, callModel: async () => mutationFromModel([{ op: 'add', text: '我的摘要', keywords: ['k'], sourceMessageIds: ['om_1'] }]), now: () => T0 },
+      { topicKey: topic.topicKey, window: windowOf([m('om_1')]) },
+      { firstRunSinceMs: BASE - 1 },
+    );
+    expect(outcome).toMatchObject({ kind: 'commit_conflict' });
     const stored = store.getTopic(topic.topicKey)!;
-    expect(stored.summaries.map(s => s.text).sort()).toEqual(['并发摘要', '我的摘要']);
-    expect(stored.summarizedThroughCursor).toBe('msg:om_1');
+    expect(stored.summaries.map(s => s.text)).toEqual(['并发摘要']); // 无重复条目
+    expect(stored.summarizedThroughCursor).toBeUndefined(); // 本轮游标不动
   });
 
-  it('CAS 冲突（并发失效了 update 目标）：携新上下文重调模型一次后提交', async () => {
+  it('CAS 冲突（并发把游标推得更远）：游标绝不回退到本批终点之后', async () => {
     const topic = seedTopic();
-    const committed = store.commitSummaryUpdate({
-      topicKey: topic.topicKey, expectedRevision: store.getTopic(topic.topicKey)!.revision,
-      mutations: [{ op: 'add', text: '旧摘要', keywords: [], sourceMessageIds: ['om_1'] }],
-      generatorKey: 'g', now: T0,
-    });
-    const targetId = committed.summaries[0].id;
-    let modelCalls = 0;
-    const outcome = await updateTopicFromWindow(deps(async input => {
-      modelCalls++;
-      if (modelCalls === 1) {
-        // 模型返回前并发删除目标摘要（如权限失效路径）
-        store.invalidateSummaries(topic.topicKey, [targetId], T0);
-        return mutationFromModel([{ op: 'update', id: targetId, text: '更新', keywords: [], sourceMessageIds: ['om_2'] }]);
-      }
-      // 第二次调用应拿到失效后的（空）旧摘要上下文
-      expect(input.oldSummaries).toHaveLength(0);
-      return mutationFromModel([{ op: 'add', text: '重建摘要', keywords: [], sourceMessageIds: ['om_2'] }]);
-    }), { topicKey: topic.topicKey, window: windowOf([m('om_1'), m('om_2')]) }, { firstRunSinceMs: BASE - 1 });
-    expect(outcome).toMatchObject({ kind: 'committed' });
-    expect(modelCalls).toBe(2);
-    const stored = store.getTopic(topic.topicKey)!;
-    expect(stored.summaries.map(s => s.text)).toEqual(['重建摘要']);
-    expect(stored.summarizedThroughCursor).toBe('msg:om_2');
+    const racingStore = Object.create(store) as TopicStore;
+    racingStore.commitSummaryUpdate = input => {
+      // 抢先提交并推进游标到 om_8（本批只有 om_1）
+      store.commitSummaryUpdate({
+        topicKey: topic.topicKey,
+        expectedRevision: store.getTopic(topic.topicKey)!.revision,
+        mutations: [{ op: 'add', text: '胜者摘要', keywords: [], sourceMessageIds: ['om_1'] }],
+        generatorKey: 'other', now: T0, summarizedThroughCursor: 'msg:om_8',
+      });
+      return store.commitSummaryUpdate(input); // 旧 revision → 冲突
+    };
+    const outcome = await updateTopicFromWindow(
+      { store: racingStore, callModel: async () => mutationFromModel([{ op: 'add', text: '败者摘要', keywords: [], sourceMessageIds: ['om_1'] }]), now: () => T0 },
+      { topicKey: topic.topicKey, window: windowOf([m('om_1')]) },
+      { firstRunSinceMs: BASE - 1 },
+    );
+    expect(outcome).toMatchObject({ kind: 'commit_conflict' });
+    expect(store.getTopic(topic.topicKey)!.summarizedThroughCursor).toBe('msg:om_8'); // 胜者游标不被回退
   });
 
   it('引用消息从完整窗口消失：失效关联摘要且本轮不总结新消息（游标不动）', async () => {

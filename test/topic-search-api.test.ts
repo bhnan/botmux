@@ -126,7 +126,8 @@ describe('handleTopicSearchQuery', () => {
   });
 
   it('filters.chatIds 只收窄：目录外群不返回', async () => {
-    writeConfig(validTopicSearch);
+    // 两个群都在授权清单里（查询过滤在授权集之上只收窄，不提权）
+    writeConfig({ ...validTopicSearch, allowedChatIds: ['oc_chat', 'oc_chat2'] });
     const state = await startTopicSearchHost(hostDeps());
     for (const chat of ['oc_chat', 'oc_chat2']) {
       const topic = state!.runtime.topicStore.ensureTopic({

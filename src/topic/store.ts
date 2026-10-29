@@ -373,6 +373,16 @@ export class TopicStore {
       .map(t => this.hydrateTopic(t));
   }
 
+  /** Cheap catalog fingerprint for pagination cursors: any committed change
+   * to topics/summaries moves updatedAt (whole-row rewrite), so a cursor
+   * minted before a change is rejected instead of silently paging over a
+   * shifted ranking (spec §6.2: cursor 绑定查询/索引版本). COUNT pairs with
+   * it so a same-ms rewrite across different row sets still differs. */
+  catalogVersion(): string {
+    const row = this.db.prepare('SELECT COUNT(*) AS count, MAX(updated_at) AS max_updated FROM topics').get() as { count: number; max_updated: string | null };
+    return `${row.count}:${row.max_updated ?? ''}`;
+  }
+
   private selectTopicRow(topicKey: string): TopicRowDb | undefined {
     return this.db.prepare('SELECT topic_key, row FROM topics WHERE topic_key=?').get(topicKey) as TopicRowDb | undefined;
   }
@@ -693,6 +703,18 @@ export class TopicStore {
       expired = Number(result.changes);
     });
     return expired;
+  }
+
+  /** Release a claimed job back to the claimable pool WITHOUT burning an
+   * attempt or touching its backoff — for aborts that are not the job's
+   * fault (e.g. the feature was disabled mid-tick). Undoes the claim's
+   * attempt increment so a disabled abort cannot accelerate the job toward
+   * dead, and clears the lease so it is not stuck 'running' until expiry. */
+  releaseJobToPending(jobKey: string, now: string): void {
+    this.withImmediateWrite(() => {
+      this.db.prepare(`UPDATE topic_jobs SET state='pending', lease_owner=NULL, lease_expires_at=NULL,
+        attempt_count=MAX(attempt_count-1, 0), updated_at=? WHERE job_key=? AND state='running'`).run(now, jobKey);
+    });
   }
 
   // ─── Schedule state (deployment lease, fair-scan cursor) ─────────────────
