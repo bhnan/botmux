@@ -143,6 +143,46 @@ describe('runtime 装配', () => {
     expect(store.listTopics()).toHaveLength(0);
   });
 
+  it('群移出更新范围后，历史摘要仍继续回填 embedding', async () => {
+    // 话题在 oc_1，但当前更新范围只剩 oc_2。
+    store.upsertTopicDirectory({
+      topicKey: 'thread:oc_1:om_archived',
+      chatId: 'oc_1',
+      rootMessageId: 'om_archived',
+      title: '历史话题',
+      accessPolicyRef: 'deployment:topic-search',
+      now: '2026-10-01T00:00:00.000Z',
+      coverageStartAt: '2026-10-01T00:00:00.000Z',
+    });
+    store.commitSummaryMutation({
+      topicKey: 'thread:oc_1:om_archived',
+      expectedRevision: 0,
+      mutations: [{ op: 'add', text: '历史摘要', keywords: [], sourceMessageIds: ['om_src'] }],
+      nextCursor: 'cursor-archived',
+      sourceThroughAt: '2026-10-01T00:00:00.000Z',
+      generatorKey: 'test-model@v1',
+      now: '2026-10-01T00:00:00.000Z',
+    });
+    const embed = vi.fn(async () => [1, 0, 0]);
+    const rt = createTopicRuntime({
+      readConfig: () => ({
+        enabled: true,
+        allowedChatIds: ['oc_2'],
+        llmModelRef: 'topic-enricher',
+        embedding: { enabled: true, modelRef: 'embed' },
+      }),
+      source: source([], []),
+      resolveEnricher: () => enricher,
+      resolveEmbedder: () => ({ modelKey: 'host/embed/2', embed }),
+      store,
+      now: () => '2026-10-01T00:00:00.000Z',
+    });
+
+    await rt.runOnce();
+    expect(embed).toHaveBeenCalledTimes(1);
+    expect(store.pendingEmbeddingTasks(10)).toHaveLength(0);
+  });
+
   it('停用不截断已接纳批次：并发 2、批次 3，队列中的第 3 个也正常提交', async () => {
     const entries = [
       { ...entry, rootMessageId: 'om_1' },
