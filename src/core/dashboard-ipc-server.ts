@@ -4988,6 +4988,36 @@ ipcRoute('GET', '/api/sessions/:sessionId/history', async (req, res, params) => 
   }
 });
 
+// 话题检索（spec 20261028-topic-search）：供 Dashboard 中心进程的后台 runtime
+// 读取一个 thread 话题的消息窗口。只读路由，走默认 trusted-host IPC 门禁（不在
+// 窄孔白名单内）；消息体不落盘，只返回已解析的文本形态。窗口截断标记让调用方
+// 知道更早的消息未被读取（删除核对只对完整窗口生效）。
+ipcRoute('GET', '/api/topic-messages', requireBoundBot(async (req, res) => {
+  const url = new URL(req.url ?? '/', 'http://localhost');
+  const chatId = url.searchParams.get('chatId') ?? '';
+  const rootMessageId = url.searchParams.get('rootMessageId') ?? '';
+  const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') ?? '200', 10) || 200, 1), 200);
+  if (!chatId || !rootMessageId || !rootMessageId.startsWith('om_')) {
+    return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+  }
+  try {
+    const raw = await listThreadMessages(cachedLarkAppId, chatId, rootMessageId, limit);
+    const messages = raw.map((m: any) => {
+      const parsed = parseApiMessage(m);
+      return {
+        messageId: parsed.messageId,
+        senderType: parsed.senderType === 'user' ? 'user' : 'app',
+        ...(parsed.senderName ? { senderName: parsed.senderName } : {}),
+        text: parsed.content,
+        createTimeMs: Number(parsed.createTime) || undefined,
+      };
+    });
+    jsonRes(res, 200, { ok: true, truncated: raw.length >= limit, messages });
+  } catch (err: any) {
+    jsonRes(res, 502, { ok: false, error: ipcErrorText(err) });
+  }
+}, NOT_BOUND_BODY.okFalse));
+
 // Authenticated host API; deliberately outside the core-only public allowlist.
 ipcRoute('GET', '/api/sessions/:sessionId/trigger-registration', (req, res, params) => {
   const url = new URL(req.url ?? '/', 'http://localhost');

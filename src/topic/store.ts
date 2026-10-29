@@ -517,6 +517,33 @@ export class TopicStore {
     });
   }
 
+  /** Remove summaries whose cited source messages disappeared from the
+   * observable thread (deletion/revocation, spec §5.4). Same transaction drops
+   * their embeddings and bumps revision; the cursor stays (the messages WERE
+   * processed — removal is about knowledge, not progress). Returns the ids
+   * actually removed (unknown ids are skipped). */
+  invalidateSummaries(topicKey: string, summaryIds: readonly string[], now: string): string[] {
+    const removed: string[] = [];
+    this.withImmediateWrite(() => {
+      const topic = this.readTopicRow(topicKey);
+      if (!topic) throw new TopicMutationValidationError('topic_not_found');
+      const doomed = new Set(summaryIds);
+      const before = topic.summaries.length;
+      topic.summaries = topic.summaries.filter(s => {
+        if (doomed.has(s.id)) { removed.push(s.id); return false; }
+        return true;
+      });
+      if (topic.summaries.length === before) return;
+      topic.updatedAt = now;
+      topic.revision += 1;
+      this.writeTopicRow(topic);
+      for (const id of removed) {
+        this.db.prepare('DELETE FROM topic_embeddings WHERE summary_id=?').run(id);
+      }
+    });
+    return removed;
+  }
+
   /** Persist a computed vector. Late/mismatched results are dropped silently:
    * the summary text must still hash to contentHash (spec §5.4 迟到向量丢弃). */
   saveEmbedding(input: { topicKey: string; summaryId: string; modelKey: string; contentHash: string; vector: number[]; now: string }): { saved: boolean; reason?: 'summary_missing' | 'content_hash_mismatch' | 'topic_missing' } {
