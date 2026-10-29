@@ -253,6 +253,32 @@ describe('摘要提交（revision CAS）', () => {
   });
 });
 
+describe('来源时间观察（change.md §3）', () => {
+  it('latestMessageAt 只前进；topicCreatedAt 只后退；不动 revision；仅 latest 变化动 updatedAt', async () => {
+    const store = await openStore();
+    const topic = seededTopic(store);
+    const t1 = '2026-10-01T00:00:00.000Z';
+    const t2 = '2026-10-03T00:00:00.000Z';
+    const revisionBefore = store.getTopic(topic.topicKey)!.revision;
+    const updatedBefore = store.getTopic(topic.topicKey)!.updatedAt;
+    store.observeTopicTimes(topic.topicKey, { earliestObservedAt: t1, latestObservedAt: t2 }, '2026-10-29T00:00:00.000Z');
+    let stored = store.getTopic(topic.topicKey)!;
+    expect(stored.topicCreatedAt).toBe(t1);
+    expect(stored.latestMessageAt).toBe(t2);
+    expect(stored.revision).toBe(revisionBefore); // 元数据不是知识变更
+    expect(stored.updatedAt).toBe('2026-10-29T00:00:00.000Z'); // latest 前进 → updatedAt 动
+    // 乱序观察：更晚窗口在前、更早历史在后
+    store.observeTopicTimes(topic.topicKey, { earliestObservedAt: '2026-10-02T00:00:00.000Z', latestObservedAt: '2026-10-02T00:00:00.000Z' }, '2026-10-30T00:00:00.000Z');
+    stored = store.getTopic(topic.topicKey)!;
+    expect(stored.topicCreatedAt).toBe(t1); // 更早的历史才回退创建时间
+    expect(stored.latestMessageAt).toBe(t2); // 更旧窗口不动最新消息时间
+    expect(stored.updatedAt).toBe('2026-10-29T00:00:00.000Z'); // 无变化不动 updatedAt
+    expect(stored.revision).toBe(revisionBefore);
+    void updatedBefore;
+    store.close();
+  });
+});
+
 describe('游标与检查状态', () => {
   it('recordHistoryCheck 只推进 lastCheckedAt，不动摘要游标', async () => {
     const store = await openStore();

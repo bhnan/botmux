@@ -117,15 +117,92 @@ describe('关键词召回', () => {
 });
 
 describe('filters 与分页', () => {
-  it('chatIds/来源时间窗只收窄候选；时间按来源消息时间而非摘要时间', async () => {
-    makeTopic(1, { chatId: 'oc_a', summaries: [{ text: '部署问题' }], coverageStartAt: '2026-10-01T00:00:00Z', sourceThroughAt: '2026-10-02T00:00:00Z' });
-    makeTopic(2, { chatId: 'oc_b', summaries: [{ text: '部署问题' }], coverageStartAt: '2026-10-28T00:00:00Z', sourceThroughAt: '2026-10-29T00:00:00Z' });
+  it('chatIds 只收窄候选；时间按所选口径过滤（change.md §3）', async () => {
+    const t1 = makeTopic(1, { chatId: 'oc_a', summaries: [{ text: '部署问题' }] });
+    store.observeTopicTimes(t1.topicKey, { earliestObservedAt: '2026-10-01T00:00:00Z', latestObservedAt: '2026-10-02T00:00:00Z' }, T0);
+    const t2 = makeTopic(2, { chatId: 'oc_b', summaries: [{ text: '部署问题' }] });
+    store.observeTopicTimes(t2.topicKey, { earliestObservedAt: '2026-10-28T00:00:00Z', latestObservedAt: '2026-10-29T00:00:00Z' }, T0);
     const service = new TopicSearchService({});
     const narrowed = await service.search({ query: '部署', mode: 'keyword', limit: 10, filters: { chatIds: ['oc_b'] } }, store.listTopics());
     expect(narrowed.items).toHaveLength(1);
     expect(narrowed.items[0]!.topicKey).toBe('thread:oc_b:om_root2');
+    // 旧参数 sourceTo 兼容映射为 latestMessage 口径
     const oldOnly = await service.search({ query: '部署', mode: 'keyword', limit: 10, filters: { sourceTo: '2026-10-15T00:00:00Z' } }, store.listTopics());
     expect(oldOnly.items.map(i => i.topicKey)).toEqual(['thread:oc_a:om_root1']);
+    // 新参数同口径等价
+    const newStyle = await service.search({ query: '部署', mode: 'keyword', limit: 10, filters: { timeBasis: 'latestMessage', to: '2026-10-15T00:00:00Z' } }, store.listTopics());
+    expect(newStyle.items.map(i => i.topicKey)).toEqual(['thread:oc_a:om_root1']);
+  });
+
+  it('§3 验收例：1 日创建、3 日新消息——两种口径筛选 1–2 日结果不同', async () => {
+    const topic = makeTopic(1, { summaries: [{ text: '部署问题' }] });
+    // 1 日创建（窗口最早消息 1 日）；3 日观察到新消息（即使摘要失败也要反映）
+    store.observeTopicTimes(topic.topicKey, { earliestObservedAt: '2026-10-01T00:00:00Z' }, T0);
+    store.observeTopicTimes(topic.topicKey, { latestObservedAt: '2026-10-03T00:00:00Z' }, T0);
+    const service = new TopicSearchService({});
+    const byCreated = await service.search({
+      query: '部署', mode: 'keyword', limit: 10,
+      filters: { timeBasis: 'topicCreated', from: '2026-10-01T00:00:00Z', to: '2026-10-02T00:00:00Z' },
+    }, store.listTopics());
+    expect(byCreated.items).toHaveLength(1);
+    const byLatest = await service.search({
+      query: '部署', mode: 'keyword', limit: 10,
+      filters: { timeBasis: 'latestMessage', from: '2026-10-01T00:00:00Z', to: '2026-10-02T00:00:00Z' },
+    }, store.listTopics());
+    expect(byLatest.items).toHaveLength(0);
+    const byLatest3 = await service.search({
+      query: '部署', mode: 'keyword', limit: 10,
+      filters: { timeBasis: 'latestMessage', from: '2026-10-03T00:00:00Z', to: '2026-10-03T23:59:59Z' },
+    }, store.listTopics());
+    expect(byLatest3.items).toHaveLength(1);
+  });
+
+  it('纯日期查询（无关键词）：按口径列出话题；未知来源时间不伪装命中', async () => {
+    const known = makeTopic(1, { summaries: [{ text: '任意' }] });
+    store.observeTopicTimes(known.topicKey, { earliestObservedAt: '2026-10-01T00:00:00Z', latestObservedAt: '2026-10-05T00:00:00Z' }, T0);
+    const unknown = makeTopic(2, { summaries: [{ text: '任意' }] }); // 从未观察到来源时间
+    const service = new TopicSearchService({});
+    const result = await service.search({
+      query: '', mode: 'keyword', limit: 10,
+      filters: { timeBasis: 'latestMessage', from: '2026-10-01T00:00:00Z', to: '2026-10-06T00:00:00Z' },
+    }, store.listTopics());
+    expect(result.items.map(i => i.topicKey)).toEqual([known.topicKey]); // unknown 被排除
+    // 无关键词且无任何收窄 → 仍然 query_invalid
+    await expect(service.search({ query: '', mode: 'keyword', limit: 10 }, store.listTopics())).rejects.toThrow(TopicSearchValidationError);
+  });
+
+  it('两种口径不自动组合：只按所选口径判定', async () => {
+    // 创建于 9 月、最新消息 10 月末：选 latestMessage 1-2 日不命中，选 topicCreated 9 月命中
+    const topic = makeTopic(1, { summaries: [{ text: '内容' }] });
+    store.observeTopicTimes(topic.topicKey, { earliestObservedAt: '2026-09-01T00:00:00Z', latestObservedAt: '2026-10-29T00:00:00Z' }, T0);
+    const service = new TopicSearchService({});
+    const oct = await service.search({ query: '', mode: 'keyword', limit: 10, filters: { timeBasis: 'latestMessage', from: '2026-10-01T00:00:00Z', to: '2026-10-02T00:00:00Z' } }, store.listTopics());
+    expect(oct.items).toHaveLength(0); // 不因创建时间在 9 月而豁免
+    const sep = await service.search({ query: '', mode: 'keyword', limit: 10, filters: { timeBasis: 'topicCreated', from: '2026-09-01T00:00:00Z', to: '2026-09-30T00:00:00Z' } }, store.listTopics());
+    expect(sep.items).toHaveLength(1);
+  });
+
+  it('§5 预算顺序：范围外候选先被过滤，不占预算挤掉合法结果', async () => {
+    const inRange: Topic = {
+      schemaVersion: 1, topicKey: 'thread:oc_a:om_hit', chatId: 'oc_a', rootMessageId: 'om_hit',
+      title: '命中话题', accessPolicyRef: 'chat:oc_a', revision: 1,
+      summaries: [{ id: 's0', text: '部署记录', keywords: [], sourceMessageIds: [], updatedAt: T0, generatorKey: 'g' }],
+      updatedAt: T0, latestMessageAt: '2026-10-20T00:00:00Z',
+    };
+    // 大量候选在日期范围外（且字典序排在命中话题前面）：预算在过滤之后生效
+    const outOfRange = Array.from({ length: MAX_CANDIDATES + 5 }, (_, i) => ({
+      schemaVersion: 1 as const, topicKey: `thread:oc_a:om_a${i}`, chatId: 'oc_a', rootMessageId: `om_a${i}`,
+      title: `范围外${i}`, accessPolicyRef: 'chat:oc_a', revision: 1,
+      summaries: [{ id: `so${i}`, text: `无关内容${i}`, keywords: [], sourceMessageIds: [], updatedAt: T0, generatorKey: 'g' }],
+      updatedAt: T0, latestMessageAt: '2026-09-01T00:00:00Z',
+    }));
+    const service = new TopicSearchService({});
+    const result = await service.search({
+      query: '', mode: 'keyword', limit: 10,
+      filters: { timeBasis: 'latestMessage', from: '2026-10-19T00:00:00Z', to: '2026-10-21T00:00:00Z' },
+    }, outOfRange.concat([inRange]));
+    expect(result.items.map(i => i.topicKey)).toEqual([inRange.topicKey]);
+    expect(result.coverage.state).toBe('complete'); // 范围外候选不计入未覆盖
   });
 
   it('分页：游标翻页；改查询/过滤后旧游标作废', async () => {
@@ -142,7 +219,7 @@ describe('filters 与分页', () => {
       .rejects.toThrow(TopicSearchValidationError);
   });
 
-  it('输入校验：空查询/超长/limit 越界', async () => {
+  it('输入校验：空查询且无收窄/超长/limit 越界', async () => {
     const service = new TopicSearchService({});
     const candidates = store.listTopics();
     await expect(service.search({ query: '  ', mode: 'keyword', limit: 5 }, candidates)).rejects.toThrow(TopicSearchValidationError);

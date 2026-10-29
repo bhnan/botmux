@@ -37015,3 +37015,39 @@ button.dboard-add-image { min-height: 28px; padding: 0 10px; font-size: var(--fs
 .bd-steward-guide-input { width: 100%; min-height: 96px; resize: vertical; }
 .bd-steward-guide-actions { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
 .bd-steward-open { display: inline-block; margin-top: 4px; color: var(--accent-strong); font-size: var(--fs-13); }
+
+/* 话题检索的时间口径与日期范围（change.md §3） */
+.topics-toolbar-row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 6px 10px 0;
+}
+
+.topics-date-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.topics-date-filter select,
+.topics-date-filter input[type='date'] {
+  font-size: 12px;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg, #fff);
+  color: inherit;
+}
+
+.topics-date-filter .link {
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  padding: 0;
+  text-decoration: underline;
+  font-size: 12px;
+}

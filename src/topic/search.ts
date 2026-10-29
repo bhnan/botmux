@@ -23,10 +23,25 @@ export const MAX_CANDIDATES = 2_000;
 
 export type TopicSearchMode = 'keyword' | 'hybrid' | 'auto';
 
+/** Two independent, user-selectable time bases for date filtering
+ * (change.md §3). They are never auto-combined: the chosen basis alone
+ * decides inclusion, and both are SOURCE-derived topic attributes — never
+ * summary generation time, coverage bounds, or the success cursor. */
+export type TopicTimeBasis = 'topicCreated' | 'latestMessage';
+
 export interface TopicSearchFilters {
   /** Narrow the authorized set further; never widen it. */
   chatIds?: string[];
-  /** ISO-8601 bounds on SOURCE message time (not summary generation time). */
+  /** Which time basis the date range applies to. Defaults to 'latestMessage'
+   * when a range is given without a basis (the UI always sends it
+   * explicitly so the user sees what they selected). */
+  timeBasis?: TopicTimeBasis;
+  /** ISO-8601 bounds for the chosen basis (inclusive). */
+  from?: string | null;
+  to?: string | null;
+  /** LEGACY (pre-change.md) aliases: bounds on source-message time. Mapped
+   * onto { timeBasis: 'latestMessage', from, to }; explicit new-style params
+   * win when both are present. */
   sourceFrom?: string | null;
   sourceTo?: string | null;
 }
@@ -56,6 +71,9 @@ export interface TopicSearchItem {
   matches: TopicSearchMatch[];
   updatedAt: string;
   sourceThroughAt?: string;
+  /** Source-derived time bases (change.md §3); absent = not yet observed. */
+  topicCreatedAt?: string;
+  latestMessageAt?: string;
 }
 
 export interface TopicSearchOutput {
@@ -110,18 +128,34 @@ function decodeCursor(raw: string | null | undefined, sig: string): number {
   }
 }
 
-/** Topic's source-time window overlaps the filter bounds? Coverage fields are
- * optional (a topic summarized long ago may lack them) — missing bounds keep
- * the topic (filters narrow, absence must not silently exclude history). */
-function sourceWindowOverlaps(topic: Topic, filters: TopicSearchFilters): boolean {
-  const from = filters.sourceFrom ? Date.parse(filters.sourceFrom) : undefined;
-  const to = filters.sourceTo ? Date.parse(filters.sourceTo) : undefined;
-  if (from === undefined && to === undefined) return true;
-  const start = topic.coverageStartAt ? Date.parse(topic.coverageStartAt) : undefined;
-  const end = topic.sourceThroughAt ? Date.parse(topic.sourceThroughAt) : undefined;
-  if (start !== undefined && to !== undefined && start > to) return false;
-  if (end !== undefined && from !== undefined && end < from) return false;
-  if (start === undefined && end === undefined) return false;
+/** Normalize legacy + new-style date params into one basis + range. */
+function resolveTimeFilter(filters: TopicSearchFilters): { basis: TopicTimeBasis; from?: number; to?: number } {
+  const from = filters.from ?? filters.sourceFrom ?? null;
+  const to = filters.to ?? filters.sourceTo ?? null;
+  const basis = filters.timeBasis ?? 'latestMessage';
+  return {
+    basis,
+    ...(from ? { from: Date.parse(from) } : {}),
+    ...(to ? { to: Date.parse(to) } : {}),
+  };
+}
+
+function hasDateFilter(filters: TopicSearchFilters): boolean {
+  return !!(filters.from || filters.to || filters.sourceFrom || filters.sourceTo);
+}
+
+/** Date filtering by the ONE selected basis (change.md §3): the chosen basis
+ * field alone decides; the other basis is never implicitly AND'ed. Topics
+ * whose basis field is still unknown (never observed from the source) are
+ * excluded from date-filtered results rather than faked from summary
+ * fields. */
+function topicWithinTimeFilter(topic: Topic, time: { basis: TopicTimeBasis; from?: number; to?: number }): boolean {
+  if (time.from === undefined && time.to === undefined) return true;
+  const field = time.basis === 'topicCreated' ? topic.topicCreatedAt : topic.latestMessageAt;
+  if (!field) return false; // unknown source time: cannot prove in-range
+  const at = Date.parse(field);
+  if (time.from !== undefined && at < time.from) return false;
+  if (time.to !== undefined && at > time.to) return false;
   return true;
 }
 
@@ -139,11 +173,15 @@ export class TopicSearchService {
 
   async search(input: TopicSearchInput, candidates: readonly Topic[]): Promise<TopicSearchOutput> {
     const query = input.query?.trim() ?? '';
-    if (!query || query.length > MAX_QUERY_LENGTH) throw new TopicSearchValidationError('query_invalid');
+    // Date-only queries are first-class: an empty keyword is valid when a
+    // date range (or chat filter) narrows the set (change.md §3: 不输入关键
+    // 词，仅选择时间口径和范围，也能获得话题列表).
+    const filters = input.filters ?? {};
+    const narrowing = hasDateFilter(filters) || !!(filters.chatIds && filters.chatIds.length);
+    if ((!query && !narrowing) || query.length > MAX_QUERY_LENGTH) throw new TopicSearchValidationError('query_invalid');
     const limit = Math.floor(input.limit);
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_LIMIT) throw new TopicSearchValidationError('limit_invalid');
 
-    const filters = input.filters ?? {};
     const sig = cursorSignature(input);
     const offset = decodeCursor(input.cursor, sig);
 
@@ -152,17 +190,20 @@ export class TopicSearchService {
       const allowed = new Set(filters.chatIds);
       visible = visible.filter(t => allowed.has(t.chatId));
     }
-    visible = visible.filter(t => sourceWindowOverlaps(t, filters));
+    // Filter FIRST, budget after: out-of-scope topics must not consume the
+    // candidate budget and squeeze out legal results (change.md §5).
+    const timeFilter = resolveTimeFilter(filters);
+    visible = visible.filter(t => topicWithinTimeFilter(t, timeFilter));
 
     const degradedReasons: string[] = [];
     const overBudget = visible.length > MAX_CANDIDATES;
     const scanned = overBudget ? visible.slice(0, MAX_CANDIDATES) : visible;
 
-    const keywordRanked = keywordRecall(scanned, query);
+    const keywordRanked = query ? keywordRecall(scanned, query) : [];
     const keywordByTopic = new Map(keywordRanked.map(entry => [entry.topicKey, entry]));
 
     let vectorByTopic: Map<string, { summaryId: string; similarity: number }> | undefined;
-    const wantsVector = input.mode === 'hybrid' || (input.mode === 'auto' && scanned.length > 0);
+    const wantsVector = query && (input.mode === 'hybrid' || (input.mode === 'auto' && scanned.length > 0));
     if (wantsVector) {
       if (!this.embedQuery) {
         degradedReasons.push('embedding_disabled');
@@ -180,7 +221,12 @@ export class TopicSearchService {
 
     const hybrid = vectorByTopic !== undefined;
     let orderedTopicKeys: string[];
-    if (hybrid) {
+    if (!query) {
+      // Date-only browsing: newest observed activity first, deterministic.
+      orderedTopicKeys = [...scanned]
+        .sort((a, b) => (Date.parse(b.latestMessageAt ?? '') || 0) - (Date.parse(a.latestMessageAt ?? '') || 0) || a.topicKey.localeCompare(b.topicKey))
+        .map(t => t.topicKey);
+    } else if (hybrid) {
       const fused = fuseRankings(keywordRanked.map(k => k.topicKey), [...vectorByTopic!.keys()]);
       orderedTopicKeys = [...fused.entries()]
         .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
@@ -217,6 +263,8 @@ export class TopicSearchService {
         matches,
         updatedAt: topic.updatedAt,
         ...(topic.sourceThroughAt ? { sourceThroughAt: topic.sourceThroughAt } : {}),
+        ...(topic.topicCreatedAt ? { topicCreatedAt: topic.topicCreatedAt } : {}),
+        ...(topic.latestMessageAt ? { latestMessageAt: topic.latestMessageAt } : {}),
       };
     });
 

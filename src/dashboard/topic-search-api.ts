@@ -143,10 +143,10 @@ export async function handleTopicSearchQuery(input: TopicSearchInput): Promise<T
   if (!state) return { status: 403, body: { ok: false, error: 'topic_search_disabled' } };
   const config = resolveLiveConfig(readGlobalConfig().topicSearch);
   if (!config) return { status: 403, body: { ok: false, error: 'topic_search_disabled' } };
-  // Live authorization on the query path too: a chat removed from
-  // allowedChatIds stops being searchable immediately (spec §5.4 / A-10).
-  const allowed = new Set(config.allowedChatIds);
-  const candidates = state.runtime.topicStore.listTopics().filter(topic => allowed.has(topic.chatId));
+  // 查询候选 = 整个持久目录（含已移出更新范围的群的历史话题）：更新范围与
+  // 检索可见范围是两个概念——移出 allowedChatIds 只停止新更新，旧摘要与向量
+  // 仍可检索（change.md §1）。聊天范围收窄由查询 filters 承担。
+  const candidates = state.runtime.topicStore.listTopics();
   // Embedding is resolved from the LIVE config per query — the query path
   // must never keep sending embedding requests after the operator turned
   // them off, nor stay keyword-only after they were turned on (复核 P2-7).

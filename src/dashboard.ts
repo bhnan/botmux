@@ -4629,20 +4629,33 @@ const server = createServer(async (req, res) => {
       }
       const b = (body ?? {}) as {
         query?: unknown;
-        filters?: { chatIds?: unknown; sourceFrom?: unknown; sourceTo?: unknown };
+        filters?: {
+          chatIds?: unknown;
+          sourceFrom?: unknown;
+          sourceTo?: unknown;
+          timeBasis?: unknown;
+          from?: unknown;
+          to?: unknown;
+        };
         mode?: unknown;
         limit?: unknown;
         cursor?: unknown;
       };
       const mode = b.mode === 'keyword' || b.mode === 'hybrid' || b.mode === 'auto' ? b.mode : 'auto';
       const limit = typeof b.limit === 'number' ? b.limit : 20;
+      const f = b.filters ?? {};
+      const hasFilters = f.chatIds !== undefined || f.sourceFrom !== undefined || f.sourceTo !== undefined
+        || f.timeBasis !== undefined || f.from !== undefined || f.to !== undefined;
       const outcome = await handleTopicSearchQuery({
         query: typeof b.query === 'string' ? b.query : '',
-        ...(b.filters?.chatIds !== undefined || b.filters?.sourceFrom !== undefined || b.filters?.sourceTo !== undefined ? {
+        ...(hasFilters ? {
           filters: {
-            ...(Array.isArray(b.filters?.chatIds) ? { chatIds: b.filters.chatIds.filter((id): id is string => typeof id === 'string') } : {}),
-            ...(typeof b.filters?.sourceFrom === 'string' ? { sourceFrom: b.filters.sourceFrom } : {}),
-            ...(typeof b.filters?.sourceTo === 'string' ? { sourceTo: b.filters.sourceTo } : {}),
+            ...(Array.isArray(f.chatIds) ? { chatIds: f.chatIds.filter((id): id is string => typeof id === 'string') } : {}),
+            ...(typeof f.sourceFrom === 'string' ? { sourceFrom: f.sourceFrom } : {}),
+            ...(typeof f.sourceTo === 'string' ? { sourceTo: f.sourceTo } : {}),
+            ...(f.timeBasis === 'topicCreated' || f.timeBasis === 'latestMessage' ? { timeBasis: f.timeBasis } : {}),
+            ...(typeof f.from === 'string' ? { from: f.from } : {}),
+            ...(typeof f.to === 'string' ? { to: f.to } : {}),
           },
         } : {}),
         mode,

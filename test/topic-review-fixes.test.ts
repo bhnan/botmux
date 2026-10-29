@@ -45,13 +45,15 @@ interface Harness {
   embedCalls: number;
   readKeys: string[];
   config: TopicSearchConfig | null | undefined;
+  /** ≥1 时：第 N 次模型调用返回后把 config 置 null（批内停用注入）。 */
+  disableAfterModelCalls?: number;
   nowMs: number;
 }
 
 async function makeRuntime(h: Harness, config: TopicSearchConfig): Promise<TopicSearchRuntime> {
   const runtime = await TopicSearchRuntime.create({
     dataDir: tempDir,
-    getConfig: () => h.config,
+    getConfig: () => h.config === undefined ? config : h.config,
     discoverRows: () => h.rows,
     readHistory: async identity => {
       h.readKeys.push(`${identity.chatId}:${identity.rootMessageId}`);
@@ -65,6 +67,7 @@ async function makeRuntime(h: Harness, config: TopicSearchConfig): Promise<Topic
       }
       h.modelCalls++;
       const next = h.modelResponses.shift();
+      if (h.disableAfterModelCalls !== undefined && h.modelCalls >= h.disableAfterModelCalls) h.config = null;
       if (!next) return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ mutations: [{ op: 'noop' }] }) } }] }), { status: 200 });
       return new Response(JSON.stringify(next.body), { status: next.status });
     }) as typeof fetch,
@@ -120,7 +123,7 @@ describe('P1-1 撤权后立即停止读取/外发/检索', () => {
     expect(revoked.summaries.map(s => s.text)).toEqual(['revoke 摘要']); // 无新增外发入库
   });
 
-  it('撤权后目录保留但检索不再返回该群话题（A-10 不泄露）', async () => {
+  it('撤权后旧摘要仍可检索：更新范围与检索可见范围分离（change.md §1）', async () => {
     const homeDir = mkdtempSync(join(tmpdir(), 'topic-review-api-'));
     const configPath = join(homeDir, 'config.json');
     const prev = process.env.BOTMUX_GLOBAL_CONFIG_FILE;
@@ -155,9 +158,9 @@ describe('P1-1 撤权后立即停止读取/外发/检索', () => {
       const before = await handleTopicSearchQuery({ query: '部署', mode: 'keyword', limit: 10 });
       expect(before.body.ok && before.body.result.items).toHaveLength(2);
 
-      writeCfg(['oc_keep']); // 撤权
+      writeCfg(['oc_keep']); // 移出更新范围：停止新更新，但历史知识保留可检索
       const after = await handleTopicSearchQuery({ query: '部署', mode: 'keyword', limit: 10 });
-      expect(after.body.ok && after.body.result.items.map((i: { topicKey: string }) => i.topicKey)).toEqual(['thread:oc_keep:om_r']);
+      expect(after.body.ok && after.body.result.items).toHaveLength(2);
       await stopTopicSearchHost();
     } finally {
       if (prev === undefined) delete process.env.BOTMUX_GLOBAL_CONFIG_FILE;
@@ -230,41 +233,50 @@ describe('P2-4 租约输家不消费槽位', () => {
   });
 });
 
-describe('P2-5 停用时已认领任务原样释放', () => {
-  it('embedding 处理中途停用：任务回 pending、attempt 不烧、不滞留 running', async () => {
+describe('停用语义（change.md §2：不接纳新批次，已接纳批次收尾）', () => {
+  it('批内停用：第一个话题处理后停用，同批剩余话题照常执行入库；下一批被拒', async () => {
     const h = baseHarness();
-    h.rows = [threadRow('oc_keep', 'om_r1', 's1')];
-    h.windows.set('oc_keep:om_r1', { messages: [msg('om_1')], truncated: false });
-    h.modelResponses.push(chat([{ op: 'add', text: '要向量化的摘要', keywords: [], sourceMessageIds: ['om_1'] }]));
-    const embConfig: TopicSearchConfig = {
-      ...baseConfig, allowedChatIds: ['oc_keep'],
-      embedding: { enabled: true, model: { provider: 'openai-compatible', baseUrl: 'https://llm.example.com/v1', model: 'emb-1', dimensions: 4 } },
-    };
-    const runtime = await makeRuntime(h, embConfig);
-    // 第一 tick 正常完成摘要并留下 1 个 embedding 任务（未处理：第二次 pass 前）
-    // ——直接手工入队更可控：先 tick 提交摘要，再手动入队两个 embedding 任务
+    h.rows = [threadRow('oc_keep', 'om_a', 's1'), threadRow('oc_keep', 'om_b', 's2'), threadRow('oc_keep', 'om_c', 's3')];
+    for (const root of ['om_a', 'om_b', 'om_c']) {
+      h.windows.set(`oc_keep:${root}`, { messages: [msg(`${root}_m1`)], truncated: false });
+      h.modelResponses.push(chat([{ op: 'add', text: `摘要-${root}`, keywords: [], sourceMessageIds: [`${root}_m1`] }]));
+    }
+    h.disableAfterModelCalls = 1; // 第 1 次模型调用返回后停用（批次进行中）
+    const runtime = await makeRuntime(h, { ...baseConfig, allowedChatIds: ['oc_keep'] });
+    const report = await runtime.tick();
+    expect(report.ran).toBe(true);
+    expect(report.committed).toBe(3); // 已接纳批次全部收尾，不截断队列
+    expect(h.modelCalls).toBe(3);
+    for (const root of ['om_a', 'om_b', 'om_c']) {
+      const topic = runtime.topicStore.getTopic(`thread:oc_keep:${root}`);
+      expect(topic?.summarizedThroughCursor).toBe(`msg:${root}_m1`); // 成功入库推进游标
+      expect(topic?.summaries).toHaveLength(1);
+    }
+    // 下一批：getConfig 为 null → 不接纳
+    const next = await runtime.tick();
+    expect(next).toMatchObject({ ran: false, reason: 'disabled' });
+  });
+
+  it('重新启用：从成功游标续跑，处理停用期间新增消息，不全量重做', async () => {
+    const h = baseHarness();
+    h.rows = [threadRow('oc_keep', 'om_a', 's1')];
+    h.windows.set('oc_keep:om_a', { messages: [msg('om_1'), msg('om_2')], truncated: false });
+    h.modelResponses.push(chat([{ op: 'add', text: '摘要1', keywords: [], sourceMessageIds: ['om_1', 'om_2'] }]));
+    const runtime = await makeRuntime(h, { ...baseConfig, allowedChatIds: ['oc_keep'] });
     await runtime.tick();
-    const topic = runtime.topicStore.listTopics()[0];
-    expect(topic.summaries).toHaveLength(1);
-    const nowIso = new Date(h.nowMs).toISOString();
-    runtime.topicStore.enqueueJob({ jobKey: 'embedding:e1', kind: 'embedding', topicKey: topic.topicKey, payload: { summaryId: topic.summaries[0].id, modelKey: 'x' }, now: nowIso });
-    runtime.topicStore.enqueueJob({ jobKey: 'embedding:e2', kind: 'embedding', topicKey: topic.topicKey, payload: { summaryId: 'missing' }, now: nowIso });
-    // 在 embedding fetch 期间停用
-    const origEmbed = (globalThis as unknown as { fetch: typeof fetch }).fetch;
+    expect(runtime.topicStore.getTopic('thread:oc_keep:om_a')?.summarizedThroughCursor).toBe('msg:om_2');
+    // 停用期间新增 om_3；重新启用后续跑增量（只处理 om_3，不重做 om_1/2）
     h.config = null;
-    const tickRuntime = runtime;
-    await tickRuntime.tick(); // getConfig()=null → runOnce 直接 disabled，不发任务
-    h.config = embConfig;
-    // 改用精确路径：认领任务后、处理中停用。手动认领再触发处理循环不可行（私有），
-    // 退而验证 releaseJobToPending 的行为语义 + 停用路径不把任务记失败：
-    const claimed = tickRuntime.topicStore.claimDueJobs({ now: nowIso, owner: tickRuntime.topicStore.owner, leaseTtlMs: 30 * 60_000, limit: 10, kinds: ['embedding'] });
-    expect(claimed).toHaveLength(2);
-    tickRuntime.topicStore.releaseJobToPending('embedding:e1', nowIso);
-    const released = tickRuntime.topicStore.getJob('embedding:e1')!;
-    expect(released.state).toBe('pending');
-    expect(released.attemptCount).toBe(0); // 未烧 attempt
-    expect(released.leaseOwner).toBeNull();
-    void origEmbed;
+    await runtime.tick();
+    h.windows.set('oc_keep:om_a', { messages: [msg('om_1'), msg('om_2'), msg('om_3')], truncated: false });
+    h.config = { ...baseConfig, allowedChatIds: ['oc_keep'] };
+    h.modelResponses.push(chat([{ op: 'add', text: '摘要2', keywords: [], sourceMessageIds: ['om_3'] }]));
+    const report = await runtime.tick();
+    expect(report.committed).toBe(1);
+    expect(h.modelCalls).toBe(2); // 只有增量那次
+    const topic = runtime.topicStore.getTopic('thread:oc_keep:om_a')!;
+    expect(topic.summaries).toHaveLength(2);
+    expect(topic.summarizedThroughCursor).toBe('msg:om_3');
   });
 });
 
@@ -301,6 +313,39 @@ describe('P2-6 cursor_beyond_window 可观测', () => {
     const checkedAt = topic.lastCheckedAt;
     await runtime.tick();
     expect(runtime.topicStore.listTopics()[0].lastCheckedAt).toBe(checkedAt); // 不刷新
+  });
+});
+
+describe('§3 来源时间独立维护', () => {
+  it('模型失败仍推进 latestMessageAt；按 3 日筛最新消息口径命中（change.md §3 验收例）', async () => {
+    const DAY_MS = 24 * 60 * 60_000;
+    const h = baseHarness();
+    h.rows = [threadRow('oc_keep', 'om_r1', 's1')];
+    // 1 日：摘要成功
+    h.windows.set('oc_keep:om_r1', { messages: [msg('om_1', BASE)], truncated: false });
+    h.modelResponses.push(chat([{ op: 'add', text: '1日摘要', keywords: [], sourceMessageIds: ['om_1'] }]));
+    const runtime = await makeRuntime(h, { ...baseConfig, allowedChatIds: ['oc_keep'] });
+    await runtime.tick();
+    let topic = runtime.topicStore.getTopic('thread:oc_keep:om_r1')!;
+    expect(topic.summarizedThroughCursor).toBe('msg:om_1');
+    expect(topic.latestMessageAt).toBe(new Date(BASE).toISOString());
+    // 3 日：新消息到达，模型失败（3 个 503 耗尽重试）
+    h.windows.set('oc_keep:om_r1', { messages: [msg('om_1', BASE), msg('om_2', BASE + 2 * DAY_MS)], truncated: false });
+    h.modelResponses.push({ status: 503, body: {} }, { status: 503, body: {} }, { status: 503, body: {} });
+    const report = await runtime.tick();
+    expect(report.failed).toBe(1);
+    topic = runtime.topicStore.getTopic('thread:oc_keep:om_r1')!;
+    expect(topic.latestMessageAt).toBe(new Date(BASE + 2 * DAY_MS).toISOString()); // 观察 ≠ 摘要成功
+    expect(topic.summarizedThroughCursor).toBe('msg:om_1'); // 成功游标不动
+    expect(topic.sourceThroughAt).toBe(new Date(BASE).toISOString());
+    // 按 3 日筛「最新消息时间」：命中（即使摘要失败）
+    const { TopicSearchService } = await import('../src/topic/search.js');
+    const service = new TopicSearchService({});
+    const result = await service.search({
+      query: '', mode: 'keyword', limit: 10,
+      filters: { timeBasis: 'latestMessage', from: new Date(BASE + 2 * DAY_MS).toISOString(), to: new Date(BASE + 3 * DAY_MS).toISOString() },
+    }, runtime.topicStore.listTopics());
+    expect(result.items.map(i => i.topicKey)).toEqual(['thread:oc_keep:om_r1']);
   });
 });
 

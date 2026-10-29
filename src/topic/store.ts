@@ -518,6 +518,30 @@ export class TopicStore {
     return result!;
   }
 
+  /** Observe SOURCE-derived topic times (change.md §3). topicCreatedAt
+   * min-merges (earlier history can only move it back); latestMessageAt
+   * max-merges and reflects messages seen in reads even when the model call
+   * fails afterwards. Metadata, not a knowledge mutation: no revision bump;
+   * updatedAt only moves when latestMessageAt actually advances (a real
+   * ordering-relevant change for pagination cursors). */
+  observeTopicTimes(topicKey: string, observed: { earliestObservedAt?: string; latestObservedAt?: string }, now: string): void {
+    if (!observed.earliestObservedAt && !observed.latestObservedAt) return;
+    this.withImmediateWrite(() => {
+      const topic = this.readTopicRow(topicKey);
+      if (!topic) throw new TopicMutationValidationError('topic_not_found');
+      let changed = false;
+      if (observed.latestObservedAt && (!topic.latestMessageAt || observed.latestObservedAt > topic.latestMessageAt)) {
+        topic.latestMessageAt = observed.latestObservedAt;
+        changed = true;
+      }
+      if (observed.earliestObservedAt && (!topic.topicCreatedAt || observed.earliestObservedAt < topic.topicCreatedAt)) {
+        topic.topicCreatedAt = observed.earliestObservedAt;
+      }
+      if (changed) topic.updatedAt = now;
+      this.writeTopicRow(topic);
+    });
+  }
+
   /** History-check bookkeeping. Only lastCheckedAt moves — never the summary
    * cursor, never summaries (spec §5.1). */
   recordHistoryCheck(topicKey: string, now: string): void {
@@ -703,18 +727,6 @@ export class TopicStore {
       expired = Number(result.changes);
     });
     return expired;
-  }
-
-  /** Release a claimed job back to the claimable pool WITHOUT burning an
-   * attempt or touching its backoff — for aborts that are not the job's
-   * fault (e.g. the feature was disabled mid-tick). Undoes the claim's
-   * attempt increment so a disabled abort cannot accelerate the job toward
-   * dead, and clears the lease so it is not stuck 'running' until expiry. */
-  releaseJobToPending(jobKey: string, now: string): void {
-    this.withImmediateWrite(() => {
-      this.db.prepare(`UPDATE topic_jobs SET state='pending', lease_owner=NULL, lease_expires_at=NULL,
-        attempt_count=MAX(attempt_count-1, 0), updated_at=? WHERE job_key=? AND state='running'`).run(now, jobKey);
-    });
   }
 
   // ─── Schedule state (deployment lease, fair-scan cursor) ─────────────────

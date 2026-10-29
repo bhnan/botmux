@@ -145,6 +145,35 @@ describe('handleTopicSearchQuery', () => {
     if (!narrowed.body.ok) throw new Error('expected ok');
     expect(narrowed.body.result.items.map(i => i.topicKey)).toEqual(['thread:oc_chat2:om_r']);
   });
+
+  it('时间口径透传（change.md §3）：纯日期查询 + 新旧参数', async () => {
+    writeConfig(validTopicSearch);
+    const state = await startTopicSearchHost(hostDeps());
+    const topic = state!.runtime.topicStore.ensureTopic({
+      topicKey: 'thread:oc_chat:om_r1', chatId: 'oc_chat', rootMessageId: 'om_r1',
+      title: '部署话题', accessPolicyRef: 'chat:oc_chat',
+    }, '2026-10-29T00:00:00Z').topic;
+    state!.runtime.topicStore.commitSummaryUpdate({
+      topicKey: topic.topicKey, expectedRevision: topic.revision,
+      mutations: [{ op: 'add', text: '部署内容', keywords: [], sourceMessageIds: ['om_1'] }],
+      generatorKey: 'm1', now: '2026-10-29T00:00:00Z',
+    });
+    state!.runtime.topicStore.observeTopicTimes(topic.topicKey, {
+      earliestObservedAt: '2026-10-01T00:00:00Z', latestObservedAt: '2026-10-05T00:00:00Z',
+    }, '2026-10-29T00:00:00Z');
+    // 纯日期（无关键词）+ topicCreated 口径：10-01~02 命中，10-04 后不命中
+    const hit = await handleTopicSearchQuery({ query: '', mode: 'auto', limit: 10, filters: { timeBasis: 'topicCreated', from: '2026-10-01T00:00:00Z', to: '2026-10-02T00:00:00Z' } });
+    expect(hit.status).toBe(200);
+    expect(hit.body.ok && hit.body.result.items).toHaveLength(1);
+    const miss = await handleTopicSearchQuery({ query: '', mode: 'auto', limit: 10, filters: { timeBasis: 'topicCreated', from: '2026-10-04T00:00:00Z', to: '2026-10-05T00:00:00Z' } });
+    expect(miss.body.ok && miss.body.result.items).toHaveLength(0);
+    // 旧参数 sourceFrom/sourceTo 兼容（映射 latestMessage 口径）：10-06 起排除
+    const legacy = await handleTopicSearchQuery({ query: '', mode: 'auto', limit: 10, filters: { sourceFrom: '2026-10-06T00:00:00Z' } });
+    expect(legacy.body.ok && legacy.body.result.items).toHaveLength(0);
+    // 空查询且无收窄仍 400
+    const bare = await handleTopicSearchQuery({ query: '', mode: 'auto', limit: 10 });
+    expect(bare.status).toBe(400);
+  });
 });
 
 describe('contentHash 一致性（宿主层与存储层共用）', () => {

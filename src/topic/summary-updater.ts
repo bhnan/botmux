@@ -15,7 +15,7 @@
 import type { Topic } from '../types.js';
 import type { TopicModelCallInput, TopicModelCallResult, TopicModelMessage } from './model-client.js';
 import { TopicRevisionConflictError, type TopicStore } from './store.js';
-import { findVanishedSourceRefs, sliceIncrement, type TopicHistoryWindow } from './source.js';
+import { dedupeSourceMessages, findVanishedSourceRefs, sliceIncrement, type TopicHistoryWindow } from './source.js';
 
 /** How many recent summaries form the "relevant old summaries" context
  * window (spec §5.3: 只选择相关旧摘要和有限窗口). */
@@ -68,6 +68,21 @@ export async function updateTopicFromWindow(
 ): Promise<TopicUpdateOutcome> {
   const topic = deps.store.getTopic(args.topicKey);
   if (!topic) return { kind: 'model_failed', code: 'topic_missing' };
+
+  // SOURCE time observation is independent of summarization: even when the
+  // model call below fails, latestMessageAt must reflect messages this read
+  // already observed (change.md §3 验收例：3 日新消息摘要失败仍按 3 日命中)。
+  const timedMessages = dedupeSourceMessages(args.window.messages)
+    .filter(m => m.createTimeMs !== undefined)
+    .map(m => m.createTimeMs!);
+  if (timedMessages.length > 0) {
+    try {
+      deps.store.observeTopicTimes(args.topicKey, {
+        earliestObservedAt: new Date(Math.min(...timedMessages)).toISOString(),
+        latestObservedAt: new Date(Math.max(...timedMessages)).toISOString(),
+      }, deps.now());
+    } catch { /* topic vanished concurrently; observation is best-effort */ }
+  }
 
   const sliced = sliceIncrement(args.window.messages, {
     cursor: topic.summarizedThroughCursor,

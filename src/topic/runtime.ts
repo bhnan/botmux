@@ -3,19 +3,22 @@
  * stopped with its lifecycle (mount point lives in src/dashboard, this module
  * stays dashboard-free and receives every external capability by injection).
  *
+ * One tick = one ACCEPTED update batch (change.md §2): disabling the feature
+ * stops NEW batches at the next tick's entry gate; the in-flight batch —
+ * including topics still queued behind the per-run limit — drains normally
+ * (reads, model calls, commits, cursor advances, embedding). In-flight
+ * results are never dropped at a "disable boundary", and draining still
+ * respects the per-run limits.
+ *
  * One tick:
  *   lease → discover authorized topics from session rows (ensure catalog)
  *   → fair scan (bounded topics per run, round-robin cursor)
- *   → per topic: read history window → slice increment → (no increment ⇒
- *     lastCheckedAt only, ZERO model calls) → one structured model call →
- *     revision-CAS commit with cursor
+ *   → per topic: read history window → observe source times → slice
+ *     increment → (no increment ⇒ lastCheckedAt only, ZERO model calls)
+ *     → one structured model call → revision-CAS commit with cursor
  *   → retry queue (topic summary failures, exponential backoff via jobs)
  *   → embedding jobs (independent of summary success, spec §5.1)
  *   → release lease, persist scan cursor + last run slot.
- *
- * Mid-run disable: the config resolver is consulted at every commit/outbound
- * boundary (before each model call) — stopping the feature halts new model
- * traffic without killing an in-flight HTTP request's bookkeeping.
  */
 import { embedSummaryText } from './embedding-client.js';
 import { callSummaryModel, type TopicModelCallInput, type TopicModelCallResult } from './model-client.js';
@@ -314,8 +317,6 @@ export class TopicSearchRuntime {
       await this.enqueueSummaryRetry(topic.topicKey, 'history_read_failed');
       return { kind: 'model_failed', code: 'history_read_failed' };
     }
-    // Disable check at the outbound boundary: no model traffic once off.
-    if (!this.deps.getConfig()) return { kind: 'no_increment' };
     const hasStoredCursor = !!this.store.getTopic(topic.topicKey)?.summarizedThroughCursor;
     const outcome = await updateTopicFromWindow(
       { store: this.store, callModel: input => this.callModel(config, input), now: () => this.nowIso },
@@ -383,9 +384,7 @@ export class TopicSearchRuntime {
     const jobs = this.store.claimDueJobs({
       now: this.nowIso, owner: this.store.owner, leaseTtlMs: RUN_LEASE_TTL_MS, limit: config.maxTopicsPerRun, kinds: ['summary'],
     });
-    for (let i = 0; i < jobs.length; i++) {
-      const job = jobs[i];
-      if (!this.deps.getConfig()) { this.releaseClaimedOnDisable(jobs.slice(i)); return; }
+    for (const job of jobs) {
       const topic = this.store.getTopic(job.topicKey);
       if (!topic) { this.finishClaimed(job, true); continue; }
       const outcome = await this.processOneTopic(config, topic, this.now - config.initialLookbackDays * 24 * 60 * 60_000);
@@ -412,9 +411,7 @@ export class TopicSearchRuntime {
     const jobs = this.store.claimDueJobs({
       now: this.nowIso, owner: this.store.owner, leaseTtlMs: RUN_LEASE_TTL_MS, limit: EMBEDDING_JOBS_PER_TICK, kinds: ['embedding'],
     });
-    for (let i = 0; i < jobs.length; i++) {
-      const job = jobs[i];
-      if (!this.deps.getConfig()) { this.releaseClaimedOnDisable(jobs.slice(i)); return; }
+    for (const job of jobs) {
       const payload = job.payload as { summaryId?: string; modelKey?: string; contentHash?: string };
       const topic = this.store.getTopic(job.topicKey);
       const summary = topic?.summaries.find(s => s.id === payload.summaryId);
@@ -442,16 +439,6 @@ export class TopicSearchRuntime {
         report.embeddingsFailed++;
       }
     }
-  }
-
-  /** Feature disabled mid-run: the abort is not the jobs' fault. Release
-   * every still-claimed job untouched — no attempt burned, no extra backoff,
-   * no 'running' residue waiting for lease expiry (复核 P2-5). */
-  private releaseClaimedOnDisable(claimed: readonly TopicJobRecord[]): void {
-    for (const job of claimed) {
-      try { this.store.releaseJobToPending(job.jobKey, this.nowIso); } catch { /* best effort */ }
-    }
-    this.log.warn(`[topic-search] disabled mid-run; ${claimed.length} claimed job(s) released untouched`);
   }
 
   // ─── Lifecycle ────────────────────────────────────────────────────────────

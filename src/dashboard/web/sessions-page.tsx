@@ -1728,12 +1728,22 @@ type TopicContentSearchState =
     }
   | { phase: 'error' };
 
-function useTopicContentSearch(query: string, chatFilter: string, retryNonce: number): TopicContentSearchState {
+/** 日期过滤条件（change.md §3）：口径 + 范围；可与关键词独立使用。 */
+interface TopicDateFilter {
+  basis: 'topicCreated' | 'latestMessage';
+  from: string;
+  to: string;
+}
+
+function useTopicContentSearch(query: string, chatFilter: string, dateFilter: TopicDateFilter, retryNonce: number): TopicContentSearchState {
   const [state, setState] = useState<TopicContentSearchState>({ phase: 'idle' });
   const seqRef = useRef(0);
   useEffect(() => {
     const q = query.trim();
-    if (!q) {
+    const fromDate = dateFilter.from || null;
+    const toDate = dateFilter.to || null;
+    // 关键词与日期是两种独立入口：纯日期（无关键词）也是合法查询
+    if (!q && !fromDate && !toDate) {
       seqRef.current++;
       setState({ phase: 'idle' });
       return;
@@ -1750,7 +1760,12 @@ function useTopicContentSearch(query: string, chatFilter: string, retryNonce: nu
               query: q,
               mode: 'auto',
               limit: 30,
-              ...(chatFilter ? { filters: { chatIds: [chatFilter] } } : {}),
+              filters: {
+                timeBasis: dateFilter.basis,
+                ...(fromDate ? { from: fromDate } : {}),
+                ...(toDate ? { to: toDate } : {}),
+                ...(chatFilter ? { chatIds: [chatFilter] } : {}),
+              },
             }),
           });
           if (response.status === 401 || response.status === 403) {
@@ -1782,7 +1797,7 @@ function useTopicContentSearch(query: string, chatFilter: string, retryNonce: nu
       })();
     }, 250);
     return () => clearTimeout(timer);
-  }, [query, chatFilter, retryNonce]);
+  }, [query, chatFilter, dateFilter.basis, dateFilter.from, dateFilter.to, retryNonce]);
   return state;
 }
 
@@ -3058,7 +3073,9 @@ function SessionsPage(): React.JSX.Element {
   }, [chatOptions, filters.chat]);
 
   const [topicSearchRetryNonce, setTopicSearchRetryNonce] = useState(0);
-  const topicContentSearch = useTopicContentSearch(filters.q, filters.chat, topicSearchRetryNonce);
+  const [topicDate, setTopicDate] = useState<TopicDateFilter>({ basis: 'latestMessage', from: '', to: '' });
+  const topicContentSearch = useTopicContentSearch(filters.q, filters.chat, topicDate, topicSearchRetryNonce);
+  const topicDateActive = !!(topicDate.from || topicDate.to);
   const contentRankedKeys = useMemo(
     () => (topicContentSearch.phase === 'ok' ? new Set(topicContentSearch.rankedKeys) : null),
     [topicContentSearch],
@@ -3082,17 +3099,20 @@ function SessionsPage(): React.JSX.Element {
       .filter(s => !filters.adopt || (filters.adopt === 'yes') === !!s.adopt)
       .filter(s => !filters.chat || String(s.chatId ?? '') === filters.chat)
       .filter(s => !filters.active || keepClosed || s.status !== 'closed')
-      // 内容检索命中时不叠加旧的字符串包含过滤（spec §6.2）；未启用/失败时回退原过滤
-      .filter(s => !q || (contentRankedKeys
-        ? contentRankedKeys.has(sessionTopicKey(s))
-        : sessionSearchText(s).includes(q)));
+      // 内容检索命中时不叠加旧的字符串包含过滤（spec §6.2）；纯日期查询同样
+      // 以服务返回的话题集合过滤；未启用/失败时回退原过滤
+      .filter(s => {
+        if (!q && !topicDate.from && !topicDate.to) return true;
+        if (contentRankedKeys) return contentRankedKeys.has(sessionTopicKey(s));
+        return !q || sessionSearchText(s).includes(q);
+      });
     if (!acceptedTopicKeys) {
       return base.sort((a, b) => compareRows(a, b, sortKey, sortDir));
     }
     return base
       .filter(row => acceptedTopicKeys.has(sessionTopicKey(row)))
       .sort((a, b) => compareRows(a, b, sortKey, sortDir));
-  }, [contentRankedKeys, filters, revision, sortDir, sortKey, storeRows, viewMode]);
+  }, [contentRankedKeys, filters, revision, sortDir, sortKey, storeRows, topicDate.from, topicDate.to, viewMode]);
   const runtimeCounts = useMemo(() => sessionRuntimeCounts(storeRows), [storeRows]);
 
   const rowsById = useMemo(() => new Map(storeRows.map(row => [row.sessionId, row])), [storeRows, revision]);
@@ -4121,6 +4141,39 @@ function SessionsPage(): React.JSX.Element {
         ) : null}
 
         {bootstrapped && viewMode === 'topics' ? (
+        <div className="topics-toolbar-row">
+          <label className="topics-date-filter" aria-label={t('sessions.topicSearch.timeBasis')}>
+            <span>{t('sessions.topicSearch.timeBasis')}</span>
+            <select
+              value={topicDate.basis}
+              onChange={event => setTopicDate(prev => ({ ...prev, basis: event.currentTarget.value as TopicDateFilter['basis'] }))}
+            >
+              <option value="latestMessage">{t('sessions.topicSearch.basisLatest')}</option>
+              <option value="topicCreated">{t('sessions.topicSearch.basisCreated')}</option>
+            </select>
+            <input
+              type="date"
+              aria-label={t('sessions.topicSearch.dateFrom')}
+              value={topicDate.from}
+              onChange={event => setTopicDate(prev => ({ ...prev, from: event.currentTarget.value }))}
+            />
+            <span aria-hidden>–</span>
+            <input
+              type="date"
+              aria-label={t('sessions.topicSearch.dateTo')}
+              value={topicDate.to}
+              onChange={event => setTopicDate(prev => ({ ...prev, to: event.currentTarget.value }))}
+            />
+            {topicDateActive ? (
+              <button type="button" className="link" onClick={() => setTopicDate(prev => ({ ...prev, from: '', to: '' }))}>
+                {t('sessions.topicSearch.clearDates')}
+              </button>
+            ) : null}
+          </label>
+        </div>
+        ) : null}
+
+        {bootstrapped && viewMode === 'topics' ? (
         <TopicGroupsView
           rows={rows}
           relationRows={storeRows}
@@ -4133,7 +4186,7 @@ function SessionsPage(): React.JSX.Element {
           onRestart={listOnRestart}
           onLock={listOnLock}
           onClose={listOnClose}
-          contentSearch={filters.q.trim() ? {
+          contentSearch={(filters.q.trim() || topicDateActive) ? {
             loading: topicContentSearch.phase === 'loading',
             error: topicContentSearch.phase === 'error',
             ...(topicContentSearch.phase === 'ok' ? {

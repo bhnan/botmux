@@ -1318,6 +1318,15 @@ export interface Topic {
   sourceThroughAt?: string;
   /** ISO-8601 UTC of the last successful history check (≠ summary cursor). */
   lastCheckedAt?: string;
+  /** SOURCE-derived topic creation time (earliest message time ever observed
+   *  in the thread). Advances only backwards (min-merge) as earlier history
+   *  becomes visible. Never derived from summary fields; absent = not yet
+   *  observed (change.md §3 话题创建时间口径). */
+  topicCreatedAt?: string;
+  /** SOURCE-derived latest observed message time. Reflects messages SEEN in
+   *  history reads even when the model call later fails — observation and
+   *  summarization are independent (change.md §3 最新消息时间口径). */
+  latestMessageAt?: string;
   updatedAt: string;
 }
 

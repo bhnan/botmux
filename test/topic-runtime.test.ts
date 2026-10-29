@@ -222,14 +222,17 @@ describe('embedding', () => {
 });
 
 describe('停用与租约', () => {
-  it('中途停用：读取后禁用，模型调用前熔断', async () => {
+  it('中途停用（change.md §2）：已接纳批次继续执行并入库；下一批被拒', async () => {
     const h2: Harness = { rows: [threadRow('oc_allowed', 'om_r1', 's1')], windows: new Map(), modelResponses: [], modelCalls: 0, embedCalls: 0, config: baseConfig, readCalls: 0 };
     h2.windows.set('oc_allowed:om_r1', { messages: [msg('om_1')], truncated: false });
     h2.modelResponses.push(chatCompletion([{ op: 'noop' }]));
     const flippingRuntime = await makeRuntimeFlipping(h2);
     const report = await flippingRuntime.tick();
     expect(report.ran).toBe(true);
-    expect(h2.modelCalls).toBe(0); // 停用后零模型调用
+    expect(h2.modelCalls).toBe(1); // 批内停用不丢弃已接纳工作
+    expect(flippingRuntime.topicStore.getTopic('thread:oc_allowed:om_r1')?.summarizedThroughCursor).toBe('msg:om_1');
+    const next = await flippingRuntime.tick();
+    expect(next).toMatchObject({ ran: false, reason: 'disabled' }); // 新批次被拒
   });
 
   it('部署级租约：同库第二个实例的 tick 被拒（单飞）', async () => {
