@@ -46,6 +46,8 @@ export interface TopicSearchGlobalConfig {
   initialLookbackDays?: number;
   maxConcurrentTopics?: number;
   maxTopicsPerRun?: number;
+  /** 删除核查窗口（小时）；0 = 关闭缺席判定，只处理源侧显式删标记。 */
+  recheckOverlapHours?: number;
 }
 
 /** 解析后的完整配置（默认值已填好，可直接消费）。 */
@@ -58,6 +60,7 @@ export interface ResolvedTopicSearchConfig {
   initialLookbackDays: number;
   maxConcurrentTopics: number;
   maxTopicsPerRun: number;
+  recheckOverlapHours: number;
 }
 
 export const TOPIC_SEARCH_DEFAULT_SCHEDULE: TopicSearchCronSchedule = {
@@ -70,6 +73,7 @@ export const TOPIC_SEARCH_DEFAULT_LOOKBACK_DAYS = 14;
 export const TOPIC_SEARCH_MAX_LOOKBACK_DAYS = 3650;
 export const TOPIC_SEARCH_MAX_TOPICS_PER_RUN_CEILING = 200;
 export const TOPIC_SEARCH_MAX_CONCURRENT_CEILING = 8;
+export const TOPIC_SEARCH_MAX_RECHECK_OVERLAP_HOURS = 720;
 
 export const TOPIC_SEARCH_DEFAULT_CONFIG: ResolvedTopicSearchConfig = {
   enabled: false,
@@ -80,6 +84,7 @@ export const TOPIC_SEARCH_DEFAULT_CONFIG: ResolvedTopicSearchConfig = {
   initialLookbackDays: TOPIC_SEARCH_DEFAULT_LOOKBACK_DAYS,
   maxConcurrentTopics: 1,
   maxTopicsPerRun: 20,
+  recheckOverlapHours: 24,
 };
 
 export type TopicSearchConfigErrorCode =
@@ -93,7 +98,8 @@ export type TopicSearchConfigErrorCode =
   | 'invalid_schedule_interval'
   | 'invalid_lookback_days'
   | 'invalid_max_concurrent_topics'
-  | 'invalid_max_topics_per_run';
+  | 'invalid_max_topics_per_run'
+  | 'invalid_recheck_overlap_hours';
 
 export interface TopicSearchConfigIssue {
   code: TopicSearchConfigErrorCode;
@@ -270,6 +276,16 @@ export function validateTopicSearchConfig(raw: unknown): TopicSearchConfigValida
     else maxConcurrentTopics = value;
   }
 
+  let recheckOverlapHours = TOPIC_SEARCH_DEFAULT_CONFIG.recheckOverlapHours;
+  if (section.recheckOverlapHours !== undefined) {
+    const value = readPositiveInt(section.recheckOverlapHours, {
+      min: 0,
+      max: TOPIC_SEARCH_MAX_RECHECK_OVERLAP_HOURS,
+    });
+    if (value === null) issues.push({ code: 'invalid_recheck_overlap_hours', field: 'recheckOverlapHours' });
+    else recheckOverlapHours = value;
+  }
+
   let maxTopicsPerRun = TOPIC_SEARCH_DEFAULT_CONFIG.maxTopicsPerRun;
   if (section.maxTopicsPerRun !== undefined) {
     const value = readPositiveInt(section.maxTopicsPerRun, {
@@ -294,6 +310,7 @@ export function validateTopicSearchConfig(raw: unknown): TopicSearchConfigValida
       initialLookbackDays,
       maxConcurrentTopics,
       maxTopicsPerRun,
+      recheckOverlapHours,
     },
   };
 }

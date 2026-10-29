@@ -864,7 +864,7 @@ function readTopicSearchSection(raw: unknown): TopicSearchGlobalConfig | undefin
     if (typeof schedule.intervalMinutes === 'number') next.intervalMinutes = schedule.intervalMinutes;
     out.schedule = next;
   }
-  for (const key of ['initialLookbackDays', 'maxConcurrentTopics', 'maxTopicsPerRun'] as const) {
+  for (const key of ['initialLookbackDays', 'maxConcurrentTopics', 'maxTopicsPerRun', 'recheckOverlapHours'] as const) {
     if (typeof v[key] === 'number') out[key] = v[key] as number;
   }
   return Object.keys(out).length > 0 ? out : undefined;

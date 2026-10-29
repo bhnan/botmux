@@ -54,8 +54,21 @@ describe('话题检索配置校验', () => {
     expect(validateTopicSearchConfig({ initialLookbackDays: 0 }).ok).toBe(false);
     expect(validateTopicSearchConfig({ maxTopicsPerRun: 10_000 }).ok).toBe(false);
     expect(validateTopicSearchConfig({ maxConcurrentTopics: 0 }).ok).toBe(false);
-    const ok = validateTopicSearchConfig({ maxTopicsPerRun: 3, maxConcurrentTopics: 2, initialLookbackDays: 30 });
-    expect(ok.value).toMatchObject({ maxTopicsPerRun: 3, maxConcurrentTopics: 2, initialLookbackDays: 30 });
+    expect(validateTopicSearchConfig({ recheckOverlapHours: -1 }).ok).toBe(false);
+    expect(validateTopicSearchConfig({ recheckOverlapHours: 721 }).ok).toBe(false);
+    expect(validateTopicSearchConfig({ recheckOverlapHours: 0 }).value?.recheckOverlapHours).toBe(0);
+    const ok = validateTopicSearchConfig({
+      maxTopicsPerRun: 3,
+      maxConcurrentTopics: 2,
+      initialLookbackDays: 30,
+      recheckOverlapHours: 12,
+    });
+    expect(ok.value).toMatchObject({
+      maxTopicsPerRun: 3,
+      maxConcurrentTopics: 2,
+      initialLookbackDays: 30,
+      recheckOverlapHours: 12,
+    });
   });
 
   it('allowedChatIds 去重并去掉空白，非字符串项判非法', () => {

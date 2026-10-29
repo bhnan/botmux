@@ -146,7 +146,11 @@ export function createTopicRuntime(deps: TopicRuntimeDeps): TopicRuntime {
           source: deps.source,
           enricher: activeEnricher,
           now,
-          ...(deps.limits ? { limits: deps.limits } : {}),
+          limits: {
+            ...(deps.limits ?? {}),
+            // 0 表示关闭「缺席即删除」判定，只处理源侧显式 deleted 标记。
+            recheckOverlapMs: config.recheckOverlapHours * 60 * 60_000,
+          },
         },
         entry,
         { skipUntil },
