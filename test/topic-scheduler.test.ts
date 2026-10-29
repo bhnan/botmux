@@ -142,6 +142,33 @@ describe('调度 tick', () => {
     expect(store.getNextRunAt()).toBe('2026-10-31T18:00:00.000Z');
   });
 
+  it('运行中先关闭再开启：关闭期不跑，重新开启后补跑积压槽位', async () => {
+    let enabled = true;
+    const runOnce = vi.fn(async () => emptyReport);
+    const scheduler = createTopicScheduler({
+      store,
+      resolveConfig: () => ({ ...config, enabled }),
+      runOnce: runOnce as never,
+      owner: 'test-owner',
+      now: () => new Date('2026-10-30T02:00:00.000Z'),
+    });
+
+    await scheduler.tick(new Date('2026-10-30T02:00:00.000Z')); // 初始化下一次
+    expect(store.getNextRunAt()).toBe('2026-10-30T18:00:00.000Z');
+
+    enabled = false;
+    const disabled = await scheduler.tick(new Date('2026-10-30T18:00:00.000Z'));
+    expect(disabled.status).toBe('disabled');
+    // 关闭期间不推进计划时刻：重新开启后这个槽位仍欠着。
+    expect(store.getNextRunAt()).toBe('2026-10-30T18:00:00.000Z');
+    expect(runOnce).not.toHaveBeenCalled();
+
+    enabled = true;
+    const resumed = await scheduler.tick(new Date('2026-10-30T19:00:00.000Z'));
+    expect(resumed.status).toBe('ran');
+    expect(runOnce).toHaveBeenCalledTimes(1);
+  });
+
   it('功能关闭时 tick 直接 disabled，不碰库', async () => {
     const runOnce = vi.fn(async () => emptyReport);
     const scheduler = schedulerWith(runOnce, { config: { ...config, enabled: false } });
