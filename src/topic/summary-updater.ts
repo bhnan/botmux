@@ -186,12 +186,21 @@ export async function updateTopicFromSource(
   }
   readAfter ??= cursor;
 
+  const readPage = (after: typeof cursor, limit: number) =>
+    deps.source.readMessages(entry, {
+      ...(after ? { after } : {}),
+      limit,
+    });
+
   let page;
   try {
-    page = await deps.source.readMessages(entry, {
-      ...(readAfter ? { after: readAfter } : {}),
-      limit: recheckSinceIso ? limits.recheckLimit : limits.maxMessagesPerBatch,
-    });
+    page = await readPage(readAfter, recheckSinceIso ? limits.recheckLimit : limits.maxMessagesPerBatch);
+    if (page.truncated && recheckSinceIso) {
+      // 重叠窗口太宽（话题消息量超过核查预算）：退回正常增量，本轮放弃
+      // 「缺席即删除」判定，但增量摘要照常推进——不能因为核查读不完就把话题卡死。
+      recheckSinceIso = undefined;
+      page = await readPage(cursor, limits.maxMessagesPerBatch);
+    }
   } catch {
     const checkedAt = now();
     deps.store.recordJobFailure({

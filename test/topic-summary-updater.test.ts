@@ -116,8 +116,12 @@ describe('增量摘要更新', () => {
     expect(first.status).toBe('committed');
 
     const enricher = fakeEnricher([]);
+    const alwaysTruncated = {
+      discoverTopics: async () => [entry],
+      readMessages: vi.fn(async () => ({ messages: [message('om_5', 5)], truncated: true })),
+    } as never;
     const outcome = await updateTopicFromSource(
-      { store, source: fakeSource([{ messages: [message('om_5', 5)], truncated: true }]), enricher },
+      { store, source: alwaysTruncated, enricher },
       entry,
       {},
     );
@@ -330,6 +334,59 @@ describe('增量摘要更新', () => {
     expect(outcome.errorCode).toBe('commit_failed');
     expect(store.jobState('thread:oc_1:om_1')?.nextAttemptAt).toBeTruthy();
     expect(store.getTopic('thread:oc_1:om_1')!.summaries).toEqual([]);
+  });
+
+  it('重叠窗口被预算截断时退回正常增量，不把话题判成窗口不足', async () => {
+    store.upsertTopicDirectory({
+      topicKey: 'thread:oc_1:om_1',
+      chatId: 'oc_1',
+      rootMessageId: 'om_1',
+      title: entry.title,
+      accessPolicyRef: entry.accessPolicyRef,
+      now: '2026-10-01T00:00:00.000Z',
+      coverageStartAt: '2026-10-01T00:00:00.000Z',
+    });
+    const cursorTime = '2026-10-01T00:00:01.000Z';
+    store.commitSummaryMutation({
+      topicKey: 'thread:oc_1:om_1',
+      expectedRevision: 0,
+      mutations: [{ op: 'add', text: '旧摘要', keywords: [], sourceMessageIds: ['om_100'] }],
+      nextCursor: encodeCursor({ createTime: cursorTime, messageIds: ['om_100'] }),
+      sourceThroughAt: cursorTime,
+      generatorKey: 'test-model@v1',
+      now: cursorTime,
+    });
+
+    const readMessages = vi.fn(async (
+      _entry: TopicDirectoryEntry,
+      options: { after?: { createTime: string; messageIds: string[] }; limit: number },
+    ) => {
+      const afterMs = options.after ? Date.parse(options.after.createTime) : NaN;
+      // 重叠窗口读不完（真实源会报 complete=false）；正常游标读得到新消息。
+      if (Number.isFinite(afterMs) && afterMs < Date.parse(cursorTime)) {
+        return { messages: [], truncated: true };
+      }
+      return { messages: [message('om_2', 2, '新消息')], truncated: false };
+    });
+    const enricher = fakeEnricher([
+      { op: 'add', text: '新消息摘要', keywords: [], sourceMessageIds: ['om_2'] },
+    ]);
+    const outcome = await updateTopicFromSource(
+      {
+        store,
+        source: { discoverTopics: async () => [entry], readMessages } as never,
+        enricher,
+      },
+      entry,
+      {},
+    );
+
+    expect(readMessages).toHaveBeenCalledTimes(2);
+    expect(outcome.status).toBe('committed');
+    expect(outcome.invalidated).toBeUndefined();
+    // 旧摘要没有被误删（本轮没做缺席判定），新摘要正常提交。
+    expect(store.getTopic('thread:oc_1:om_1')!.summaries.map(summary => summary.text))
+      .toEqual(['旧摘要', '新消息摘要']);
   });
 
   it('模型调用期间发生撤回：epoch 变化使整批作废，游标不动', async () => {
