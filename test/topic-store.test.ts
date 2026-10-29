@@ -243,6 +243,53 @@ describe('Topic 存储', () => {
     expect(store.pendingEmbeddingTasks(10)).toEqual([]);
   });
 
+  it('删除墓碑阻止晚到的 add/update 把已删内容写回来', () => {
+    addSummary('引用 om_100');
+    store.invalidateSummariesForMessages({
+      topicKey: 'thread:oc_1:om_1',
+      messageIds: ['om_100'],
+      now: '2026-10-02T00:00:00.000Z',
+    });
+    const afterInvalidation = store.getTopic('thread:oc_1:om_1')!;
+
+    const late = store.commitSummaryMutation({
+      topicKey: 'thread:oc_1:om_1',
+      expectedRevision: afterInvalidation.revision,
+      mutations: [
+        // 读到删除前快照的模型结果：引用了已删消息 → 整条丢弃。
+        { op: 'add', text: '来自已删消息的摘要', keywords: [], sourceMessageIds: ['om_100', 'om_101'] },
+        // 只引用存活消息的摘要仍然保留。
+        { op: 'add', text: '存活消息摘要', keywords: [], sourceMessageIds: ['om_102'] },
+      ],
+      nextCursor: 'cursor-2',
+      sourceThroughAt: '2026-10-02T00:10:00.000Z',
+      generatorKey: 'test-model@v1',
+      now: '2026-10-02T00:10:00.000Z',
+    });
+    expect(late.status).toBe('committed');
+    if (late.status !== 'committed') return;
+    expect(late.applied).toEqual({ added: 1, updated: 0 });
+    expect(late.summaries.map(summary => summary.text)).toEqual(['存活消息摘要']);
+
+    // 墓碑跨重启仍然有效（不能只靠进程内集合）。
+    store.close();
+    store = openTopicStore({ path: join(dir, 'topics.sqlite') });
+    const reopened = store.commitSummaryMutation({
+      topicKey: 'thread:oc_1:om_1',
+      expectedRevision: store.getTopic('thread:oc_1:om_1')!.revision,
+      mutations: [{ op: 'add', text: '重启后的迟到摘要', keywords: [], sourceMessageIds: ['om_100'] }],
+      nextCursor: 'cursor-3',
+      sourceThroughAt: '2026-10-03T00:00:00.000Z',
+      generatorKey: 'test-model@v1',
+      now: '2026-10-03T00:00:00.000Z',
+    });
+    expect(reopened.status).toBe('committed');
+    if (reopened.status === 'committed') {
+      expect(reopened.applied).toEqual({ added: 0, updated: 0 });
+      expect(reopened.summaries.map(summary => summary.text)).toEqual(['存活消息摘要']);
+    }
+  });
+
   it('没有摘要引用被删消息时不递增 revision，避免无谓 CAS 冲突', () => {
     addSummary('引用 om_100');
     const before = store.getTopic('thread:oc_1:om_1')!;

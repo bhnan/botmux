@@ -268,6 +268,41 @@ describe('增量摘要更新', () => {
       encodeCursor({ createTime: '2026-10-01T00:00:01.000Z', messageIds: ['om_0'] }),
     );
   });
+  it('删除后的晚到模型结果不能把已删内容写回摘要', async () => {
+    store.upsertTopicDirectory({
+      topicKey: 'thread:oc_1:om_1',
+      chatId: 'oc_1',
+      rootMessageId: 'om_1',
+      title: entry.title,
+      accessPolicyRef: entry.accessPolicyRef,
+      now: '2026-10-01T00:00:00.000Z',
+      coverageStartAt: '2026-10-01T00:00:00.000Z',
+    });
+    store.commitSummaryMutation({
+      topicKey: 'thread:oc_1:om_1',
+      expectedRevision: 0,
+      mutations: [{ op: 'add', text: '含 om_100 的旧摘要', keywords: [], sourceMessageIds: ['om_100'] }],
+      nextCursor: encodeCursor({ createTime: '2026-10-01T00:00:01.000Z', messageIds: ['om_0'] }),
+      sourceThroughAt: '2026-10-01T00:00:01.000Z',
+      generatorKey: 'test-model@v1',
+      now: '2026-10-01T00:00:01.000Z',
+    });
+
+    const source = fakeSource([{
+      messages: [{ ...message('om_100', 2), deleted: true }, message('om_101', 3)],
+    }]);
+    // 模型（模拟删除前读到的快照）仍然把 om_100 当作来源。
+    const enricher = fakeEnricher([
+      { op: 'add', text: '来自已删消息的摘要', keywords: [], sourceMessageIds: ['om_100', 'om_101'] },
+      { op: 'add', text: '只基于存活消息的摘要', keywords: [], sourceMessageIds: ['om_101'] },
+    ]);
+    const outcome = await updateTopicFromSource({ store, source, enricher }, entry, {});
+
+    expect(outcome.status).toBe('committed');
+    expect(outcome.added).toBe(1);
+    expect(store.getTopic('thread:oc_1:om_1')!.summaries.map(summary => summary.text))
+      .toEqual(['只基于存活消息的摘要']);
+  });
 });
 
 describe('失败退避与向量回填', () => {

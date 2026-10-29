@@ -101,6 +101,12 @@ CREATE TABLE IF NOT EXISTS topic_summary_embeddings (
   vector TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS topic_deleted_messages (
+  topic_key TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  deleted_at TEXT NOT NULL,
+  PRIMARY KEY (topic_key, message_id)
+);
 CREATE TABLE IF NOT EXISTS topic_jobs (
   topic_key TEXT PRIMARY KEY,
   attempts INTEGER NOT NULL,
@@ -168,7 +174,13 @@ export interface CommitSummaryMutationInput {
 }
 
 export type CommitSummaryMutationResult =
-  | { status: 'committed'; revision: number; summaries: TopicSummary[] }
+  | {
+    status: 'committed';
+    revision: number;
+    summaries: TopicSummary[];
+    /** 实际落库的变更条数（被删除墓碑挡掉的 add/update 不计入）。 */
+    applied: { added: number; updated: number };
+  }
   | { status: 'conflict'; revision: number }
   | { status: 'missing' };
 
@@ -426,8 +438,19 @@ export function openTopicStore(options: OpenTopicStoreOptions = {}): TopicStore 
           return { status: 'conflict' as const, revision: Number(row.revision) };
         }
 
+        // 删除墓碑：失效之后才到达的模型结果（并发/重试）不得把已删内容写回来。
+        // 只要变更引用了墓碑消息，整条 add/update 丢弃——改写来源 id 会让正文与
+        // 来源不一致，反而更难排查。
+        const tombstoned = new Set(
+          (db.prepare('SELECT message_id FROM topic_deleted_messages WHERE topic_key = ?')
+            .all(input.topicKey) as Array<{ message_id: string }>).map(entry => entry.message_id),
+        );
+        let appliedAdded = 0;
+        let appliedUpdated = 0;
+
         for (const mutation of input.mutations) {
           if (mutation.op === 'noop') continue;
+          if (tombstoned.size > 0 && mutation.sourceMessageIds.some(id => tombstoned.has(id))) continue;
           if (mutation.op === 'add') {
             db.prepare(
               `INSERT INTO topic_summaries
@@ -442,6 +465,7 @@ export function openTopicStore(options: OpenTopicStoreOptions = {}): TopicStore 
               input.now,
               input.generatorKey,
             );
+            appliedAdded += 1;
             continue;
           }
           const existing = db
@@ -466,6 +490,7 @@ export function openTopicStore(options: OpenTopicStoreOptions = {}): TopicStore 
             mutation.id,
             input.topicKey,
           );
+          appliedUpdated += 1;
           if (textChanged) {
             // 正文变了：旧向量对新正文无意义，直接删除（读路径还会按 hash 二次校验）。
             db.prepare('DELETE FROM topic_summary_embeddings WHERE summary_id = ?').run(mutation.id);
@@ -485,6 +510,7 @@ export function openTopicStore(options: OpenTopicStoreOptions = {}): TopicStore 
           status: 'committed' as const,
           revision: nextRevision,
           summaries: topic?.summaries ?? [],
+          applied: { added: appliedAdded, updated: appliedUpdated },
         };
       });
     },
@@ -497,6 +523,15 @@ export function openTopicStore(options: OpenTopicStoreOptions = {}): TopicStore 
           .get(input.topicKey) as TopicRow | undefined;
         if (!row) return { invalidated: 0, revision: 0 };
         if (deleted.size === 0) return { invalidated: 0, revision: Number(row.revision) };
+
+        // 先落墓碑，再删摘要：即使在删除摘要期间进程崩溃，后续提交也不会把
+        // 同一条被删消息的内容写回来。
+        const tombstone = db.prepare(
+          `INSERT INTO topic_deleted_messages (topic_key, message_id, deleted_at)
+             VALUES (?, ?, ?)
+           ON CONFLICT(topic_key, message_id) DO NOTHING`,
+        );
+        for (const messageId of deleted) tombstone.run(input.topicKey, messageId, input.now);
 
         const affected: string[] = [];
         for (const summary of readSummaryRows(input.topicKey)) {
@@ -707,6 +742,7 @@ export function openTopicStore(options: OpenTopicStoreOptions = {}): TopicStore 
         db.prepare('DELETE FROM topic_summaries WHERE topic_key = ?').run(topicKey);
         db.prepare('DELETE FROM topics WHERE topic_key = ?').run(topicKey);
         db.prepare('DELETE FROM topic_jobs WHERE topic_key = ?').run(topicKey);
+        db.prepare('DELETE FROM topic_deleted_messages WHERE topic_key = ?').run(topicKey);
       });
     },
 

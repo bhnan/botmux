@@ -78,16 +78,6 @@ export function computeRetryAtIso(attempts: number, nowIso: string): string {
   return new Date(Date.parse(nowIso) + backoffMs).toISOString();
 }
 
-function countMutations(mutations: readonly SummaryMutation[]): { added: number; updated: number } {
-  let added = 0;
-  let updated = 0;
-  for (const mutation of mutations) {
-    if (mutation.op === 'add') added += 1;
-    if (mutation.op === 'update') updated += 1;
-  }
-  return { added, updated };
-}
-
 /**
  * 冲突重试时把 update 降级：目标摘要正文已被别处改写 → 这条 update 的语义前提没了，
  * 直接丢弃（等价 noop），而不是拿旧前提覆盖新正文。
@@ -330,7 +320,7 @@ export async function updateTopicFromSource(
 
   if (commit.status === 'committed') {
     deps.store.clearJobFailure(topicKey, checkedAt);
-    const counts = countMutations(mutations);
+    const counts = commit.applied;
     return {
       topicKey,
       status: 'committed',
@@ -360,7 +350,7 @@ export async function updateTopicFromSource(
     });
     if (retried.status === 'committed') {
       deps.store.clearJobFailure(topicKey, checkedAt);
-      const counts = countMutations(reconciled);
+      const counts = retried.applied;
       return {
         topicKey,
         status: 'committed',

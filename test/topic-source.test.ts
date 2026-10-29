@@ -158,6 +158,20 @@ describe('daemon 源：增量契约的完整性判定', () => {
     expect(page.truncated).toBe(true);
   });
 
+  it('源侧标记 deleted 的消息原样透传（供更新器失效旧摘要）', async () => {
+    const { source } = build({
+      messages: [
+        { messageId: 'om_101', createTime: Date.parse('2026-10-01T00:01:01.000Z'), content: '已撤回内容', deleted: true },
+        { messageId: 'om_102', createTime: Date.parse('2026-10-01T00:02:01.000Z'), content: '正常内容' },
+      ],
+    });
+    const page = await source.readMessages(entry, { limit: 10 });
+    expect(page.messages.map(message => [message.messageId, message.deleted === true])).toEqual([
+      ['om_101', true],
+      ['om_102', false],
+    ]);
+  });
+
   it('complete=true 时可以正常提交，并带回原生话题 id', async () => {
     const { source } = build({
       complete: true,
