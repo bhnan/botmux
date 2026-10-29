@@ -9,6 +9,40 @@ import {
 import { findExecutableLinkRefs } from '../../src/services/link-ref-resolver.js';
 import { enforceFinalLinkIntegrity } from '../../src/services/final-link-integrity.js';
 
+// Opt-in file policies exercise the CLI's pre-read limit and the second limit
+// after a file grows. Other fixture callers retain the actual fs behavior.
+const forbiddenDiffRead = process.env.BOTMUX_TEST_FORBID_DIFF_READ;
+if (forbiddenDiffRead) {
+  const originalRead = fs.readFileSync.bind(fs);
+  fs.readFileSync = ((path: fs.PathOrFileDescriptor, options?: unknown) => {
+    if (String(path) === forbiddenDiffRead) throw new Error('large diff must not be read in full');
+    return originalRead(path, options as never);
+  }) as typeof fs.readFileSync;
+  syncBuiltinESMExports();
+}
+const growingDiff = process.env.BOTMUX_TEST_GROW_DIFF_AFTER_STAT;
+if (growingDiff) {
+  const originalStat = fs.statSync.bind(fs);
+  let grown = false;
+  fs.statSync = ((path: fs.PathLike, options?: unknown) => {
+    const result = originalStat(path, options as never);
+    if (String(path) === growingDiff && !grown) {
+      grown = true;
+      fs.writeFileSync(growingDiff, '--- a/spec.md\n+++ b/spec.md\n@@ -0,0 +1 @@\n+' + 'x'.repeat(2 * 1024 * 1024) + '\n');
+    }
+    return result;
+  }) as typeof fs.statSync;
+  syncBuiltinESMExports();
+}
+if ((globalThis as { Bun?: unknown }).Bun && (forbiddenDiffRead || growingDiff)) {
+  // Bun does not synchronize named fs imports with syncBuiltinESMExports.
+  // Register the same opt-in fs surface using its actual module-mock API.
+  const bunTestModule = 'bun:test';
+  const { mock } = await import(bunTestModule);
+  const mockedFs = { ...fs, default: fs };
+  mock.module('node:fs', () => mockedFs);
+}
+
 // The >MAX_STRING_LENGTH regression uses a sparse attachment to prove the CLI
 // never decodes it as UTF-8. Keep the later upload path lightweight: production
 // uploadFile still asks fs for bytes, but this fixture only needs to exercise

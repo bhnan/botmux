@@ -8,6 +8,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import assert from 'node:assert/strict';
+import { customFinalCardError } from '../src/im/lark/final-card-sections.js';
 import { homedir, tmpdir } from 'node:os';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -1812,6 +1813,13 @@ describe('unified diff reply cards', () => {
     expect(result.card.body.elements.some(element => element.tag === 'collapsible_panel')).toBe(true);
   });
 
+  it.each(['#', '##'])('keeps %s summary headings displayable in final cards', heading => {
+    const result = buildDiffCard(parseUnifiedDiff(BASIC), { summary: `${heading} 修改结果\n\n已更新需求。` });
+    expect(customFinalCardError(result.card as unknown as Record<string, unknown>)).toBeUndefined();
+    expect(JSON.stringify(result.card)).not.toContain('botmux_md_h');
+    expect(JSON.stringify(result.card)).toContain('修改结果');
+  });
+
   it('统一 diff 的真实计数、路径、上下文和空行', () => {
     const files = parseUnifiedDiff(BASIC);
     assert.equal(files[0].path, 'docs/stress_test.md');
@@ -1890,7 +1898,8 @@ describe('unified diff reply cards', () => {
   it('无差异、非法 diff、hunk 不完整和参数边界', () => {
     assert.equal(buildDiffCard(parseUnifiedDiff('')).stats.files, 0);
     for (const input of ['not a diff', '--- a/x\n@@ -1 +1 @@\n-a\n+b\n', '--- a/x\n+++ b/x\n@@ -1,2 +1 @@\n-a\n+b\n', '--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n+extra\n']) assert.throws(() => parseUnifiedDiff(input));
-    assert.throws(() => parseUnifiedDiff('x'.repeat(2 * 1024 * 1024 + 1)));
+    const oversizedValidDiff = '--- a/spec.md\n+++ b/spec.md\n@@ -0,0 +1 @@\n+' + 'x'.repeat(2 * 1024 * 1024) + '\n';
+    assert.throws(() => parseUnifiedDiff(oversizedValidDiff), /diff 输入超过 2MiB/);
     assert.throws(() => buildDiffCard([], {maxLines: 0}));
     assert.throws(() => buildDiffCard([], {summary: '中'.repeat(1_400)}));
   });

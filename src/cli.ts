@@ -9430,6 +9430,7 @@ import {
   parseUnifiedDiff,
   MAX_DIFF_INPUT_BYTES,
   type DiffFile,
+  type DiffCardResult,
   CARD_LATE_CHROME_RESERVE_BYTES,
   createReplyCard,
   fitChartsToCardBudget,
@@ -9569,7 +9570,7 @@ async function relaySend(
     voice: rest.includes('--voice'), slash: rest.includes('--slash'),
   });
   if (diffError) { console.error(`botmux send: ${diffError}`); process.exit(2); }
-  const diffFiles = diff.path ? readSendDiffFile(diff.path) : undefined;
+  const diffInput = diff.path ? readSendDiffFile(diff.path) : undefined;
   const hasCard = cardJsonArg !== undefined || cardFile !== undefined || diff.requested;
   if (flagPresentButValueMissing(rest, '--plugin-card-action')) {
     console.error('relay: --plugin-card-action 需要 plugin id');
@@ -9615,8 +9616,8 @@ async function relaySend(
       : await readStdin();
   }
   content = stripTrailingOaiMemoryCitation(content);
-  if (diffFiles) {
-    cardContent = JSON.stringify(buildDiffCard(diffFiles, { summary: extractCardText(content) }).card);
+  if (diffInput) {
+    cardContent = JSON.stringify(buildSendDiffCard(diffInput, extractCardText(content)).card);
     content = '';
   }
   const preparedCardContent = !hasCard && !rest.includes('--voice')
@@ -10216,15 +10217,29 @@ function reportCardRenderDiagnostics(diagnostics: CardRenderDiagnostic[]): void 
   }
 }
 
-function readSendDiffFile(path: string): DiffFile[] {
+type SendDiffInput = { files: DiffFile[]; inputBytes?: number; inputName: string };
+
+function readSendDiffFile(path: string): SendDiffInput {
   try {
     const stat = statSync(path);
-    if (!stat.isFile() || stat.size > MAX_DIFF_INPUT_BYTES) throw new Error('diff 需要不超过 2MiB 的普通 UTF-8 文件');
+    if (!stat.isFile()) throw new Error('diff 需要普通 UTF-8 文件');
+    const inputName = basename(path);
+    if (stat.size > MAX_DIFF_INPUT_BYTES) return { files: [], inputBytes: stat.size, inputName };
     const bytes = readFileSync(path);
-    if (bytes.length > MAX_DIFF_INPUT_BYTES) throw new Error('diff 输入超过 2MiB');
-    return parseUnifiedDiff(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+    if (bytes.length > MAX_DIFF_INPUT_BYTES) return { files: [], inputBytes: bytes.length, inputName };
+    return { files: parseUnifiedDiff(new TextDecoder('utf-8', { fatal: true }).decode(bytes)), inputName };
   } catch (error) {
     console.error(`botmux send: ${error instanceof Error ? error.message : String(error)}`);
+    process.exit(2);
+  }
+}
+
+function buildSendDiffCard(input: SendDiffInput, summary: string): DiffCardResult {
+  try {
+    return buildDiffCard(input.files, { summary, inputBytes: input.inputBytes, inputName: input.inputName });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    console.error(`botmux send: ${reason.replace(/\s+/g, ' ')}`);
     process.exit(2);
   }
 }
@@ -10239,7 +10254,7 @@ async function sendDryRun(rest: string[]): Promise<void> {
     voice: rest.includes('--voice'), slash: rest.includes('--slash'),
   });
   if (diffError) { console.error(`botmux send: ${diffError}`); process.exit(2); }
-  const diffFiles = diff.path ? readSendDiffFile(diff.path) : undefined;
+  const diffInput = diff.path ? readSendDiffFile(diff.path) : undefined;
   if (argValue(rest, '--card-file') !== undefined || argValue(rest, '--card-json') !== undefined) {
     console.error('botmux send --dry-run 只渲染 markdown 正文，不能与 --card-file/--card-json 混用');
     process.exit(2);
@@ -10259,7 +10274,7 @@ async function sendDryRun(rest: string[]): Promise<void> {
       : await readStdin();
   }
   content = extractCardText(stripTrailingOaiMemoryCitation(content));
-  if (!content.trim() && !diffFiles) {
+  if (!content.trim() && !diffInput) {
     console.error('botmux send --dry-run: 正文为空');
     process.exit(2);
   }
@@ -10268,7 +10283,7 @@ async function sendDryRun(rest: string[]): Promise<void> {
   const localHomeLinkMode: LocalHomeLinkMode = configuredLinkMode === 'disabled'
     ? 'disabled'
     : configuredLinkMode === 'lexical' ? 'lexical' : 'filesystem';
-  const rendered = diffFiles ? buildDiffCard(diffFiles, { summary: content }) : undefined;
+  const rendered = diffInput ? buildSendDiffCard(diffInput, content) : undefined;
   const card = rendered?.card ?? createReplyCard(buildCardBodyElements(content, process.cwd(), localHomeLinkMode, undefined, diagnostics));
   // Same sizing as a real send: Feishu request body incl. envelope.
   const budget = fitChartsToCardBudget(card, { reserveBytes: CARD_LATE_CHROME_RESERVE_BYTES, diagnostics });
@@ -10751,7 +10766,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     voice: rest.includes('--voice'), slash: rest.includes('--slash'),
   });
   if (diffError) { console.error(`botmux send: ${diffError}`); process.exit(2); }
-  const diffFiles = diff.path ? readSendDiffFile(diff.path) : undefined;
+  const diffInput = diff.path ? readSendDiffFile(diff.path) : undefined;
   if (customCardRequested && (images.length > 0 || files.length > 0 || videos.length > 0 || videoCovers.length > 0)) {
     console.error('botmux send: --card-file/--card-json 暂不与 --images/--files/--videos 混用；请把素材先上传为飞书资源并写入卡片 JSON');
     process.exit(2);
@@ -11444,8 +11459,8 @@ async function cmdSend(rest: string[]): Promise<void> {
       content = await readStdin();
     }
   }
-  if (diffFiles) {
-    customCard = { ...buildDiffCard(diffFiles, { summary: extractCardText(stripTrailingOaiMemoryCitation(content)) }).card };
+  if (diffInput) {
+    customCard = { ...buildSendDiffCard(diffInput, extractCardText(stripTrailingOaiMemoryCitation(content))).card };
   }
   const customFinal = !!customCard && effectiveResponseKind === 'final';
   if (customFinal) {

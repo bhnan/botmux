@@ -16,7 +16,7 @@ src/services/send-policy.ts：parseDiffFlag/diffUsageError；src/im/lark/md-card
 生成纯展示 schema 2.0，无 callback。dry-run 只本地解析并返回 JSON，不走会话/relay/provider。真实发送经过既有授权、路由、final、mention、预期链接、幂等和回放处理。与 --layout、--as、文档评论等组合沿用既有卡片边界。
 
 ## Failure modes and edge cases
-2MiB 输入限制、严格 UTF-8、hunk 数字和行数验证、Git quoted UTF-8、增删文件、rename/binary 说明、行数和字节双重截断。空 diff 不伪造变化。媒体/附件先单独交付再 final；不新增上传或补偿写操作。
+逐行解析最多2MiB，超大文件采用提示卡片并保留完整原文件；正常输入严格 UTF-8、hunk 数字和行数验证、Git quoted UTF-8、增删文件、rename/binary 说明、行数和字节双重截断。空 diff 不伪造变化。媒体/附件先单独交付再 final；不新增上传或补偿写操作。
 
 ## Security, compliance, and operational rules
 用户内容仅作数据，无 shell。原始 diff 在调用时读取一次并作为确定性渲染输入。不会改变身份或 durable outbox 语义。live daemon 切换需单独授权（可能影响同机所有 Bot），实现和验证完成后再提交具体部署结果。
@@ -34,3 +34,11 @@ src/services/send-policy.ts：parseDiffFlag/diffUsageError；src/im/lark/md-card
 卡片模块进一步合并：已移除独立 diff-card.ts 与独立 DiffCard 外壳类型。diff 正文和摘要使用 md-card 内现有构建函数，整张卡片配置使用 createReplyCard。diff 用例合并到 md-card.test.ts；本轮卡片模块及发送相关检查为 448 项通过、2 项 Linux 专用跳过，开发版完整构建通过；v3.54.0 候选核心检查 264 项通过。
 
 摘要现在经过通用 Markdown 正规化（例如清理末尾无显示意义的换行），CLI 用例对照同一 body builder 验证摘要优先级。diff 行内容的换行/转义保留原实现。
+
+## PR反馈修复：标题、错误及超大diff
+
+- diff摘要继续使用通用Markdown显示，但去掉生成的宿主element_id，避免H1/H2标题触发custom final保留ID校验；不放宽全局自定义卡片校验。标题仍可见，回读不再保留该摘要的宿主层级ID。
+- CLI内统一卡片构建错误处理，正常发送、dry-run和relay均以单行原因+退出码2反馈用户输入或预算错误，不输出内部堆栈。
+- 文件超过2MiB时，不解析全文也不截到半个hunk；输出大小和预览上限说明卡片。stats的files/added/removed为null，preview.reason为input_too_large，明确统计不可用。完整文件不被修改，仍由Agent先交付附件/链接。
+- 文件stat检查后的读取结果也保留长度保护，文件增长时使用相同提示。直接调用parseUnifiedDiff的文本输入仍严格执行2MiB守卫。
+- diff与plugin-card-action的当前发送互斥已先补回归并验证，不增加callback能力。

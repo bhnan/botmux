@@ -162,8 +162,8 @@ export interface DiffFile {
 export interface DiffCardResult {
   card: ReplyCardV2;
   bytes: number;
-  stats: { files: number; added: number; removed: number };
-  preview: { files: number; rows: number; truncated: boolean; omittedFiles: number };
+  stats: { files: number | null; added: number | null; removed: number | null };
+  preview: { files: number; rows: number; truncated: boolean; omittedFiles: number | null; reason?: 'input_too_large'; inputBytes?: number };
 }
 
 export const MAX_DIFF_INPUT_BYTES = 2 * 1024 * 1024;
@@ -320,15 +320,31 @@ function renderDiffRow(row: DiffRow): string {
   return `<font color='${color}'>${prefix}${content}</font>`;
 }
 
-export function buildDiffCard(files: DiffFile[], {summary = '', maxLines = 60}: { summary?: string; maxLines?: number } = {}): DiffCardResult {
+export function buildDiffCard(files: DiffFile[], {summary = '', maxLines = 60, inputBytes, inputName}: { summary?: string; maxLines?: number; inputBytes?: number; inputName?: string } = {}): DiffCardResult {
   if (Buffer.byteLength(summary, 'utf8') > 4_000) throw new Error('摘要超过 4000 UTF-8 字节');
   if (!Number.isInteger(maxLines) || maxLines < 1 || maxLines > 200) throw new Error('max-lines 需要为 1–200');
+  // The custom final validator reserves botmux_* IDs for host sections.
+  // Preserve the shared heading presentation without carrying those IDs.
+  const summaryElements = summary
+    ? buildCardBodyElements(summary).map(({ element_id: _elementId, ...element }) => element)
+    : [];
+  if (inputBytes !== undefined && inputBytes > MAX_DIFF_INPUT_BYTES) {
+    const label = inputName ? escapeDiffMarkdown(displayDiffPath(inputName)) : 'diff 文件';
+    const card = createReplyCard([
+      ...summaryElements,
+      { tag: 'markdown', content: '**差异文件较大，已省略逐行预览**' },
+      { tag: 'markdown', content: `${label} 的大小为 **${(inputBytes / (1024 * 1024)).toFixed(2)} MiB**，超过 **2 MiB** 的预览上限。\n\n未解析完整差异，文件数和增删统计暂不可用。请查看本轮的完整 diff 文件。` },
+    ]);
+    const bytes = Buffer.byteLength(JSON.stringify(card), 'utf8');
+    if (bytes > DIFF_PREVIEW_BUDGET_BYTES) throw new Error('卡片摘要超过预览预算');
+    return { card, bytes, stats: { files: null, added: null, removed: null }, preview: { files: 0, rows: 0, truncated: true, omittedFiles: null, reason: 'input_too_large', inputBytes } };
+  }
   const stats = {files: files.length, added: files.reduce((n, f) => n + f.added, 0), removed: files.reduce((n, f) => n + f.removed, 0)};
   let count = Math.min(files.length, 20);
   let limit = maxLines;
   function assemble(): DiffCardResult {
     const elements: Record<string, unknown>[] = [];
-    if (summary) elements.push(...buildCardBodyElements(summary));
+    elements.push(...summaryElements);
     elements.push({tag: 'markdown', content: files.length ? `共 ${stats.files} 个文件，+${stats.added} / -${stats.removed}。完整内容请查看原始 diff 文件。` : '未检测到内容差异。'});
     let truncated = count < files.length;
     let shownRows = 0;

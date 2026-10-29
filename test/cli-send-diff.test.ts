@@ -15,15 +15,19 @@ const captured = (stdout: unknown) => String(stdout).split('\n')
   .filter(line => line.startsWith('CAPTURE_REPLY='))
   .map(line => JSON.parse(line.slice('CAPTURE_REPLY='.length)));
 
-function preview(args: string[], bytes: string | Buffer = patch, input = '') {
+function preview(args: string[], bytes: string | Buffer = patch, input = '', summaryContent = 'file summary\n', filePolicy?: 'forbid_read' | 'grow_after_stat') {
   const root = mkdtempSync(join(tmpdir(), 'botmux-diff-dry-'));
   try {
     const path = join(root, 'change.diff');
     const summary = join(root, 'summary.md');
     writeFileSync(path, bytes);
-    writeFileSync(summary, 'file summary\n');
-    return spawnSyncTsScript(cli, ['send', '--dry-run', ...args.map(arg => arg.replace('@diff', path).replace('@summary', summary))], {
-      env: { PATH: process.env.PATH, SESSION_DATA_DIR: join(root, 'data'), BOTS_CONFIG: join(root, 'missing.json') },
+    writeFileSync(summary, summaryContent);
+    return spawnSyncTsScript(filePolicy ? fixture : cli, ['send', '--dry-run', ...args.map(arg => arg.replace('@diff', path).replace('@summary', summary))], {
+      env: {
+        PATH: process.env.PATH, SESSION_DATA_DIR: join(root, 'data'), BOTS_CONFIG: join(root, 'missing.json'),
+        ...(filePolicy === 'forbid_read' ? { BOTMUX_TEST_FORBID_DIFF_READ: path } : {}),
+        ...(filePolicy === 'grow_after_stat' ? { BOTMUX_TEST_GROW_DIFF_AFTER_STAT: path } : {}),
+      },
       input, encoding: 'utf8', timeout: 30_000,
     });
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -77,9 +81,53 @@ describe('send --diff CLI', () => {
   });
 
   it.each([
-    { cliId: 'codex', scope: 'thread' },
-    { cliId: 'claude-code', scope: 'chat' },
-  ])('uses ordinary final/mention/replay for $cliId/$scope', ({ cliId, scope }) => {
+    { name: '摘要字节超限', summary: 'x'.repeat(4001), reason: '摘要超过 4000' },
+    {
+      name: '表格渲染超预算',
+      summary: [
+        '|' + Array.from({ length: 200 }, (_, i) => 'c' + i).join('|') + '|',
+        '|' + Array(200).fill('---').join('|') + '|',
+        ...Array(4).fill('|' + Array(200).fill('1').join('|') + '|'),
+      ].join('\n'),
+      reason: '卡片摘要超过预览预算',
+    },
+  ])('reports $name as a clean input error', ({ summary, reason }) => {
+    if (reason === '卡片摘要超过预览预算') expect(Buffer.byteLength(summary)).toBeLessThan(4000);
+    const result = preview(['--diff', '@diff', '--content-file', '@summary'], patch, '', summary);
+    expect(result.status).toBe(2);
+    expect(String(result.stderr)).toContain('botmux send: ' + reason);
+    expect(String(result.stderr)).not.toMatch(/\n\s+at\s|md-card\.ts:\d/);
+    expect(captured(result.stdout)).toHaveLength(0);
+  });
+
+  it('shows a notice rather than false counts for a file larger than the preview limit', () => {
+    const input = '--- a/spec.md\n+++ b/spec.md\n@@ -0,0 +1 @@\n+' + 'x'.repeat(2 * 1024 * 1024) + '\n';
+    const result = preview(['--diff', '@diff', '需求文档的完整差异较大。'], input, '', '', 'forbid_read');
+    expect(result.status, String(result.stderr)).toBe(0);
+    const output = JSON.parse(String(result.stdout));
+    expect(output.diff.preview.reason).toBe('input_too_large');
+    expect(output.diff.stats).toEqual({ files: null, added: null, removed: null });
+    expect(JSON.stringify(output.card)).toContain('2 MiB');
+    expect(JSON.stringify(output.card)).not.toContain('未检测到内容差异');
+    expect(output.fits).toBe(true);
+  });
+
+  it('shows the same notice when the diff grows between stat and reading', () => {
+    const result = preview(['--diff', '@diff'], patch, '', '', 'grow_after_stat');
+    expect(result.status, String(result.stderr)).toBe(0);
+    const output = JSON.parse(String(result.stdout));
+    expect(output.diff.preview.reason).toBe('input_too_large');
+    expect(output.diff.preview.inputBytes).toBeGreaterThan(2 * 1024 * 1024);
+    expect(output.diff.stats).toEqual({ files: null, added: null, removed: null });
+    expect(output.fits).toBe(true);
+  });
+
+  it.each([
+    { cliId: 'codex', scope: 'thread', summary: '已修改', largeInput: false },
+    { cliId: 'claude-code', scope: 'chat', summary: '已修改', largeInput: false },
+    { cliId: 'codex', scope: 'thread', summary: '## 摘要\n\n已修改', largeInput: false },
+    { cliId: 'codex', scope: 'thread', summary: '## 摘要\n\n已修改', largeInput: true },
+  ])('uses ordinary final/mention/replay for $cliId/$scope/$summary large=$largeInput', ({ cliId, scope, summary, largeInput }) => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-diff-send-'));
     const dataDir = join(root, 'data');
     const appId = 'cli_diff_test';
@@ -100,12 +148,21 @@ describe('send --diff CLI', () => {
         turnReplyContexts: { [turnId]: { replyTargetSenderOpenId: 'ou_requester', replyTargetSenderIsBot: false } },
       } });
       const path = join(root, 'change.diff');
-      writeFileSync(path, patch);
-      const run = (extra: string[] = [], kind = 'final') => spawnSyncTsScript(fixture, ['send', '--diff', path, '--response-kind', kind, '--mention-back', ...extra, '已修改'], {
+      writeFileSync(path, largeInput ? '--- a/spec.md\n+++ b/spec.md\n@@ -0,0 +1 @@\n+' + 'x'.repeat(2 * 1024 * 1024) + '\n' : patch);
+      const run = (extra: string[] = [], kind = 'final', body = summary) => spawnSyncTsScript(fixture, ['send', '--diff', path, '--response-kind', kind, '--mention-back', ...extra, body], {
         cwd: fileURLToPath(new URL('..', import.meta.url)),
         env: { PATH: process.env.PATH, SESSION_DATA_DIR: dataDir, BOTS_CONFIG: join(root, 'bots.json'), BOTMUX_SESSION_ID: sessionId, BOTMUX_TURN_ID: turnId, BOTMUX_LARK_APP_ID: appId },
         encoding: 'utf8', timeout: 30_000,
       });
+      const incompatiblePlugin = run(['--plugin-card-action', 'example']);
+      expect(incompatiblePlugin.status, String(incompatiblePlugin.stderr)).toBe(2);
+      expect(captured(incompatiblePlugin.stdout)).toHaveLength(0);
+      expect(String(incompatiblePlugin.stderr)).toContain('--plugin-card-action');
+      const oversizedSummary = run([], 'final', 'x'.repeat(4001));
+      expect(oversizedSummary.status).toBe(2);
+      expect(String(oversizedSummary.stderr)).toContain('botmux send: 摘要超过 4000');
+      expect(String(oversizedSummary.stderr)).not.toMatch(/\n\s+at\s|md-card\.ts:\d/);
+      expect(captured(oversizedSummary.stdout)).toHaveLength(0);
       const attention = run(['--attention=decision'], 'progress');
       expect(attention.status, String(attention.stderr)).toBe(0);
       expect(captured(attention.stdout)).toHaveLength(1);
@@ -115,8 +172,10 @@ describe('send --diff CLI', () => {
       const requests = captured(first.stdout);
       expect(requests).toHaveLength(1);
       const card = JSON.parse(requests[0].body.content);
-      expect(card.body.elements[0]).toMatchObject({ tag: 'markdown', content: '已修改' });
-      expect(card.body.elements.some((element: { tag: string }) => element.tag === 'collapsible_panel')).toBe(true);
+      expect(JSON.stringify(card)).toContain('已修改');
+      expect(JSON.stringify(card)).not.toContain('botmux_md_h');
+      if (largeInput) expect(JSON.stringify(card)).toContain('已省略逐行预览');
+      else expect(card.body.elements.some((element: { tag: string }) => element.tag === 'collapsible_panel')).toBe(true);
       expect(requests[0].body.content.match(/"element_id":"botmux_reply_footer"/g)).toHaveLength(1);
       expect((requests[0].body.content.match(/<at id=ou_requester>/g) ?? [])).toHaveLength(1);
       const replay = run();
