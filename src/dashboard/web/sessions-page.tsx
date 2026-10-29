@@ -1708,11 +1708,168 @@ const KANBAN_ICONS: SessionsKanbanIcons = {
   unlock: ICON.unlock,
 };
 
+export type TopicSearchMatch = {
+  summaryId: string;
+  text: string;
+  sourceMessageIds: string[];
+};
+
+export type TopicSearchHit = {
+  topicKey: string;
+  title: string;
+  url?: string;
+  matches: TopicSearchMatch[];
+  updatedAt: string;
+  sourceThroughAt?: string;
+  degraded?: string[];
+};
+
+export type TopicSearchCoverage = {
+  state: 'complete' | 'partial';
+  unindexedKnownTopics: number;
+};
+
+export type TopicSearchStatus = 'idle' | 'loading' | 'ready' | 'error' | 'disabled';
+
+export type TopicSearchViewState = {
+  status: TopicSearchStatus;
+  query: string;
+  requestId: number;
+  items: TopicSearchHit[];
+  coverage: TopicSearchCoverage;
+  degradedReasons: string[];
+};
+
+export const initialTopicSearchState: TopicSearchViewState = {
+  status: 'idle',
+  query: '',
+  requestId: 0,
+  items: [],
+  coverage: { state: 'complete', unindexedKnownTopics: 0 },
+  degradedReasons: [],
+};
+
+export type TopicSearchAction =
+  | { type: 'start'; query: string; requestId: number }
+  | {
+    type: 'success';
+    query: string;
+    requestId: number;
+    items: TopicSearchHit[];
+    coverage: TopicSearchCoverage;
+    degradedReasons: string[];
+  }
+  | { type: 'failure'; query: string; requestId: number; disabled: boolean }
+  | { type: 'reset' };
+
+function topicSearchActionIsCurrent(
+  state: TopicSearchViewState,
+  action: Extract<TopicSearchAction, { type: 'success' | 'failure' }>,
+): boolean {
+  return state.status === 'loading'
+    && state.requestId === action.requestId
+    && state.query === action.query;
+}
+
+/** Request-scoped reducer: a response only lands while its query/request id is
+ * still the in-flight one. A late answer for a superseded query is dropped
+ * rather than overwriting the newer result (same pattern as the history drawer). */
+export function topicSearchReducer(
+  state: TopicSearchViewState,
+  action: TopicSearchAction,
+): TopicSearchViewState {
+  switch (action.type) {
+    case 'reset':
+      return state.status === 'idle' && state.query === '' ? state : initialTopicSearchState;
+    case 'start':
+      return {
+        ...initialTopicSearchState,
+        status: 'loading',
+        query: action.query,
+        requestId: action.requestId,
+      };
+    case 'success':
+      if (!topicSearchActionIsCurrent(state, action)) return state;
+      return {
+        ...state,
+        status: 'ready',
+        items: action.items,
+        coverage: action.coverage,
+        degradedReasons: action.degradedReasons,
+      };
+    case 'failure':
+      if (!topicSearchActionIsCurrent(state, action)) return state;
+      return {
+        ...state,
+        status: action.disabled ? 'disabled' : 'error',
+        items: [],
+        coverage: initialTopicSearchState.coverage,
+        degradedReasons: [],
+      };
+  }
+}
+
+/** Local substring filtering stays in charge unless a successful content
+ * search for exactly this query is in effect. Empty / blank queries never hit
+ * the API (the server rejects them with 400). */
+export function effectiveSessionSearchQuery(
+  q: string,
+  search: TopicSearchViewState | undefined,
+): string {
+  const trimmed = q.trim();
+  if (!trimmed) return '';
+  if (search?.status === 'ready' && search.query === trimmed) return '';
+  return q.toLowerCase();
+}
+
+/** POST /api/topic-search → reducer action. `null` for a blank query, so the
+ * caller can short-circuit before touching the network. */
+export async function requestTopicSearch(
+  query: string,
+  requestId: number,
+  fetchImpl: (input: any, init?: any) => Promise<any> = fetch,
+): Promise<TopicSearchAction | null> {
+  const trimmed = query.trim();
+  if (!trimmed) return null;
+  try {
+    const response = await fetchImpl('/api/topic-search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: trimmed, limit: 30 }),
+    });
+    // A 401 gate answers with HTML: `json()` throws and lands in the catch,
+    // which must fall back to the local list rather than breaking the page.
+    const body = await response.json().catch(() => null);
+    if (response.status === 403 && body?.error === 'disabled') {
+      return { type: 'failure', query: trimmed, requestId, disabled: true };
+    }
+    if (!response.ok || body?.ok !== true) {
+      return { type: 'failure', query: trimmed, requestId, disabled: false };
+    }
+    const items = Array.isArray(body.items) ? body.items as TopicSearchHit[] : [];
+    const coverage: TopicSearchCoverage = body.coverage?.state === 'partial'
+      ? {
+        state: 'partial',
+        unindexedKnownTopics: Math.max(0, Number(body.coverage.unindexedKnownTopics) || 0),
+      }
+      : { state: 'complete', unindexedKnownTopics: 0 };
+    const degradedReasons = Array.isArray(body.degradedReasons)
+      ? body.degradedReasons.map((reason: unknown) => String(reason))
+      : [];
+    return { type: 'success', query: trimmed, requestId, items, coverage, degradedReasons };
+  } catch {
+    return { type: 'failure', query: trimmed, requestId, disabled: false };
+  }
+}
+
 type TopicGroupsViewProps = {
   rows: SessionRow[];
   relationRows?: SessionRow[];
   selected: Set<string>;
   hidden: boolean;
+  /** Content-search state. Absent ⇒ the original local-filter-only view. */
+  search?: TopicSearchViewState;
+  onSearchRetry?: () => void;
   onToggleSelect: (row: SessionRow) => void;
   onOpen: (row: SessionRow) => void;
   onHistory: (row: SessionRow) => void;
@@ -1722,12 +1879,112 @@ type TopicGroupsViewProps = {
   onClose: (row: SessionRow, button?: HTMLButtonElement) => void;
 };
 
+function TopicSearchBanner(props: {
+  search: TopicSearchViewState;
+  onRetry?: () => void;
+}): React.JSX.Element | null {
+  const search = props.search;
+  if (search.status === 'loading') {
+    return <LoadingState label={t('sessions.topic.searching')} className="sessions-topic-search-state" compact />;
+  }
+  if (search.status === 'error') {
+    return (
+      <div className="sessions-topic-search-state error" role="alert">
+        <span>{t('sessions.topic.searchFailed')}</span>
+        <button type="button" className="sessions-topic-search-retry" onClick={props.onRetry}>
+          {t('sessions.topic.searchRetry')}
+        </button>
+      </div>
+    );
+  }
+  if (search.status !== 'ready') return null;
+  const partial = search.coverage.state === 'partial';
+  const degraded = search.degradedReasons.length > 0;
+  if (!partial && !degraded) return null;
+  return (
+    <div
+      className="sessions-topic-search-notes"
+      data-search-coverage={search.coverage.state}
+      data-search-degraded={degraded ? 'true' : undefined}
+    >
+      {partial ? (
+        <p className="sessions-topic-search-note">
+          {t('sessions.topic.partial', { count: search.coverage.unindexedKnownTopics })}
+        </p>
+      ) : null}
+      {degraded ? (
+        <p className="sessions-topic-search-note degraded">
+          {t('sessions.topic.degraded')}: {search.degradedReasons.join(', ')}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+/** Snippets + updatedAt + the topic entry. A missing `url` is never fabricated:
+ * it falls back to the topic's first session details, or (when the topic has no
+ * session rows at all) renders no entry. */
+function TopicSearchHitDetails(props: {
+  hit: TopicSearchHit;
+  row?: SessionRow;
+  onOpen: (row: SessionRow) => void;
+}): React.JSX.Element {
+  const hit = props.hit;
+  const row = props.row;
+  return (
+    <div className="session-topic-hit" data-search-hit={hit.topicKey}>
+      {(hit.matches ?? []).slice(0, 3).map((match, index) => (
+        <p
+          key={match.summaryId || `${hit.topicKey}-${index}`}
+          className="session-topic-hit-match"
+          data-search-match={match.summaryId}
+        >
+          {match.text}
+        </p>
+      ))}
+      <div className="session-topic-hit-meta">
+        <span className="session-topic-updated">
+          {t('sessions.topic.updatedAt')}: {relTime(Date.parse(hit.updatedAt))}
+        </span>
+        {hit.degraded && hit.degraded.length ? (
+          <span className="topic-chip degraded" data-search-degraded="item">{t('sessions.topic.degraded')}</span>
+        ) : null}
+        {hit.url ? (
+          <a
+            className="session-topic-hit-link"
+            data-search-entry="url"
+            href={hit.url}
+            target="_blank"
+            rel="noreferrer noopener"
+          >
+            {t('sessions.topic.openHit')}
+          </a>
+        ) : row ? (
+          <button
+            type="button"
+            className="session-topic-hit-link"
+            data-search-entry="details"
+            onClick={() => props.onOpen(row)}
+          >
+            {t('sessions.details')}
+          </button>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 function topicGroupTitle(group: SessionTopicGroup<SessionRow>): string {
   const title = stripMentionPrefix(group.title).trim();
   if (title) return title;
   if (group.kind === 'thread') return t('sessions.topic.untitled');
   return group.kind === 'chat' ? t('sessions.topic.wholeChat') : t('sessions.topic.singleSession');
 }
+
+type TopicGroupEntry = {
+  group: SessionTopicGroup<SessionRow> | undefined;
+  hit: TopicSearchHit | undefined;
+};
 
 function TopicGroupsViewBase(props: TopicGroupsViewProps): React.JSX.Element {
   useT();
@@ -1736,9 +1993,53 @@ function TopicGroupsViewBase(props: TopicGroupsViewProps): React.JSX.Element {
     () => new Map(groupSessionsByTopic(props.relationRows ?? props.rows).map(group => [group.key, group])),
     [props.relationRows, props.rows],
   );
+  const searchHits = props.search?.status === 'ready' ? props.search.items : undefined;
+  const entries = useMemo<TopicGroupEntry[]>(() => {
+    // No search prop (or a failed/disabled search) ⇒ keep the original grouping
+    // and ordering byte-for-byte.
+    if (!searchHits) return groups.map(group => ({ group, hit: undefined }));
+    const groupsByKey = new Map(groups.map(group => [group.key, group]));
+    return searchHits.flatMap<TopicGroupEntry>(hit => {
+      const group = groupsByKey.get(hit.topicKey);
+      if (group) return [{ group, hit }];
+      // The topic still has session rows in the store but every one was removed
+      // by status / Bot / CLI filters: keep those filters authoritative.
+      if (relationGroups.has(hit.topicKey)) return [];
+      // No session rows at all (e.g. sessions closed and pruned) — render the
+      // persistent topic itself without inventing a session row.
+      return [{ group: undefined, hit }];
+    });
+  }, [groups, relationGroups, searchHits]);
   return (
     <div id="sessions-topics" className="sessions-topic-view" hidden={props.hidden}>
-      {groups.length ? groups.map(group => {
+      {props.search ? <TopicSearchBanner search={props.search} onRetry={props.onSearchRetry} /> : null}
+      {entries.length ? entries.map(entry => {
+        if (!entry.group) {
+          const hit = entry.hit!;
+          return (
+            <section
+              key={hit.topicKey}
+              className="session-topic-group search-hit-only"
+              data-topic-key={hit.topicKey}
+              data-search-only="true"
+            >
+              <header>
+                <div className="session-topic-heading">
+                  <h2 title={hit.title}>{hit.title || t('sessions.topic.untitled')}</h2>
+                  <code title={hit.topicKey}>{hit.topicKey}</code>
+                </div>
+                <div className="session-topic-summary" aria-label={t('sessions.topic.summary')}>
+                  <span className="session-topic-updated">
+                    {t('sessions.topic.updatedAt')}: {relTime(Date.parse(hit.updatedAt))}
+                  </span>
+                </div>
+              </header>
+              <TopicSearchHitDetails hit={hit} onOpen={props.onOpen} />
+            </section>
+          );
+        }
+        const group = entry.group;
+        const hit = entry.hit;
         // Member cards respect the current session filters. Header metadata is
         // derived from the complete store so a hidden closed sibling does not
         // erase the topic's multi-Bot relationship.
@@ -1781,6 +2082,7 @@ function TopicGroupsViewBase(props: TopicGroupsViewProps): React.JSX.Element {
                 <span className="session-topic-updated">{t('sessions.last')}: {relTime(relation.latestActivityAt)}</span>
               </div>
             </header>
+            {hit ? <TopicSearchHitDetails hit={hit} row={group.rows[0]} onOpen={props.onOpen} /> : null}
             <div className="session-topic-members">
               {group.rows.map(row => (
                 <BoardCard
@@ -1802,7 +2104,11 @@ function TopicGroupsViewBase(props: TopicGroupsViewProps): React.JSX.Element {
             </div>
           </section>
         );
-      }) : <div className="sessions-topic-empty">{t('sessions.topic.empty')}</div>}
+      }) : (
+        <div className="sessions-topic-empty">
+          {searchHits ? t('sessions.topic.searchEmpty') : t('sessions.topic.empty')}
+        </div>
+      )}
     </div>
   );
 }
@@ -2852,6 +3158,10 @@ function SessionsPage(): React.JSX.Element {
   const [createState, setCreateState] = useState<CreateSessionState | null>(null);
   const [createLoading, setCreateLoading] = useState(false);
   const createRequestRef = useRef(0);
+  const [topicSearch, dispatchTopicSearch] = useReducer(topicSearchReducer, initialTopicSearchState);
+  const topicSearchRequestRef = useRef(0);
+  const [topicSearchRetry, setTopicSearchRetry] = useState(0);
+  const retryTopicSearch = useCallback(() => setTopicSearchRetry(n => n + 1), []);
 
   // 视图切换的入场动画。以前靠 `key={viewStageAnimKey}` 换 key 强制 remount 整个
   // 舞台来重放 CSS animation——那等于每次点「看板/状态板/话题/表格」都把当前视图
@@ -2908,8 +3218,33 @@ function SessionsPage(): React.JSX.Element {
     setFilters(prev => ({ ...prev, chat: '' }));
   }, [chatOptions, filters.chat]);
 
+  // Content search runs from the topics view. Blank queries never reach the
+  // API (the server answers 400), and every superseded request is ignored by
+  // the reducer's request-id guard.
+  const trimmedTopicQuery = filters.q.trim();
+  useEffect(() => {
+    if (!trimmedTopicQuery || viewMode !== 'topics') {
+      dispatchTopicSearch({ type: 'reset' });
+      return;
+    }
+    const requestId = ++topicSearchRequestRef.current;
+    dispatchTopicSearch({ type: 'start', query: trimmedTopicQuery, requestId });
+    let cancelled = false;
+    void (async () => {
+      const action = await requestTopicSearch(trimmedTopicQuery, requestId);
+      if (!cancelled && action) dispatchTopicSearch(action);
+    })();
+    return () => { cancelled = true; };
+  }, [trimmedTopicQuery, viewMode, topicSearchRetry]);
+
+  // Only a result that belongs to the query currently in the box may replace
+  // the local list. A late response for an older query never reaches the view.
+  const topicSearchView = viewMode === 'topics' && trimmedTopicQuery && topicSearch.query === trimmedTopicQuery
+    ? topicSearch
+    : undefined;
+
   const rows = useMemo(() => {
-    const q = filters.q.toLowerCase();
+    const q = effectiveSessionSearchQuery(filters.q, topicSearchView);
     const cli = [...filters.cli];
     const cliFilterActive = cli.length > 0 && cli.length < CLI_FILTER_OPTIONS.length;
     const keepClosed = viewMode === 'kanban';
@@ -2933,7 +3268,7 @@ function SessionsPage(): React.JSX.Element {
     return base
       .filter(row => acceptedTopicKeys.has(sessionTopicKey(row)))
       .sort((a, b) => compareRows(a, b, sortKey, sortDir));
-  }, [filters, revision, sortDir, sortKey, storeRows, viewMode]);
+  }, [filters, revision, sortDir, sortKey, storeRows, topicSearchView, viewMode]);
   const runtimeCounts = useMemo(() => sessionRuntimeCounts(storeRows), [storeRows]);
 
   const rowsById = useMemo(() => new Map(storeRows.map(row => [row.sessionId, row])), [storeRows, revision]);
@@ -3967,6 +4302,8 @@ function SessionsPage(): React.JSX.Element {
           relationRows={storeRows}
           selected={selected}
           hidden={false}
+          search={topicSearchView}
+          onSearchRetry={retryTopicSearch}
           onToggleSelect={listOnToggleSelect}
           onOpen={listOnOpen}
           onHistory={openHistoryModal}
