@@ -11,6 +11,10 @@ import { sessionTerminalHref } from './session-terminal.js';
 import { copyText } from './clipboard.js';
 import { toast } from './toast.js';
 import { sessionMutationBlockedText } from './session-mutation-blocked.js';
+// 话题身份判定/编码已共享到 src/topic/identity.ts，Topic 目录与检索用同一份编码。
+// 该模块是纯函数（无 Node-only import），浏览器 bundle 引用它是安全的；不要顺着
+// 这里引入 store / model-client 等 Node 侧 topic 模块。
+import { topicKeyOf, topicScopeOf, type TopicScope } from '../../topic/identity.js';
 
 export function resumeErrorMessage(reason: unknown, translate: typeof t = t): string {
   if (reason === 'workspace_retired') return translate('sessions.resumeWorkspaceRetired');
@@ -255,7 +259,9 @@ export function sessionSearchText(s: any): string {
   return `${JSON.stringify(s)} ${sessionLocationText(s)} ${sessionLocationTitle(s)}`.toLowerCase();
 }
 
-export type SessionTopicKind = 'thread' | 'chat' | 'session';
+/** 话题粒度（thread 真实话题 / chat 整群一会话 / session 无锚点）。
+ *  定义已迁到 `src/topic/identity.ts`，这里保留别名以维持既有 import 面。 */
+export type SessionTopicKind = TopicScope;
 
 /** Location-level grouping used by the Dashboard topic view.
  *
@@ -284,25 +290,20 @@ function nonEmptyString(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
 
+/** 委托到 `src/topic/identity.ts`：Topic 目录、检索与 Dashboard 聚合必须共用
+ *  同一份粒度判定，否则同一话题会在两处被判成不同 kind。 */
 function sessionTopicKind(s: any): SessionTopicKind {
-  const chatId = nonEmptyString(s?.chatId);
-  const rootMessageId = nonEmptyString(s?.rootMessageId);
-  if (s?.scope === 'chat') return chatId ? 'chat' : 'session';
-  return chatId && rootMessageId ? 'thread' : 'session';
+  return topicScopeOf(s ?? {});
 }
 
 /** Stable location key for the current schema. Keep it separate from any
  * future `collaborationId`: location and logical task identity are different
- * dimensions and must not silently alias each other. */
+ * dimensions and must not silently alias each other.
+ *
+ * 编码实现已迁到 `src/topic/identity.ts`（`topicKeyOf`）；字节级兼容由
+ * `test/topic-identity.test.ts` 钉住，因为该 key 同时是持久化标识。 */
 export function sessionTopicKey(s: any): string {
-  const chatId = nonEmptyString(s?.chatId);
-  const rootMessageId = nonEmptyString(s?.rootMessageId);
-  const kind = sessionTopicKind(s);
-  if (kind === 'thread') {
-    return `thread:${encodeURIComponent(chatId)}:${encodeURIComponent(rootMessageId)}`;
-  }
-  if (kind === 'chat') return `chat:${encodeURIComponent(chatId)}`;
-  return `session:${encodeURIComponent(nonEmptyString(s?.sessionId) || 'unknown')}`;
+  return topicKeyOf(s ?? {});
 }
 
 function topicTitle(rows: any[], fallback: string): string {

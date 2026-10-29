@@ -1899,8 +1899,53 @@ export const WHITEBOARD_SKILL_NAME = 'botmux-whiteboard';
 /** 群负责人技能名；默认不随内置清单无条件安装，仅在 bot 开启 chatManagerEnabled 时注入。 */
 export const CHAT_MANAGER_SKILL_NAME = 'botmux-chat-manager';
 
+const TOPIC_SEARCH_SKILL = `---
+name: botmux-topic-search
+description: 需要找回「以前在别的话题里讨论过什么」时触发——用户问“之前聊过的某件事”“上次谁决定的那件事”“某个需求在哪讨论的”，而当前会话历史里没有。检索本机已索引的话题摘要（不是原消息全文），返回话题级结果与来源。
+---
+
+# botmux-topic-search — 检索历史话题
+
+检索的是**本机已索引的话题摘要**（标题 + 摘要 + 关键词），不是飞书原文。所以：
+
+- 命中结果是**话题**，不是单个会话：同一话题里多个 bot 的会话只会出现一条。
+- 没命中不等于不存在：新消息要等下一次定时整理才进索引。返回里的 \`coverage.state = partial\` 就是这个意思——可以据实告诉用户“可能还没整理到”，而不是断言“没有讨论过”。
+- 只在你被授权读取的群范围内检索。跨群私有内容不要转述到无权查看的群里。
+
+## 用法
+
+\`\`\`bash
+# 默认：关键词 + 可选向量（auto）
+botmux topic search "跨 bot owner 怎么校验"
+
+# 只看关键词命中（不发向量请求）
+botmux topic search "pay timeout" --mode keyword --limit 5
+
+# 限定群 / 时间窗（时间是**来源消息**时间，不是摘要生成时间）
+botmux topic search "发布流程" --chat oc_xxx --from 2026-10-01T00:00:00Z
+
+# 压缩输出（单行 JSON），便于后续处理
+botmux topic search "沙箱" --json
+\`\`\`
+
+## 输出字段
+
+- \`items[]\`：每个话题一条。\`topicKey\`（稳定身份）、\`title\`、\`matches[].text\`（命中的摘要片段）、\`matches[].sourceMessageIds\`（可回到原文的消息 id）、\`updatedAt\`、\`sourceThroughAt\`（摘要覆盖到什么时候）。
+- \`effectiveMode\`：\`keyword\` / \`hybrid\`，实际生效的检索模式。
+- \`degradedReasons\`：例如 \`embedding_disabled\`（没开向量）、\`embedding_not_backfilled\`（向量还没回填）、\`coverage_unknown\`。**要如实转达**，别把降级说成“全量语义检索”。
+- \`coverage\`：\`state=partial\` + \`unindexedKnownTopics\`（已知但还没索引的话题数）。
+- \`nextCursor\`：还有更多结果时用它翻页。
+
+## 注意
+
+- 命令**只读**，不需要也不接受任何 owner / 提权参数；换不来看不到的话题。
+- 别用 \`topic config set\`：改配置（开启扫描、换模型）属于管理员操作，agent 不应代做。
+- 结果里的摘要由模型生成，可能不精确；需要事实细节时用 \`sourceMessageIds\` 回到原消息核对。
+`;
+
 export const BUILTIN_SKILLS: SkillDef[] = [
   { name: 'botmux-chat-rename', content: CHAT_RENAME_SKILL },
+  { name: 'botmux-topic-search', content: TOPIC_SEARCH_SKILL },
   { name: 'botmux-session-rename', content: SESSION_RENAME_SKILL },
   { name: 'botmux-schedule', content: SCHEDULE_SKILL },
   { name: 'botmux-history', content: HISTORY_SKILL },

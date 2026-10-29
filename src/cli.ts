@@ -7571,6 +7571,10 @@ ${SEND_HELP_BODY}
   card stream open|write|snapshot|reanchor|bind-runtime|unbind-runtime|finish ...
                        CardKit 原生文本流式更新与 daemon 运行状态绑定；详见 botmux card stream --help
   bots list                            列出当前群聊中的机器人（含 open_id）
+  topic search <查询串> [--mode auto|keyword|hybrid] [--limit N] [--chat <chatId>]…
+                                       在本机已索引的话题摘要里检索（按话题去重返回，带命中摘要与来源）
+  topic status                         查看话题索引的启用状态、进度与检索端点
+  topic config show|set '<json>'       查看/更新 topicSearch 配置（凭证只来自环境变量，不在该配置里）
   bots invite --chat <chatId> --team <id> --agent <appId>...
                                        往「已存在的团队群」补人：把同团队、已 opt-in 的 agent + 各自 owner 一起拉进；
                                        详见 \`botmux bots invite --help\`
@@ -18357,6 +18361,10 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
     'workflow',
     'template',
     'v3',
+    // 话题知识检索：只读查询本机已索引的话题摘要（`search`/`status`），
+    // `config` 的读取同样无副作用；写配置需要 `config set`，workflow worker 里
+    // 应由 hostExecutor 代表用户执行，因此这里只放行只读子命令（见下方 sub 过滤）。
+    'topic',
   ]);
   const rootDenied = !allowedRoot.has(command);
   const mcpSub = command === 'mcp' ? (process.argv[3] ?? '') : '';
@@ -18396,10 +18404,16 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
   const templateSub = command === 'template' ? (process.argv[3] ?? '') : '';
   const blockedTemplateSub = new Set(['migrate-v3', 'archive-runs']);
   const v3Sub = command === 'v3' ? (process.argv[3] ?? '') : '';
+  // `topic` 只放行只读子命令：`search` / `status` / help。`config set` 会改机器级
+  // 配置（开启后台扫描与模型外发），必须由宿主/用户发起。
+  const topicSub = command === 'topic' ? (process.argv[3] ?? '') : '';
+  const topicReadOnlySub = new Set(['', 'search', 'status', 'help', '--help']);
+  const topicMutation = command === 'topic' && !topicReadOnlySub.has(topicSub);
   const workflowMutation =
     (command === 'workflow' && blockedWorkflowSub.has(workflowSub)) ||
     (command === 'template' && blockedTemplateSub.has(templateSub)) ||
-    (command === 'v3' && v3Sub === 'run');
+    (command === 'v3' && v3Sub === 'run') ||
+    topicMutation;
   if (
     rootDenied ||
     mcpDenied ||
@@ -18418,14 +18432,18 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
             ? templateSub
             : command === 'v3'
               ? v3Sub
-              : '';
+              : command === 'topic'
+                ? topicSub
+                : '';
     const guidance = mcpDenied
       ? 'Only the botmux-owned Plugin MCP gateway bootstrap (`mcp serve`) is available inside a workflow subagent.'
-      : workflowMutation
-        ? 'Workflow authorization and run mutations must be initiated by the host/user, not a subagent.'
-        : rootDenied
-          ? 'This root command is not in the workflow read-only allowlist; chat-facing effects belong in a hostExecutor activity.'
-          : 'Chat-facing or schedule-mutating effects belong in a hostExecutor activity, not a subagent.';
+      : topicMutation
+        ? 'Topic-search config mutations (which enable background scanning and model egress) must be initiated by the host/user; subagents may only run `topic search` / `topic status`.'
+        : workflowMutation
+          ? 'Workflow authorization and run mutations must be initiated by the host/user, not a subagent.'
+          : rootDenied
+            ? 'This root command is not in the workflow read-only allowlist; chat-facing effects belong in a hostExecutor activity.'
+            : 'Chat-facing or schedule-mutating effects belong in a hostExecutor activity, not a subagent.';
     console.error(
       `botmux ${command}${sub ? ` ${sub}` : ''} refused inside workflow ` +
       `subagent (run=${runId} node=${nodeId}).  ${guidance}`,
@@ -19735,6 +19753,13 @@ switch (command) {
   case 'grant': await cmdExactChatGrant(process.argv.slice(3)); break;
   case 'create-group': await cmdCreateGroup(process.argv.slice(3)); break;
   case 'bots':     await cmdBots(process.argv[3] ?? 'list', process.argv.slice(4)); break;
+  // 话题知识检索（只读，走本机 loopback 端点）。实现放在独立模块里，避免继续往
+  // 这个文件堆命令体。
+  case 'topic': {
+    const { runTopicCommand } = await import('./cli/topic-command.js');
+    process.exitCode = await runTopicCommand(process.argv[3] ?? '', process.argv.slice(4));
+    break;
+  }
   case 'preset':   await cmdPreset(process.argv[3] ?? '', process.argv.slice(4)); break;
   case 'history':  await cmdHistory(process.argv.slice(3)); break;
   case 'quoted':   await cmdQuoted(process.argv.slice(3)); break;

@@ -1,4 +1,5 @@
 import { normalizeVcMeetingListenerPolicy, type VcMeetingListenerPolicy } from './services/vc-meeting-listener-policy.js';
+import type { TopicSearchGlobalConfig } from './topic/config.js';
 /**
  * Global botmux configuration stored at `~/.botmux/config.json`.
  *
@@ -252,6 +253,10 @@ export interface GlobalConfig {
   /** Machine-wide multi-topic orchestration switch. Missing / enabled !== false
    *  preserves legacy behavior. `BOTMUX_MULTI_TOPIC_ENABLED` overrides it. */
   multiTopic?: MultiTopicGlobalConfig;
+  /** 话题知识与统一检索（`src/topic/`）。缺省全关：不扫描、不调模型、不起 loopback
+   *  端点。字段语义与校验见 `src/topic/config.ts`（这里只保留原始形状，解析时统一
+   *  归一化，避免两套默认值各说各话）。 */
+  topicSearch?: TopicSearchGlobalConfig;
   /** Optional proxy for GitHub release assets and checksums, preferred over
    *  HTTP_PROXY/HTTPS_PROXY. Registry metadata and platform-package downloads
    *  use only environment proxies + NO_PROXY; package-manager installs use
@@ -823,6 +828,48 @@ function readMultiTopic(raw: unknown): MultiTopicGlobalConfig | undefined {
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+/**
+ * `topicSearch` 节的形状归一化。
+ *
+ * 这里**只做形状收敛**（丢弃不认识的键），不做语义校验：非法值必须让
+ * `resolveTopicSearchConfig` 报 issue 并 fail-closed，否则「cron 写错了」会被静默
+ * 改成默认值，管理员以为定时任务已经生效。
+ */
+function readTopicSearchSection(raw: unknown): TopicSearchGlobalConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const v = raw as Record<string, unknown>;
+  const out: TopicSearchGlobalConfig = {};
+  if (typeof v.enabled === 'boolean') out.enabled = v.enabled;
+  if (Array.isArray(v.allowedChatIds)) {
+    out.allowedChatIds = v.allowedChatIds.filter((id): id is string => typeof id === 'string');
+  }
+  if (typeof v.llmModelRef === 'string' || v.llmModelRef === null) {
+    out.llmModelRef = v.llmModelRef as string | null;
+  }
+  if (v.embedding && typeof v.embedding === 'object' && !Array.isArray(v.embedding)) {
+    const embedding = v.embedding as Record<string, unknown>;
+    const next: NonNullable<TopicSearchGlobalConfig['embedding']> = {};
+    if (typeof embedding.enabled === 'boolean') next.enabled = embedding.enabled;
+    if (typeof embedding.modelRef === 'string' || embedding.modelRef === null) {
+      next.modelRef = embedding.modelRef as string | null;
+    }
+    out.embedding = next;
+  }
+  if (v.schedule && typeof v.schedule === 'object' && !Array.isArray(v.schedule)) {
+    const schedule = v.schedule as Record<string, unknown>;
+    const next: NonNullable<TopicSearchGlobalConfig['schedule']> = {};
+    if (schedule.kind === 'cron' || schedule.kind === 'interval') next.kind = schedule.kind;
+    if (typeof schedule.expression === 'string') next.expression = schedule.expression;
+    if (typeof schedule.timeZone === 'string') next.timeZone = schedule.timeZone;
+    if (typeof schedule.intervalMinutes === 'number') next.intervalMinutes = schedule.intervalMinutes;
+    out.schedule = next;
+  }
+  for (const key of ['initialLookbackDays', 'maxConcurrentTopics', 'maxTopicsPerRun'] as const) {
+    if (typeof v[key] === 'number') out[key] = v[key] as number;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 export function globalConfigPath(): string {
   const configured = process.env.BOTMUX_GLOBAL_CONFIG_FILE?.trim();
   if (configured) {
@@ -906,6 +953,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (workflow) out.workflow = workflow;
   const multiTopic = readMultiTopic(raw.multiTopic);
   if (multiTopic) out.multiTopic = multiTopic;
+  const topicSearch = readTopicSearchSection(raw.topicSearch);
+  if (topicSearch) out.topicSearch = topicSearch;
   if (typeof raw.httpProxy === 'string' && raw.httpProxy.trim()) out.httpProxy = raw.httpProxy.trim();
   // Lenient http(s) origin check; resolveOAuthRedirectUri re-validates shape.
   if (typeof raw.oauthRedirectBase === 'string' && /^https?:\/\//.test(raw.oauthRedirectBase.trim())) {

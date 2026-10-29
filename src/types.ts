@@ -1280,6 +1280,71 @@ export interface Session {
   };
 }
 
+/**
+ * 一个**持久化话题实体**，与 `Session` 并列而不是它的子集。
+ *
+ * 三者的区别不要混：`Topic` 是话题知识（目录 + 摘要 + 覆盖边界，跨 session 存活）；
+ * `Session` 是执行会话；Dashboard 的 `SessionTopicGroup` 只是行数据的展示聚合。
+ * sessionId 与 topicKey 是多对一：同一话题下可以有多个 bot 的 session，关闭 session
+ * 不删除 Topic。
+ *
+ * 身份字段（`topicKey`/`chatId`/`rootMessageId`/`accessPolicyRef`）只由宿主与
+ * 源消息元数据写入，**模型输出永远不能改它们**（见 `src/topic/summary-updater.ts`）。
+ */
+export interface Topic {
+  schemaVersion: 1;
+  /** 与 Dashboard 共用编码：`thread:<chatId>:<rootMessageId>`（见 topic/identity.ts）。 */
+  topicKey: string;
+  chatId: string;
+  rootMessageId: string;
+  /** 飞书原生 thread 标识（`omt_*`），用于跳转；不能当路由身份用。 */
+  nativeThreadId?: string;
+  /** 目录快照标题；不反向修改任何 session 的标题。 */
+  title: string;
+  /** 授权策略的权威引用（宿主解析），不由模型填写。 */
+  accessPolicyRef: string;
+  /** CAS 版本号：每次成功提交摘要/游标递增。 */
+  revision: number;
+  summaries: TopicSummary[];
+  /** 上次**成功**摘要到的源消息边界（不透明，不能按字典序比较）。 */
+  summarizedThroughCursor?: string;
+  /** 摘要覆盖范围的起点（ISO-8601 UTC）。 */
+  coverageStartAt?: string;
+  /** 输入已成功处理到的时间（ISO-8601 UTC）。 */
+  sourceThroughAt?: string;
+  /** 最近一次成功检查历史的时间（ISO-8601 UTC）；不等于成功摘要位置。 */
+  lastCheckedAt?: string;
+  updatedAt: string;
+}
+
+/**
+ * 话题里的一条事件摘要。
+ *
+ * `id` 稳定：更新同一条事件时复用 id，只更新该条的 embedding，不重算全部摘要。
+ * `keywords` 的规范化去重并集就是话题级关键词（不另存一份可写真相）。
+ * `embedding.contentHash` 绑正文：正文变化后旧向量立即不可用于新正文。
+ */
+export interface TopicSummary {
+  /** 服务端分配的稳定 id。 */
+  id: string;
+  text: string;
+  keywords: string[];
+  /** 该摘要依据的源消息 id；必须属于本话题且在当前授权输入/旧来源集合内。 */
+  sourceMessageIds: string[];
+  updatedAt: string;
+  /** 生成器标识（模型/提示词版本），**不含凭证**。 */
+  generatorKey: string;
+  embedding?: TopicSummaryEmbedding;
+}
+
+export interface TopicSummaryEmbedding {
+  /** `provider/model/revision/dimensions` 标识；不同 modelKey 的向量不可混算。 */
+  modelKey: string;
+  /** 正文内容哈希；与当前正文不符的向量视为失效。 */
+  contentHash: string;
+  vector: number[];
+}
+
 export interface CrossPrincipalInterruptionMessage {
   turnId: string;
   text: string;
