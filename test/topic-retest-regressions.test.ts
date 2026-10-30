@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import { TopicStore } from '../src/topic/store.js';
 import { updateTopicFromWindow } from '../src/topic/summary-updater.js';
 import type { SourceMessage, TopicHistoryWindow } from '../src/topic/source.js';
+import { collectThreadMessageScan } from '../src/im/lark/client.js';
 import { expandTopicSearchDateFilters } from '../src/dashboard/topic-search-api.js';
 
 const T0 = '2026-10-29T00:00:00.000Z';
@@ -216,6 +217,67 @@ describe('复测3：topicCreatedAt 只认被证实的根消息时间', () => {
     const stored = store.getTopic(topic.topicKey)!;
     expect(stored.topicCreatedAt).toBe(new Date(rootAt).toISOString()); // 用被证实的根时间
     expect(stored.topicCreatedAt).not.toBe(stored.latestMessageAt);
+  });
+});
+
+describe('复测第三轮：真实 reader 扫描核心 → updater（游标消息被引用的摘要保留）', () => {
+  // 与 daemon 路由同形的原始消息（新→旧分页），经 collectThreadMessageScan
+  // （真实 reader 核心）产出窗口，再交真实 updater——不手工构造 historyIds。
+  const raw = (id: string, atMs: number) => ({ message_id: id, create_time: String(atMs), body: { content: `{"text":"t-${id}"}` }, sender: { id: 'ou_x', sender_type: 'user' } });
+  async function* pagesOf(items: any[][]): AsyncGenerator<any[]> {
+    for (const page of items) yield page;
+  }
+  const T = Date.parse('2026-10-29T00:00:00Z');
+
+  it('有增量：线程 [M1,M2]、游标 M1、旧摘要引用 M1 → 摘要保留、M2 正常提交', async () => {
+    const topic = seed();
+    store.commitSummaryUpdate({
+      topicKey: topic.topicKey, expectedRevision: topic.revision,
+      mutations: [{ op: 'add', text: '引用 M1 的旧摘要', keywords: [], sourceMessageIds: ['om_1'] }],
+      generatorKey: 'g', now: T0, summarizedThroughCursor: 'msg:om_1', sourceThroughAt: T0,
+    });
+    // Lark 分页新→旧：先 M2 页再 M1 页（M1 即游标，本身仍在线程里）
+    const scan = await collectThreadMessageScan(pagesOf([[raw('om_2', T + 2000)], [raw('om_1', T + 1000)]]), {
+      untilMessageId: 'om_1', tailCap: 200, maxScan: 2000,
+    });
+    expect(scan.cursorFound).toBe(true);
+    expect(scan.reachedOldest).toBe(true);
+    expect(scan.historyIds).toContain('om_1'); // 游标消息本身在覆盖集合里
+    const outcome = await updateTopicFromWindow(deps(async () => ({ ok: true, mutations: [{ op: 'add', text: 'M2 事件', keywords: [], sourceMessageIds: ['om_2'] }], generatorKey: 'g' })), {
+      topicKey: topic.topicKey,
+      window: {
+        messages: scan.messages.map(m => ({ messageId: m.message_id, createTimeMs: Number(m.create_time), text: 't' })),
+        truncated: false, cursorFound: scan.cursorFound, reachedOldest: scan.reachedOldest, historyIds: scan.historyIds,
+      },
+    });
+    expect(outcome).toMatchObject({ kind: 'committed' });
+    const stored = store.getTopic(topic.topicKey)!;
+    expect(stored.summaries.map(s => s.text)).toEqual(['引用 M1 的旧摘要', 'M2 事件']); // 旧摘要保留
+    expect(stored.summarizedThroughCursor).toBe('msg:om_2');
+  });
+
+  it('无增量：线程仅 [M1]（=游标）、旧摘要引用 M1 → 空增量，摘要保留不失效', async () => {
+    const topic = seed();
+    store.commitSummaryUpdate({
+      topicKey: topic.topicKey, expectedRevision: topic.revision,
+      mutations: [{ op: 'add', text: '引用 M1 的旧摘要', keywords: [], sourceMessageIds: ['om_1'] }],
+      generatorKey: 'g', now: T0, summarizedThroughCursor: 'msg:om_1', sourceThroughAt: T0,
+    });
+    const scan = await collectThreadMessageScan(pagesOf([[raw('om_1', T + 1000)]]), {
+      untilMessageId: 'om_1', tailCap: 200, maxScan: 2000,
+    });
+    expect(scan.messages).toEqual([]);
+    expect(scan.historyIds).toEqual(['om_1']);
+    let modelCalls = 0;
+    const outcome = await updateTopicFromWindow(deps(async () => { modelCalls++; return { ok: true, mutations: [{ op: 'noop' }], generatorKey: 'g' }; }), {
+      topicKey: topic.topicKey,
+      window: {
+        messages: [], truncated: false, cursorFound: scan.cursorFound, reachedOldest: scan.reachedOldest, historyIds: scan.historyIds,
+      },
+    });
+    expect(outcome).toMatchObject({ kind: 'no_increment' });
+    expect(modelCalls).toBe(0);
+    expect(store.getTopic(topic.topicKey)!.summaries).toHaveLength(1); // 引用游标消息的摘要保留
   });
 });
 

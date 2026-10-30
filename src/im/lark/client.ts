@@ -2255,6 +2255,79 @@ export async function listThreadMessages(larkAppId: string, chatId: string, root
   return (await listThreadMessagesWithContext(larkAppId, chatId, rootMessageId, pageSize)).messages;
 }
 
+export interface ThreadScanOptions {
+  /** Success cursor to scan back to (undefined = plain tail read). */
+  untilMessageId?: string;
+  /** Max message bodies returned for a no-cursor tail read. */
+  tailCap: number;
+  /** Total-id budget across the whole scan (increment + coverage). */
+  maxScan: number;
+}
+
+export interface ThreadScanResult {
+  /** Raw messages AFTER the cursor (or the tail window), chronological. */
+  messages: any[];
+  cursorFound: boolean;
+  reachedOldest: boolean;
+  historyIds?: string[];
+}
+
+/** Pure scan core behind {@link listThreadMessagesUntil} (exported so the
+ *  reader→updater contract is testable against synthetic Lark pages — repo
+ *  rule: extract a seam instead of grepping source). Consumes NEWEST→OLDEST
+ *  pages; phases: (a) until the cursor shows up — collect the after-cursor
+ *  block; (b) past the cursor — collect ids only as deletion-check coverage
+ *  evidence, until the thread's oldest page or budget. The cursor message's
+ *  OWN id is part of the observed history: summaries routinely cite it
+ *  (复测第三轮问题), so it must appear in historyIds. */
+export async function collectThreadMessageScan(pages: AsyncIterable<any[]>, options: ThreadScanOptions): Promise<ThreadScanResult> {
+  const after: any[] = []; // newer than the cursor, newest → oldest
+  const preCursorIds: string[] = [];
+  let cursorFound = false;
+  let budgetCapped = false;
+  outer:
+  for await (const items of pages) {
+    for (const message of items) {
+      const id = message?.message_id;
+      if (!options.untilMessageId || cursorFound) {
+        if (!options.untilMessageId) {
+          if (after.length < options.tailCap) after.push(message);
+          else if (id) preCursorIds.push(id);
+        } else if (id) {
+          preCursorIds.push(id);
+        }
+        if (after.length + preCursorIds.length >= options.maxScan) {
+          budgetCapped = true;
+          break outer;
+        }
+        continue;
+      }
+      if (id === options.untilMessageId) {
+        cursorFound = true;
+        if (id) preCursorIds.push(id); // 游标消息本身属于已观察历史
+        continue;
+      }
+      after.push(message);
+      if (after.length >= options.maxScan) {
+        budgetCapped = true;
+        break outer;
+      }
+    }
+  }
+  // A `for await` that falls through (no budget break) means the page
+  // iterator completed: we paged past the thread's oldest message.
+  const reachedOldest = !budgetCapped && (!options.untilMessageId || cursorFound);
+  const messages = options.untilMessageId
+    ? (cursorFound ? after : []).reverse()
+    : after.reverse();
+  return {
+    messages,
+    cursorFound: !options.untilMessageId || cursorFound,
+    reachedOldest,
+    ...(reachedOldest ? { historyIds: [...after.map(m => m?.message_id).filter(Boolean), ...preCursorIds] as string[] } : {}),
+  };
+}
+
 /** Bounded continuous-increment read for the topic-search source (change.md
  * 复测问题 2/3): page the thread NEWEST → OLDEST until `untilMessageId` (the
  * topic's success cursor) is reached, then return the contiguous block AFTER
@@ -2266,8 +2339,9 @@ export async function listThreadMessages(larkAppId: string, chatId: string, root
  * after-cursor increment window must never be mistaken for the full visible
  * history. `reachedOldest=true` is reported only when the scan paged through
  * to the thread's oldest message within the budget, and then `historyIds`
- * carries EVERY id observed across the whole scan — the only evidence the
- * updater may use to declare a cited message deleted.
+ * carries EVERY id observed across the whole scan (including the cursor
+ * message itself) — the only evidence the updater may use to declare a
+ * cited message deleted.
  * Also returns the root message's create time when the platform serves it. */
 export async function listThreadMessagesUntil(
   larkAppId: string,
@@ -2310,54 +2384,18 @@ export async function listThreadMessagesUntil(
       ...(rootCreatedAtMs !== undefined ? { rootCreatedAtMs } : {}),
     };
   }
-  // Newest → oldest scan. Phases: (a) until the cursor shows up — collect the
-  // after-cursor block; (b) past the cursor — collect ids only, as deletion-
-  // check coverage evidence, until the thread's oldest message or budget.
-  const after: any[] = []; // newer than the cursor, newest → oldest
-  const preCursorIds: string[] = [];
-  let cursorFound = false;
-  let exhausted = false;
-  outer:
-  for await (const items of iterateMessagePages(c, {
-    containerType: 'thread',
-    containerId: threadId,
-    errorAction: 'list thread messages for topic search',
-    pageSize: messageListRequestPageSize(50),
-  })) {
-    for (const message of items) {
-      const id = message?.message_id;
-      if (!untilMessageId || cursorFound) {
-        if (!untilMessageId) {
-          if (after.length < tailCap) after.push(message);
-          else preCursorIds.push(id);
-        } else if (cursorFound) {
-          preCursorIds.push(id);
-        }
-        if (after.length + preCursorIds.length >= maxScan) break outer;
-        continue;
-      }
-      if (id === untilMessageId) {
-        cursorFound = true;
-        continue;
-      }
-      after.push(message);
-      if (after.length >= maxScan) break outer;
+  const scan = await collectThreadMessageScan((async function* wrapPages() {
+    for await (const items of iterateMessagePages(c, {
+      containerType: 'thread',
+      containerId: threadId!,
+      errorAction: 'list thread messages for topic search',
+      pageSize: messageListRequestPageSize(50),
+    })) {
+      yield items;
     }
-  }
-  // A `for await` that falls through (no break) means the page iterator
-  // completed: we reached the oldest message the platform will serve.
-  exhausted = after.length + preCursorIds.length < maxScan && cursorFoundOrNoCursor();
-  function cursorFoundOrNoCursor(): boolean {
-    return !untilMessageId || cursorFound;
-  }
-  const messages = untilMessageId
-    ? (cursorFound ? after : []).reverse()
-    : after.reverse();
+  })(), { untilMessageId, tailCap, maxScan });
   return {
-    messages,
-    cursorFound: !untilMessageId || cursorFound,
-    reachedOldest: exhausted,
-    ...(exhausted ? { historyIds: [...after.map(m => m?.message_id).filter(Boolean), ...preCursorIds] as string[] } : {}),
+    ...scan,
     ...(rootCreatedAtMs !== undefined ? { rootCreatedAtMs } : {}),
     threadId,
   };
