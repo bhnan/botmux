@@ -181,6 +181,8 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     scratchSupported: j?.scratchSupported === true,
     sandboxNetworkPolicy: j?.sandboxNetworkPolicy ?? null,
     sandboxNetworkPolicyPlatform: j?.sandboxNetworkPolicyPlatform ?? null,
+    sandboxNetworkHostDns: Array.isArray(j?.sandboxNetworkHostDns) ? j.sandboxNetworkHostDns.filter((ip: unknown) => typeof ip === 'string') : [],
+    sandboxNetworkProxyEnv: Array.isArray(j?.sandboxNetworkProxyEnv) ? j.sandboxNetworkProxyEnv.filter((key: unknown) => typeof key === 'string') : [],
     sandboxPaths: (j?.sandboxPaths && typeof j.sandboxPaths === 'object' && !Array.isArray(j.sandboxPaths))
       ? {
           readWrite: Array.isArray(j.sandboxPaths.readWrite) ? j.sandboxPaths.readWrite.filter((x: unknown) => typeof x === 'string') : [],

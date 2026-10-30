@@ -22,6 +22,7 @@ import { randomBytes } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { readFileSync, unlinkSync } from 'node:fs';
+import { hostDnsServers, networkPolicyWarnings, proxyEnvKeys } from './sandbox-network-policy.js';
 import { join } from 'node:path';
 import { logger } from '../utils/logger.js';
 import type { DurableLarkOutboxTarget } from '../services/durable-lark-outbox.js';
@@ -53,7 +54,8 @@ import {
 } from '../services/codex-reasoning-effort.js';
 import { isCodexServiceTier, isCodexServiceTierCliId, type CodexServiceTier } from '../services/codex-service-tier.js';
 import { validateCodexServiceTier } from '../services/codex-service-tier-catalog.js';
-import { botOneShotProbeEnv } from './session-env-resolve.js';
+import { botOneShotProbeEnv, sessionNetworkPolicyEnvView } from './session-env-resolve.js';
+import { resolvePairedBackendId } from './remote-cli-ids.js';
 import {
   botSessionEnvView,
   globalSessionEnvView,
@@ -8248,6 +8250,17 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     sandboxPaths: sandboxStore.getBotSandboxPaths(cachedLarkAppId) ?? null,
     sandboxNetworkPolicy: (() => { try { return getBot(cachedLarkAppId).config.sandboxNetworkPolicy ?? null; } catch { return null; } })(),
     sandboxNetworkPolicyPlatform: process.platform,
+    // Inputs for the policy editor's starting template and its proxy hint.
+    sandboxNetworkHostDns: process.platform === 'linux' ? hostDnsServers(path => readFileSync(path, 'utf8')) : [],
+    sandboxNetworkProxyEnv: (() => {
+      try {
+        const botConfig = getBot(cachedLarkAppId).config;
+        const backendType = (resolvePairedBackendId(botConfig.cliId, botConfig.backendType, config.daemon.backendType) ?? 'pty') as BackendType;
+        // Same env view the worker's policy pre-check sees, so the template's
+        // proxy hint includes the global sessionEnv layer and is never stale.
+        return proxyEnvKeys(sessionNetworkPolicyEnvView(process.env, botConfig, backendType));
+      } catch { return proxyEnvKeys(process.env); }
+    })(),
     readIsolation: sandboxStore.getBotReadIsolation(cachedLarkAppId),
     // Full enforceability (adapter support + no wrapperCli + macOS) — the UI
     // disables the toggle wherever the worker would fail-close on it.
@@ -10314,8 +10327,8 @@ botConfigPutRoute('/api/bot-skills', 'skills', {
 //   { mode: 'off'|'oncall'|'scratch',    — tri-state + scratch sub-options
 //     scratchStorage?, scratchTmpfsSizeMb?, scratchDenyPaths? }
 // oncall = per-session bwrap/Seatbelt whitelist for bots shared with
-// semi-trusted users; scratch = Linux-only full-root COW throwaway sandbox for
-// the owner's own disposable experiments.
+// semi-trusted users; scratch = full-root COW throwaway sandbox (Linux) or an
+// APFS clone of $HOME/project (macOS) for the owner's own disposable experiments.
 ipcRoute('PUT', '/api/bot-sandbox', requireBoundBot(async (req, res) => {
   const body = await readJsonBodyOrBadJson<{ enabled?: unknown; mode?: unknown; scratchStorage?: unknown; scratchTmpfsSizeMb?: unknown; scratchDenyPaths?: unknown }>(req, res);
   if (body === BAD_JSON) return;
@@ -10394,7 +10407,14 @@ botConfigPutRoute<{ policy?: unknown }>('/api/bot-sandbox-network-policy', 'sand
     || Object.keys(body).some(key => key !== 'policy') || !Object.hasOwn(body, 'policy')
     ? fieldInvalid('policy_required')
     : fieldOk(body.policy),
-  respond: () => ({ ok: true, sandboxNetworkPolicy: getBot(cachedLarkAppId).config.sandboxNetworkPolicy ?? null }),
+  respond: () => {
+    const botConfig = getBot(cachedLarkAppId).config;
+    const policy = botConfig.sandboxNetworkPolicy;
+    // Same env view the worker's policy pre-check evaluates (daemon env +
+    // composed global/bot session overlay), so warnings predict the refusal.
+    const backendType = (resolvePairedBackendId(botConfig.cliId, botConfig.backendType, config.daemon.backendType) ?? 'pty') as BackendType;
+    return { ok: true, sandboxNetworkPolicy: policy ?? null, warnings: policy ? networkPolicyWarnings(policy, sessionNetworkPolicyEnvView(process.env, botConfig, backendType)) : [] };
+  },
 });
 
 ipcRoute('PUT', '/api/bot-sandbox-paths', requireBoundBot(async (req, res) => {

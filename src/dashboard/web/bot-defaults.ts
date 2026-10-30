@@ -390,6 +390,10 @@ export type BotDefaultsRow = {
   /** Opt-in policy, configured for future sessions; absence retains legacy behavior. */
   sandboxNetworkPolicy?: import('../../core/sandbox-network-policy.js').SandboxNetworkPolicy | null;
   sandboxNetworkPolicyPlatform?: string | null;
+  /** Host nameservers usable as dnsServers (Linux), for the editor's starting template. */
+  sandboxNetworkHostDns?: string[];
+  /** Proxy variable names set for this bot's workers (daemon env + bot env). */
+  sandboxNetworkProxyEnv?: string[];
   /** Three-tier sandbox path whitelist (highest-precedence FsPolicy layer). */
   sandboxPaths?: { readWrite: string[]; readOnly: string[]; deny: string[] } | null;
   /** Whether the unified file sandbox ALSO applies cross-bot read isolation for

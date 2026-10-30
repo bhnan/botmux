@@ -3,7 +3,7 @@ import { deploymentContinuationTemplate } from './services/deployment-continuati
 import { probeCodexProfileCapability, validateCodexProfile, type CodexProfileCapability } from './services/codex-profiles.js';
 import { captureCodexNativeProcesses, waitForCodexNativeRelease } from './core/codex-native-release.js';
 import { freezeCodexCleanupLaunch } from './core/codex-cleanup-launch.js';
-import { networkPolicySupportError, networkProxyError } from './core/sandbox-network-policy.js';
+import { FROZEN_NETWORK_POLICY_HINT, networkPolicySupportError, networkProxyError } from './core/sandbox-network-policy.js';
 import { prepareZcodeSessionModel } from './services/zcode-model-config.js';
 import { archiveZcodeSessionMarker, readZcodeSessionMarker, zcodeSessionDbPath } from './services/zcode-session.js';
 import {claudeActionPrompt} from './services/claude-action-prompt.js';
@@ -20411,9 +20411,10 @@ async function spawnCli(
     platform: process.platform, backendType: cfg.backendType, sandbox: cfg.sandbox,
     adopt: cfg.adoptMode, existingEndpoint: cfg.existingAppServerEndpoint, policy: cfg.sandboxNetworkPolicy,
   });
-  if (networkError) throw new Error(networkError);
+  // cfg.sandboxNetworkPolicy is the session's creation-time snapshot.
+  if (networkError) throw new Error(networkError + FROZEN_NETWORK_POLICY_HINT);
   const proxyError = networkProxyError(cfg.sandboxNetworkPolicy, { ...process.env, ...cfg.env });
-  if (proxyError) throw new Error(proxyError);
+  if (proxyError) throw new Error(proxyError + FROZEN_NETWORK_POLICY_HINT);
   const spawnGeneration = ++cliSpawnGeneration;
   const spawnStartedAtMs = Date.now();
   restartInterruptionScanBeforeMs = undefined;
@@ -21238,7 +21239,7 @@ async function spawnCli(
     log('mojo runs tools locally (cloud not enabled, or localDaemon set) — keeping the local sandbox engaged');
   }
   const effectiveNetworkError = networkPolicySupportError({ platform: process.platform, backendType: effectiveBackendType, sandbox: sandboxMode, policy: cfg.sandboxNetworkPolicy });
-  if (effectiveNetworkError) throw new Error(effectiveNetworkError);
+  if (effectiveNetworkError) throw new Error(effectiveNetworkError + FROZEN_NETWORK_POLICY_HINT);
   // Single-source network facts for THIS spawn. These same values feed the
   // bwrap/Seatbelt constructors below (netEnabled) and the identity storage
   // decision reported to the daemon (loopbackShared). Nothing else may derive
