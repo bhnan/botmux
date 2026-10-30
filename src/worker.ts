@@ -273,9 +273,9 @@ import {
   isRemoteAccessEnabled,
 } from './global-config.js';
 import {
-  stopSessionScope,
+  prepareSessionScopedLaunch,
+  stopAllSessionScopes,
   sessionScopePayloadPid,
-  wrapCommandInSessionScope,
 } from './core/session-scope.js';
 import { unwrapBotmuxLaunchLayers, type UnwrappedLaunchLayers } from './core/launch-layers.js';
 import {
@@ -326,10 +326,11 @@ import {
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
 import { CODEX_CAPACITY_ERROR_CODE, CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexGenerationSessionIdFromRolloutPath, isCodexRateLimitEvent, codexSessionsRootFromRolloutPath, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
 import { codexConsumedRolloutEvents, codexEventsWithStableIds } from './services/codex-rollout-replay.js';
-import { PI_CREDENTIAL_ERROR_CODE } from './services/pi-transcript.js';
+import { PI_CREDENTIAL_ERROR_CODE, adoptPiTranscriptIntoBotmuxDir, piSessionUsesBotmuxDir } from './services/pi-transcript.js';
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
 import { validateCodexServiceTier } from './services/codex-service-tier-catalog.js';
 import { WORKER_IPC_HANDLER_READY_EVENT } from './worker-ipc-preload.js';
+import { resolveTraexOwnershipPid, scheduleTraexLeafPidResolve } from './core/traex-leaf-pid.js';
 import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
 import { bridgeCodexUserInput } from './services/codex-user-input.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
@@ -390,6 +391,7 @@ import type {
   VcMeetingImTurnOrigin,
 } from './types.js';
 import { normalizeCodexAppCotMarker } from './services/codex-app-cot.js';
+import { normalizeDshCotMarker } from './services/dsh-cot.js';
 import { t, setDefaultLocale } from './i18n/index.js';
 import { registerPromptOverrideResolver } from './skills/effective-builtins.js';
 import { TerminalRenderer } from './utils/terminal-renderer.js';
@@ -520,6 +522,7 @@ import {
 import {
   prepareScratchSandbox,
   attachScratchSession,
+  scratchSubmountOverflowNotice,
   scratchHostView,
   type ScratchStorage,
 } from './adapters/backend/scratch-sandbox.js';
@@ -711,6 +714,7 @@ import {
   CodexAppTurnLiveness,
 } from './utils/codex-app-turn-liveness.js';
 import { CodexAppTurnDispatchQueue } from './utils/codex-app-turn-dispatch.js';
+import { captureAttachedCodexAppProcessIdentity, codexAppEngineHasExited, verifyCodexAppProcessIdentity, type CodexAppProcessIdentity } from './services/codex-app-process-attestation.js';
 import {
   committedCodexAppSequence,
   validateCodexAppManagedSendOrigin,
@@ -2096,6 +2100,9 @@ let tmuxRestartTimer: NodeJS.Timeout | null = null;
  *  lifecycle so a 4× crash loop does not spam the Lark thread with 4 copies
  *  of the same warning. */
 let resumeFallbackNotified = false;
+/** Guard: the scratch "submounts over the overlay limit" notice is sent once
+ *  per worker, not on every CLI respawn. */
+let scratchSubmountOverflowNotified = false;
 /** True once the claude-family transcript bridge has evidence that the CLI
  *  session produced user-visible history. Two setters, covering every bridge
  *  mode:
@@ -3733,8 +3740,9 @@ function codexCliEffortNeedsRecovery(): boolean {
     return false;
   }
   try {
-    const screen = isObserveBackend(hold.backend)
-      ? hold.backend.captureCurrentScreen() : renderer?.rawSnapshot() ?? '';
+    // Observe backends return ANSI full history for web seeding. Input admission
+    // must instead inspect the current viewport's text, never old picker rows.
+    const screen = stripAnsiScreenText(captureBackendScreen(hold.backend));
     if (hasEmptyCodexComposer(screen) && !parseCodexEffortMenu(screen)) {
       codexCliEffortRecovery = undefined;
       return false;
@@ -5726,6 +5734,7 @@ let codexAppCompletionAwaitingFinal = false;
 let codexAppControlBootstrapPathForSpawn: string | undefined;
 let codexAppControlStateValue: CodexAppControlState | undefined;
 let codexAppControlProven = false;
+let codexAppRunnerProcessIdentity: CodexAppProcessIdentity | undefined;
 let codexAppEngineIdentity: CodexAppEngineIdentity | undefined;
 
 function clearCodexAppEngineIdentity(): void {
@@ -5862,6 +5871,7 @@ function stopCodexAppControlChannel(
   opts: { preserveDispatchRecovery?: boolean } = {},
 ): void {
   codexAppControlStopping = true;
+  codexAppRunnerProcessIdentity = undefined;
   clearCodexAppEngineIdentity();
   // Attribution belongs to exactly one worker/control generation.  A fresh or
   // replacement worker may recover only the daemon-frozen active identity
@@ -10982,21 +10992,6 @@ function resolveCodexOwnershipPid(
   return findLaunchedCliPid(candidatePid, 'codex', 6, {}, filterExecutable) ?? candidatePid;
 }
 
-/** Resolve the pid that actually holds a TRAE rollout open, given a candidate
- *  that may be a bwrap supervisor. Under the file sandbox, botmux launches
- *  `bwrap --unshare-pid -- traex`, so the tmux pane leaf / getChildPid() is the
- *  bwrap process — its /proc/<pid>/fd holds no rollout, and the ownership gate
- *  would always fail. The real traex leaf is host-visible across the pid ns
- *  (ps -A ppid links), so a comm-based BFS descends to it. Forge x TraeX has
- *  the same launcher shape (`forge` launcher → `traex` child). Outside such
- *  launcher shapes (or if traex hasn't been forked yet) the candidate already
- *  is the leaf, so we return it unchanged — fail closed to the launcher pid
- *  rather than guess. */
-function resolveTraexOwnershipPid(candidatePid: number, launcherActive: boolean): number {
-  if (!launcherActive || !candidatePid) return candidatePid;
-  return findLaunchedCliPid(candidatePid, 'traex') ?? candidatePid;
-}
-
 /** TRAE counterpart of currentCodexObservedPid: the pid of the TRAE process
  *  this worker observes (spawned child or adopted pane). Same resolution order
  *  — the wired backend.cliPid first, then the live pane child pid, then the
@@ -11005,7 +11000,9 @@ function resolveTraexOwnershipPid(candidatePid: number, launcherActive: boolean)
  *  outside launcher shapes / when already a leaf). */
 function currentTraexObservedPid(): number | undefined {
   const wired = (backend as { cliPid?: number } | null)?.cliPid;
-  if (wired) return wired;
+  // A launch layer can still be wired (the leaf not forked yet, or a payload
+  // binding that landed first); keep descending instead of trusting it.
+  if (wired) return resolveTraexOwnershipPid(wired, lastSpawnTraexLauncherActive);
   const child = backend?.getChildPid?.();
   if (child) return resolveTraexOwnershipPid(child, lastSpawnTraexLauncherActive);
   return codexAdoptPendingPid;
@@ -15310,6 +15307,46 @@ async function retireCodexAppDispatchForDurableReplay(
   return true;
 }
 
+/** Recover only an unambiguous human dispatch from daemon-owned init state,
+ * after the surviving runner proves its signed generation and live engine.
+ * PID marker files and the latest chat sender are not recovery authorities. */
+function restoreCodexAppAttestedTurn(
+  signedTurnId: unknown, control?: { generation: string; seq: number },
+): void {
+  if (currentBotmuxTurnId || !control || (!codexAppEngineIdentity && !codexAppRunnerProcessIdentity) || codexAppCompletionAwaitingFinal
+      || typeof signedTurnId !== 'string' || !signedTurnId
+      || !codexAppControlProven || codexAppControlStateValue?.status !== 'active'
+      || codexAppControlStateValue.identities.length !== 1
+      || codexAppControlStateValue.identities[0].generation !== control.generation
+      || !Number.isSafeInteger(control.seq) || control.seq <= 0
+      || control.seq <= (codexAppGenerationCommits.find(
+        commit => commit.generation === control.generation,
+      )?.committedThrough ?? 0)) return;
+  // A generation's first native turn has no committed final yet. Its ACK
+  // high-water is zero, not an absent authentication proof: the live signed
+  // control generation above and exact durable reservation below prove that.
+  const prepared = codexAppRecoveredDispatches.filter(entry => entry.state === 'prepared');
+  const reservations = codexAppTurnDispatchQueue.recoveredPrefix();
+  if (prepared.length !== 1 || reservations.length !== 1) return;
+  const entry = prepared[0];
+  const sender = entry.replyTargetSenderOpenId;
+  if (entry.turnId !== signedTurnId || entry.dispatchId !== reservations[0].dispatchId
+      || entry.turnId !== reservations[0].turnId
+      || entry.dispatchAttempt !== reservations[0].dispatchAttempt
+      || entry.codexAppSteerable !== true || entry.replyTargetSenderIsBot !== false
+      || typeof sender !== 'string' || !sender.startsWith('ou_') || !lastInitConfig?.larkAppId) return;
+  const caller: TrustedCaller = {
+    requestLarkAppId: lastInitConfig.larkAppId, requestUserOpenId: sender, senderType: 'user',
+  };
+  adoptInitialActiveTurn({
+    turnId: entry.turnId,
+    dispatchAttempt: entry.dispatchAttempt, linkRefMode: entry.linkRefMode,
+    trustedCaller: caller, callerOpenId: sender,
+  });
+  publishSandboxRelayCapability();
+  log('Restored active Codex App human turn from the authenticated generation and exact durable dispatch');
+}
+
 async function handleTrustedCodexAppMarker(
   kind: string,
   payload: Record<string, unknown>,
@@ -15342,6 +15379,9 @@ async function handleTrustedCodexAppMarker(
       rejectCodexAppControlMarker('invalid signed thinking marker');
       return false;
     }
+    // Older surviving runners already sign the exact reply turn on thinking
+    // records, even when their state predates activeReplyTurnId.
+    restoreCodexAppAttestedTurn(marker.turnId, control);
     const turn = codexAppTurnDispatchQueue.findByTurnId(marker.turnId);
     if (!turn) {
       log(`${cliName()} dropped thinking marker for unknown turn ${marker.turnId.substring(0, 12)}`);
@@ -15349,6 +15389,22 @@ async function handleTrustedCodexAppMarker(
     }
     observeCotEntries(marker.entries, turn);
     return true;
+  }
+
+  if (kind === 'cot') {
+    // Keep runtime gating in the pure normalizer: dsh-tui also has cliId 'dsh'.
+    const entries = normalizeDshCotMarker(lastInitConfig?.cliId, lastInitConfig?.dshRuntime, payload);
+    if (entries) {
+      // Cosmetic only: attributed like dsh's final reply; dropped without an active turn.
+      if (currentBotmuxTurnId) {
+        observeCotEntries(entries, { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
+      }
+      return true;
+    }
+    if (lastInitConfig?.cliId === 'dsh') {
+      log(`${cliName()} dropped untrusted or malformed cot control marker`);
+      return true;
+    }
   }
 
   // master added lifecycle/steer markers. In the merged world codex-app reaches
@@ -15402,6 +15458,50 @@ async function handleTrustedCodexAppMarker(
   }
 
   if (kind === 'state' && isCodexAppCliId(lastInitConfig?.cliId)) {
+    // Prefer master's namespace-aware engine proof. Retain the strict legacy
+    // proof only for an authenticated surviving runner without the new claim;
+    // never replace an already registered modern root through the old path.
+    if (payload.appServerProcess === undefined && !codexAppEngineIdentity
+        && (payload.processIdentity !== undefined || codexAppControlProven === true)) {
+      if (payload.processIdentity === undefined && !codexAppRunnerProcessIdentity) {
+        const backendPid = backend?.getChildPid?.() ?? undefined;
+        const identity = captureAttachedCodexAppProcessIdentity(backendPid, lastInitConfig!.sessionId, process.execPath);
+        if (identity) {
+          codexAppRunnerProcessIdentity = identity;
+          publishLocalProcessAttestation(backendPid);
+        }
+      }
+      if (payload.processIdentity !== undefined) {
+        const backendPid = backend?.getChildPid?.() ?? undefined;
+        const identity = verifyCodexAppProcessIdentity(payload.processIdentity, backendPid);
+        if (!identity) {
+          rejectCodexAppControlMarker('unverified app-server process identity');
+          return false;
+        }
+        // Publish once for this control generation, before admitting input. Do
+        // not resnapshot current tools on every busy/idle state from the runner.
+        if (!codexAppRunnerProcessIdentity) {
+          codexAppRunnerProcessIdentity = identity;
+          publishLocalProcessAttestation(backendPid);
+        } else if (JSON.stringify(identity) !== JSON.stringify(codexAppRunnerProcessIdentity)) {
+          // A local submit slot can already exist while the runner is recovering
+          // an idle engine, so tracker.hasActiveTurn() is not a native-busy proof.
+          // Only the signed pre-submit recovery boundary can rotate the root,
+          // after the old engine has exited and the replacement passed the same
+          // kernel/stdio checks as initial registration. Ordinary state changes
+          // must not resnapshot tools or bless an engine swap during native work.
+          if (payload.processIdentityBoundary !== 'idle_restart'
+              || payload.busy !== true || payload.tracksTurn !== false
+              || payload.acceptingInput !== true || codexAppCompletionAwaitingFinal
+              || !codexAppEngineHasExited(codexAppRunnerProcessIdentity)) {
+            rejectCodexAppControlMarker('app-server process changed outside idle recovery');
+            return false;
+          }
+          codexAppRunnerProcessIdentity = identity;
+          publishLocalProcessAttestation(backendPid);
+        }
+      }
+    }
     const readiness = codexAppSignedStateReadiness(payload);
     if (readiness === 'invalid') {
       rejectCodexAppControlMarker('signed state missing boolean acceptingInput');
@@ -15467,6 +15567,10 @@ async function handleTrustedCodexAppMarker(
       }
       log('Authenticated Codex App runner is not yet accepting input; readiness deadline remains armed');
       return true;
+    }
+    if (payload.busy === true && payload.tracksTurn !== false) {
+      // Restore this turn's caller/identity before applying its busy state.
+      restoreCodexAppAttestedTurn(payload.activeReplyTurnId, control);
     }
     const state = applyTrustedCodexAppStateMarker(
       codexAppTurnLiveness,
@@ -22275,6 +22379,20 @@ async function spawnCli(
       log(`WARN OMP legacy resume migration skipped (${migrated.reason}${migrated.detail ? `: ${migrated.detail}` : ''})`);
     }
   }
+  // Pi resumes inside its own session dir once it is sandboxed, or once it ever
+  // was (the dir then holds its history). History for this cwd that only
+  // exists in Pi's native cwd bucket (the session started unsandboxed, or ran
+  // here before a `/cd`) is copied in first, or `--session-dir` silently
+  // starts a new conversation.
+  if (cfg.cliId === 'pi' && effectiveResume && !willReattachPersistent && !cfg.adoptMode
+      && ((sandboxRequested && !scratchRequested) || piSessionUsesBotmuxDir(effectiveAdapterSessionId))) {
+    try {
+      const adopted = adoptPiTranscriptIntoBotmuxDir(effectiveAdapterSessionId, cfg.workingDir);
+      if (adopted.status === 'copied') log(`Pi sandbox resume transcript copied: ${adopted.from} → ${adopted.to}`);
+    } catch (err) {
+      log(`WARN Pi sandbox resume transcript copy failed: ${(err as Error).message}`);
+    }
+  }
   // Hermes stores sessions in a SQLite state.db (not cwd-scoped JSONL). Resolve
   // the same path the bridge uses — honoring per-bot env, the forced
   // BOTMUX_SESSION_ID, and the hermes-botmux-session wrapper profile — so the
@@ -22711,6 +22829,11 @@ async function spawnCli(
     bypassHookTrust: config.bypassCodexHookTrust,
     hideRateLimitModelNudge: config.hideCodexRateLimitModelNudge,
     skillPluginDir: cfg.skillPluginDir,
+    // Same predicate and session id as the oncall sandbox block below, which
+    // creates this dir and re-opens it read-write inside the masked tree.
+    sandboxSessionDir: sandboxRequested && !scratchRequested
+      ? cliAdapter.sandboxSessionDir?.(effectiveAdapterSessionId)
+      : undefined,
     // Per-bot CODEX_HOME can be enabled without the OS sandbox. Only the latter
     // needs Codex's read-isolation shell-env behavior.
     readIsolation: sandboxRequested && willRedirectCliData,
@@ -23274,7 +23397,11 @@ async function spawnCli(
     const ebsdCurrentSessionDir = cliAdapter.id === 'ebsd'
       ? ebsdBotmuxSessionDir(effectiveAdapterSessionId)
       : undefined;
-    const managedCurrentSessionDir = ompCurrentSessionDir ?? ebsdCurrentSessionDir;
+    // Adapters whose CLI keeps every session in one shared tree inside a
+    // read-write state dir (Pi) declare the exact-session dir only for the
+    // sandbox; their unsandboxed layout is untouched.
+    const declaredSandboxSessionDir = cliAdapter.sandboxSessionDir?.(effectiveAdapterSessionId);
+    const managedCurrentSessionDir = ompCurrentSessionDir ?? ebsdCurrentSessionDir ?? declaredSandboxSessionDir;
     if (managedCurrentSessionDir) mkdirSync(managedCurrentSessionDir, { recursive: true, mode: 0o700 });
     const canonicalManagedSessionsRoot = managedCurrentSessionDir
       ? canonical(dirname(dirname(managedCurrentSessionDir)))
@@ -23843,7 +23970,7 @@ async function spawnCli(
         home: sandboxHome,
         cliBin: cliAdapter.resolvedBin,
         cliArgs: args,
-        tempDir: canonical(sessionScratchDir),
+        tempDir: sessionScratchDir,
         effectivePath: perBotInjectEnv.PATH ?? childEnv.PATH,
         identityBin: childEnv.BOTMUX_IDENTITY_BIN,
         trustedBotmuxCommandPaths: [defaultGatewayEntry().command],
@@ -23851,6 +23978,7 @@ async function spawnCli(
         larkCliDataDir: childLarkDataRoot,
         useBwrapArgsFile: effectiveBackendType === 'tmux',
         minimaxDataDir: cliAdapter.id === 'minimax' ? cliAdapter.authPaths?.[0] : undefined,
+        childTarOptions: perBotInjectEnv.TAR_OPTIONS ?? childEnv.TAR_OPTIONS,
       });
       if (!sbx) {
         // FAIL-SAFE: never silently run unsandboxed.
@@ -24025,6 +24153,7 @@ async function spawnCli(
         dataDir: scratchDataDir,
         storage,
         tmpfsSizeMb: cfg.scratchTmpfsSizeMb,
+        tempDir: sessionScratchDir,
         net: spawnNetworkShape.netEnabled,
         chdir: cfg.workingDir,
         home: scratchHome,
@@ -24054,6 +24183,10 @@ async function spawnCli(
       );
       publishSandboxRelayCapability();
       log(`Sandbox ON (${cfg.cliId}, scratch full-root COW, ${storage}): merged=${sbx.mergedHostPath} outbox=${sbx.outbox}`);
+      if (sbx.submountOverflow && !scratchSubmountOverflowNotified) {
+        scratchSubmountOverflowNotified = true;
+        send({ type: 'user_notify', message: scratchSubmountOverflowNotice(sbx.submountOverflow), turnId: currentBotmuxTurnId });
+      }
     }
     // Host-side reads of CLI-written files (transcript bridge, rollouts, cwd
     // products) resolve through the scratch mappings for this spawn.
@@ -24658,14 +24791,19 @@ async function spawnCli(
       // of its command descendants enter this per-session scope.
       // If a prior worker crashed after its pane vanished, retire any detached
       // descendant still held by this exact logical session's old scope before
-      // reusing the deterministic unit name.
-      stopSessionScope(cfg.sessionId);
-      const scoped = wrapCommandInSessionScope(
+      // reusing the deterministic unit name. A scope that survives stop and
+      // SIGKILL would make every relaunch fail with "Unit … already exists";
+      // launch under a spawn-generation name instead and say what held it.
+      const { scoped, release: scopeRelease } = prepareSessionScopedLaunch(
         cfg.sessionId,
+        spawnGeneration,
         spawnBin,
         spawnArgs,
         readGlobalConfig().worker,
       );
+      if (scopeRelease.blocked) {
+        log(`Session scope name unavailable, launching under ${scopeRelease.unitName}: ${scopeRelease.blocked}`);
+      }
       spawnBin = scoped.bin;
       spawnArgs = scoped.args;
       scopePayloadLauncherActive = !!scoped.unitName;
@@ -25078,14 +25216,16 @@ async function spawnCli(
   lastSpawnCodexExecutable = codexFilterExecutable;
   const startTraexLauncherPidResolve = (launcherPid: number): void => {
     if (cfg.cliId !== 'traex' || !traexLauncherActive) return;
-    scheduleWrapperRealCliPid(launcherPid, {
-      findRealPid: (lp) => findLaunchedCliPid(lp, 'traex'),
+    scheduleTraexLeafPidResolve(launcherPid, {
       getBackend: () => backend,
       getChildPid: () => backend?.getChildPid?.(),
       applyRealPid: (realPid) => {
         log(`TRAE launcher: resolved real traex leaf pid ${realPid} under launcher ${launcherPid}; rewiring ownership pid`);
         (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
         (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
+        // Same pair applyResolvedCliPid keeps in step: a launch-payload binding
+        // may already have pointed the bridge pid at a layer above this leaf.
+        bridgeCliPid = realPid;
         publishLocalProcessAttestation(realPid);
       },
       schedule: (fn, ms) => { setTimeout(fn, ms); },
@@ -26327,7 +26467,9 @@ function stopOwnedSessionScope(reason: string): void {
   const cfg = lastInitConfig;
   if (!cfg || cfg.adoptMode || isRemoteBackendType(effectiveBackendType)) return;
   try {
-    const stopped = stopSessionScope(cfg.sessionId);
+    // Includes spawn-generation fallback scopes, also ones a previous worker
+    // picked before this worker reattached the pane.
+    const stopped = stopAllSessionScopes(cfg.sessionId);
     log(stopped
       ? `Stopped owned session scope (${reason})`
       : `Owned session scope was absent or could not be stopped (${reason})`);
@@ -29032,10 +29174,13 @@ function publishLocalProcessAttestation(
   enginePid = codexRpcEngine?.appServerPid,
 ): void {
   const cliProcStart = cliPid ? readProcessStartIdentity(cliPid) : undefined;
-  // Keep the signed birth token frozen. Re-reading it for a cached PID would
-  // silently authorize a replacement process after PID reuse.
-  const engineProcStart = enginePid ? readProcessStartIdentity(enginePid) : codexAppEngineIdentity?.procStart;
-  enginePid ??= codexAppEngineIdentity?.pid;
+  // Freeze the proven birth token; explicit legacy RPC roots keep priority.
+  enginePid ??= codexAppEngineIdentity?.pid ?? codexAppRunnerProcessIdentity?.enginePid;
+  const engineProcStart = codexAppEngineIdentity && enginePid === codexAppEngineIdentity.pid
+    ? codexAppEngineIdentity.procStart
+    : codexAppRunnerProcessIdentity && enginePid === codexAppRunnerProcessIdentity.enginePid
+      ? codexAppRunnerProcessIdentity.engineProcStart
+      : enginePid ? readProcessStartIdentity(enginePid) : undefined;
   send({
     type: 'local_process_attestation',
     backendType: effectiveBackendType,

@@ -134,6 +134,7 @@ import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescript
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
 import { coordinationModeIsPrimary, initializeDurableCoordinationRuntime } from './services/durable-coordination-runtime.js';
+import { effortTaskFingerprint } from './services/codex-effort-task-state.js';
 import { closeLinkRefRuntime, initializeLinkRefRuntime } from './services/link-ref-runtime.js';
 import { startDurableInboxShadowConsumer } from './services/durable-inbox-shadow-consumer.js';
 import {
@@ -577,7 +578,7 @@ import {
 import { computeInputHash } from './utils/canonical-input-hash.js';
 import { matchingScheduleBotGrant, botScheduleAuthority, assertScheduleBotGrantActive } from './core/schedule-bot-grant.js';
 import { authorizeDelegatedScheduleRun, authorizeScheduleSelfManage } from './core/schedule-delegated-runtime.js';
-import { parseScheduledTurnId } from './core/scheduled-turn-provenance.js';
+import { parseScheduledTurnId, readScheduledTaskFromAuthority } from './core/scheduled-turn-provenance.js';
 import { claimCardLocation, createScheduleIdentityClaims, resolveScheduledRunIdentity, type ScheduledRunIdentity } from './core/schedule-identity-claim.js';
 import { TRIGGER_USER_AUTH_TOOLS, delegatesOnMention } from './services/trigger-user-auth.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
@@ -4135,21 +4136,6 @@ export async function noteTurnReceived(
     // Keep recent timestamps for delivery retries; unknown/evicted turns omit waiting time.
     if (received.size > 512) received.delete(received.keys().next().value!);
   }
-  // Trigger-user CLI auth: publish (or withhold) the acting identity for THIS
-  // turn. This is the per-message acceptance point — every inbound turn passes
-  // through here before reaching the worker — so it is the one place that can
-  // guarantee no turn runs with the previous sender's credentials still on disk.
-  // It precedes the reaction bookkeeping and its early returns: a card-on session
-  // returns below, but its turns need the identity refreshed just the same.
-  //
-  // The enablement check is SYNCHRONOUS on purpose. An unconditional `await`
-  // here would yield a microtask before the bookkeeping below on every turn of
-  // every bot, reordering concurrent turns that the single-flight paths depend
-  // on. A feature that is off must not perturb timing at all, so the await only
-  // happens once a bot has actually opted in.
-  if (triggerUserAuthEnabledFor(ds)) {
-    await refreshTurnCliIdentity(ds, _turnId ?? triggerMessageId);
-  }
   // Replaces the old 「处理中」 placeholder card. That card existed only to be
   // PATCHed with the final answer, and `im.v1.message.patch` is silent (no Feishu
   // notification / unread) — so card-off answers could land unseen. The
@@ -4171,27 +4157,35 @@ export async function noteTurnReceived(
   // reaction-free (it is meeting-driven and routes through the audited listener
   // action, not the ordinary progress-reaction channel). Transcript deliveries
   // never reach this inbound-message acceptance point at all.
-  if (ds.session.vcMeetingReceiver
-    && resolveVcMeetingImTurnOrigin(ds.session, triggerMessageId) !== undefined) return;
-  // Turn-exact card-off check: the reaction ack belongs to THIS message's turn,
-  // not to whichever turn most recently overwrote currentReplyTarget.
-  if (!streamingCardDisabledFor(ds, triggerMessageId)) return;
-  if (silentTurnReactionsFor(ds)) return;
-  // Only Lark messages carry reactions — doc-comment ids / chat anchors can't.
-  if (!triggerMessageId.startsWith('om_')) return;
-  if ((ds.pendingAckReactions ??= []).some(a => a.messageId === triggerMessageId)) return;
-  // Add the ✋ FIRST, register the entry only after it lands. If we pushed the
-  // entry before awaiting addReaction, a previous turn's idle edge
-  // (finishTurnReactions) could detach this half-formed entry mid-flight —
-  // DONE-ing a message that hasn't even reached the worker yet and orphaning its
-  // reactionId. Callers await this before dispatching the message to the worker,
-  // so a registered entry is always in place before its own turn can go idle.
   let reactionId: string;
   try {
-    reactionId = await addReaction(ds.larkAppId, triggerMessageId, receivedReactionEmoji ?? receivedReactionEmojiFor(ds));
-  } catch (err) {
-    logger.debug(`[reaction] received add failed for ${triggerMessageId}: ${err instanceof Error ? err.message : String(err)}`);
-    return;
+    if (ds.session.vcMeetingReceiver
+      && resolveVcMeetingImTurnOrigin(ds.session, triggerMessageId) !== undefined) return;
+    // Turn-exact card-off check: the reaction ack belongs to THIS message's turn,
+    // not to whichever turn most recently overwrote currentReplyTarget.
+    if (!streamingCardDisabledFor(ds, triggerMessageId)) return;
+    if (silentTurnReactionsFor(ds)) return;
+    // Only Lark messages carry reactions — doc-comment ids / chat anchors can't.
+    if (!triggerMessageId.startsWith('om_')) return;
+    if ((ds.pendingAckReactions ??= []).some(a => a.messageId === triggerMessageId)) return;
+    // Add the ✋ FIRST, register the entry only after it lands. If we pushed the
+    // entry before awaiting addReaction, a previous turn's idle edge
+    // (finishTurnReactions) could detach this half-formed entry mid-flight —
+    // DONE-ing a message that hasn't even reached the worker yet and orphaning its
+    // reactionId. Callers await this before dispatching the message to the worker,
+    // so a registered entry is always in place before its own turn can go idle.
+    try {
+      reactionId = await addReaction(ds.larkAppId, triggerMessageId, receivedReactionEmoji ?? receivedReactionEmojiFor(ds));
+    } catch (err) {
+      logger.debug(`[reaction] received add failed for ${triggerMessageId}: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+  } finally {
+    // 每个入口都先完成本轮身份准备，再把消息交给 worker。
+    // 表情先展示；登记待完成表情时身份已就绪，完成状态与本轮执行保持一致。
+    if (triggerUserAuthEnabledFor(ds)) {
+      await refreshTurnCliIdentity(ds, _turnId ?? triggerMessageId);
+    }
   }
   (ds.pendingAckReactions ??= []).push({ messageId: triggerMessageId, reactionId });
 }
@@ -9085,7 +9079,8 @@ for (const sessionRelayMutation of V3_SESSION_RUN_MUTATIONS) {
           : undefined,
         selfLarkAppId: selfV3LarkAppId,
         baseDir: v3DefaultBaseDir(),
-        sessionDataDir: config.session.dataDir,
+        loadScheduledTask: (appId, taskId) =>
+          readScheduledTaskFromAuthority(scheduleAuthorityStore, appId, taskId),
         // Live owner gate for scheduled turns: the task creator must still be
         // in the bot's resolvedAllowedUsers, so removing a creator revokes
         // their scheduled tasks' workflow authority immediately.
@@ -20498,10 +20493,12 @@ async function admitFollowerBehindOpening(
     turnId: string;
     dispatchAttempt?: number;
     build: () => Promise<CliTurnPayload>;
+    isCurrent?: () => boolean;
   },
 ): Promise<void> {
   await runSessionTurn(ds.session.sessionId, async () => {
     const cliInput = await follower.build();
+    if (follower.isCurrent && !follower.isCurrent()) throw new Error('Effort task session changed before queued activation admission');
     admitQueuedActivationTail(ds, {
       userPrompt: follower.userPrompt,
       cliInput,
@@ -22205,13 +22202,18 @@ async function stageCrossPrincipalInterruption(args: {
   owner: TrustedCaller;
   proposer: TrustedCaller;
   message: CrossPrincipalInterruptionMessage;
+  isCurrent?: () => boolean;
+  onAdmitted?: () => void;
 }): Promise<boolean> {
   const { ds, ownerTurnId, owner, proposer } = args;
+  if (args.isCurrent && !args.isCurrent()) return false;
   if (ds.session.status !== 'active') return true;
   const { message, choice } = sanitizeCrossPrincipalMessage(args.message);
   if (await trySettleCrossPrincipalProposerChoice(ds, proposer, args.message.text, args.message.mentions)) {
+    args.onAdmitted?.();
     return true;
   }
+  if (args.isCurrent && !args.isCurrent()) return false;
   if (ds.session.status !== 'active') return true;
   const staged = stageCrossPrincipalInterruptionRecord({
     session: ds.session,
@@ -22224,6 +22226,7 @@ async function stageCrossPrincipalInterruption(args: {
     message,
   });
   if (!staged.inserted) {
+    args.onAdmitted?.();
     logger.info(`[${tag(ds)}] duplicate cross-principal handoff merged turn=${message.turnId.slice(0, 12)}`);
     if (choice && await applyCrossPrincipalProposerChoice(ds, staged.record, choice)) {
       return true;
@@ -22233,6 +22236,7 @@ async function stageCrossPrincipalInterruption(args: {
   // Durable write is the ownership handoff boundary. The worker-pool clears its
   // original delivery record only after this function returns true.
   persistCrossPrincipalQueue(ds);
+  args.onAdmitted?.();
   if (choice && await applyCrossPrincipalProposerChoice(ds, staged.record, choice)) {
     return true;
   }
@@ -27107,6 +27111,7 @@ async function handleThreadReplyAdmitted(
   ctx: RoutingContext,
   prepared?: PreparedThreadReply,
   replay?: { parsed: LarkMessage; resources: MessageResource[] },
+  effortSessionIsCurrent?: () => boolean,
 ): Promise<void> {
   noteInboundSenderUnionId(ctx.larkAppId, data); // see handleNewTopicAdmitted
   if (!replay && handleDocumentAskTextReply(data, ctx)) return;
@@ -27282,6 +27287,9 @@ async function handleThreadReplyAdmitted(
   // threadCommandLane 是免@ 命令模板改写**之前**的正文；没有模板时与 content
   // 逐字相同（见上方 threadCommandPrompt 处的说明）。
   let cmdContent = stripLeadingMentions(threadCommandLane, parsed.mentions);
+  // The administrative effort prefix was already consumed. Its attached task
+  // remains literal model text while quota/resources/principal admission run.
+  if (ctx.effortTaskReentry) cmdContent = '';
   // Keep the three values consumed by the remainder of this function in lock
   // step. In particular, workflow/slash parsing reads cmdContent while worker
   // injection reads content/parsed.content; listener input is never trusted as
@@ -27339,8 +27347,8 @@ async function handleThreadReplyAdmitted(
   // ^https?://127.0.0.1, so the mention prefix breaks the match — fall back to
   // the mention-stripped cmdContent so pasting the callback back into the
   // topic still works.
-  const callbackText = isCallbackUrl(content) ? content
-    : isCallbackUrl(cmdContent) ? cmdContent : null;
+  const callbackText = !ctx.effortTaskReentry && isCallbackUrl(content) ? content
+    : !ctx.effortTaskReentry && isCallbackUrl(cmdContent) ? cmdContent : null;
   if (callbackText) {
     const result = await handleCallbackUrl(callbackText);
     if (result) {
@@ -27494,7 +27502,7 @@ async function handleThreadReplyAdmitted(
   // 触发的排除理由），拦截器这里只负责拿着结果去 settle。
   // 没有 hook 连着的 dormant hook ask（hook 随 CLI 退出、或重启后还没重连）不在
   // 候选里——broker 的 list/find 已过滤：此刻没有 CLI 在等答案，这条文字照常进会话。
-  const askCandidate = askCustomReplyCandidate({
+  const askCandidate = ctx.effortTaskReentry ? null : askCustomReplyCandidate({
     senderOpenId: threadSenderOpenId,
     chatId: threadChatId,
     cmdContent,
@@ -27554,6 +27562,7 @@ async function handleThreadReplyAdmitted(
   logger.info(`Reply in ${scope}-scope session ${anchor.substring(0, 12)}: ${content.substring(0, 100)} (resources: ${resources.length})`);
 
   let ds = activeSessions.get(runtimeSessionKey);
+  if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
   // cmdContent (mention-stripped), matching the host-ask gate below: a raw
   // "@<bot> 另开任务" is not a choice, so the answer would fall through, the
   // record would time out, and the notice would ask for the answer just sent.
@@ -27710,6 +27719,7 @@ async function handleThreadReplyAdmitted(
     return;
   }
   // 种子 = 闸刚校验的 parsed.content。prepared 重投时闸已在新话题入口跑过（那边已调度）；
+  if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
   // 免@ 命令模板与监听器包装的正文不是用户在说事。
   if (groupAutoTitlePending && !prepared?.quotaChecked && !threadCommandPrompt && !listenerPrompt) {
     const seed = groupAutoTitleSeedFrom(parsed.content, parsed.mentions);
@@ -27743,6 +27753,7 @@ async function handleThreadReplyAdmitted(
     }
   }
 
+  if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
   // Update last message time + last caller (used by `botmux send` to address
   // reply cards to whoever triggered this turn — matters in oncall groups
   // where the caller is often not the session owner).
@@ -27843,6 +27854,7 @@ async function handleThreadReplyAdmitted(
     await admitFollowerBehindOpening(ds, tailReservation, {
       userPrompt: promptContent,
       turnId: parsed.messageId,
+      ...(effortSessionIsCurrent ? { isCurrent: effortSessionIsCurrent } : {}),
       build: async () => {
         const tailBot = getBot(ds.larkAppId);
         const botCfg = tailBot.config;
@@ -27850,6 +27862,7 @@ async function handleThreadReplyAdmitted(
         // <user_message> 壳与 <sender/> 标签。
         const tailSender = await getThreadSender();
         await resolveSoloSessionForTurn(ds, ctxChatType, tailSender);
+        if (effortSessionIsCurrent && !effortSessionIsCurrent()) throw new Error('Effort task session changed during queued activation preparation');
         const followUp = buildFollowUpCliInput(promptContent, ds.session.sessionId, {
           attachments,
           mentions: parsed.mentions,
@@ -28374,6 +28387,7 @@ async function handleThreadReplyAdmitted(
     return;
   }
 
+  if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
   // Daemon-side hint: divert an already-known different principal before IPC.
   // The worker remains authoritative and hands a raced rejection back through
   // onOrdinaryImInputRejected; both paths converge on the same durable record.
@@ -28396,13 +28410,16 @@ async function handleThreadReplyAdmitted(
     && !sameTrustedPrincipal(activePrincipalTurn.controller, threadTrustedCaller)) {
     const taskController = activePrincipalTurn.controller ?? activePrincipalTurn.caller;
     const sender = await getThreadSender();
+    if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
     messageQueue.ensureQueue(anchor);
     messageQueue.appendMessage(anchor, parsed);
     publishSessionMessagePreviewPatch(ds);
-    markIngressAdmitted(ctx);
+    if (!ctx.effortTaskReentry) markIngressAdmitted(ctx);
     await noteTurnReceived(ds, parsed.messageId, parsed.content, sender, parsed.messageId);
+    if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
     await stageCrossPrincipalInterruption({
       ds,
+      ...(ctx.effortTaskReentry ? { isCurrent: effortSessionIsCurrent, onAdmitted: () => markIngressAdmitted(ctx) } : {}),
       ownerTurnId: activePrincipalTurn.turnId,
       owner: taskController,
       proposer: threadTrustedCaller,
@@ -28474,6 +28491,7 @@ async function handleThreadReplyAdmitted(
     const turnSender = await getThreadSender();
     // transcript 模式按轮重算 solo（bridge 会话本就是裸文本，跳过）。
     if (!isBridge) await resolveSoloSessionForTurn(ds, ctxChatType, turnSender);
+    if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
     const openingTurn = wantsOpening && claimInitialUserTurn(ds);
     const cliInput = isBridge
       ? { content: buildGroupContextBridgeInput(promptContent, ds.session.sessionId, {
@@ -28556,6 +28574,7 @@ async function handleThreadReplyAdmitted(
         mentions: parsed.mentions,
       };
     }
+    if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
     // A principal lane is concurrent with other lanes, but strictly serial
     // inside itself for the ENTIRE CLI turn.  Admission-key serialization only
     // covers routing/materialisation and therefore cannot protect the mutable
@@ -28632,6 +28651,9 @@ async function handleThreadReplyAdmitted(
       if (accepted) {
         // 消息已实际送入 live worker——之后的收尾失败不得再诱导重发。
         markIngressAdmitted(ctx);
+        if (ctx.effortTaskReentry && ctx.durablePrimaryDispatch && !hasDurablePrimaryInputCommit(ds, parsed.messageId)) {
+          retryDurablePrimaryIngress(ctx, 'attached task provider submit receipt is still pending');
+        }
         beginNewTurn(ds, parsed.content, parsed.messageId);
         if (threadTrustedCaller) {
           setActiveInteractiveTurn(
@@ -28649,6 +28671,7 @@ async function handleThreadReplyAdmitted(
               parsed.messageId,
               ctx.durablePrimaryDispatch.signal,
             );
+            if (ctx.effortTaskReentry && ctx.ingressAdmission) delete ctx.ingressAdmission.retryReason;
           } catch (error) {
             if (ctx.durablePrimaryDispatch.signal.aborted) throw error;
             retryDurablePrimaryIngress(ctx, 'provider submit receipt is still pending');
@@ -29227,6 +29250,7 @@ interface ThreadSlashContext {
 
 async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
   const { ctx, data, larkAppId, scope, anchor, replyRootId, parsed, resources, cmdContent, routingChatId, chatType, chatId, senderOpenId, senderUnionId, teamTrustUnionId, isBotSenderType, isForeignBotSender, substituteTrigger, getThreadSender } = slash;
+  if (ctx.effortTaskReentry) return false;
   // Intercept daemon commands
   // acceptSlashFromBots gate (mirror of the new-topic path): a bot sender's
   // slash is only routed as a command when this bot opts in (default on); when
@@ -29371,6 +29395,51 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       messageId: parsed.messageId,
       replyRootId,
     });
+    invocationDeps.submitEffortTask = async (ds, message, text) => {
+      const committed = !!ctx.durablePrimaryDispatch && hasDurablePrimaryInputCommit(ds, message.messageId);
+      const sessionId = ds.session.sessionId;
+      const worker = ds.worker;
+      const workerGeneration = ds.workerGeneration;
+      const generation = ds.session.workerGeneration;
+      const nativeId = ds.session.cliSessionId;
+      const current = () => activeSessions.get(sessionKey(ctx.runtimeRoutingAnchor ?? anchor, larkAppId)) === ds
+        && ds.session.sessionId === sessionId
+        && !ctx.durablePrimaryDispatch?.signal.aborted
+        && (committed || (ds.worker === worker && !!worker && !worker.killed
+          && ds.workerGeneration === workerGeneration
+          && ds.session.workerGeneration === generation && ds.session.cliSessionId === nativeId))
+        && ds.session.status === 'active';
+      const taskCtx: RoutingContext = { ...ctx, ingressAdmission: { admitted: false },
+        cascadeBodyReentry: true, effortTaskReentry: true, commandTrigger: undefined };
+      if (!current()) return false;
+      if (ctx.durablePrimaryDispatch?.signal.aborted) return false;
+      try {
+        await handleThreadReplyAdmitted(data, taskCtx, undefined, {
+          parsed: { ...message, content: text }, resources: [...resources],
+        }, current);
+      } catch (error) {
+        logger.error(`[${tag(ds)}] Attached effort task admission failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      ctx.ingressAdmission ??= { admitted: false };
+      ctx.ingressAdmission.admitted ||= taskCtx.ingressAdmission?.admitted === true;
+      if (taskCtx.ingressAdmission?.retryReason) ctx.ingressAdmission.retryReason = taskCtx.ingressAdmission.retryReason;
+      // Post-admission persistence/notification failures must never invite a
+      // retry of an input already owned by a worker or a durable FIFO.
+      return taskCtx.ingressAdmission?.admitted === true || !!taskCtx.ingressAdmission?.retryReason;
+    };
+    if (ctx.durablePrimaryDispatch) {
+      invocationDeps.effortTaskReplay = {
+        inputHash: effortTaskFingerprint({ ...parsed, content: commandContent }, resources),
+        checkpoint: async (session, isCurrent) => {
+          if (ctx.durablePrimaryDispatch?.signal.aborted) throw new Error('Effort task Inbox claim was aborted');
+          if (!ctx.checkpointPreAdmissionSession) throw new Error('Effort task canonical checkpoint is unavailable');
+          await ctx.checkpointPreAdmissionSession(session, isCurrent);
+          if (ctx.durablePrimaryDispatch?.signal.aborted) throw new Error('Effort task Inbox claim was aborted');
+        },
+        retry: reason => { retryDurablePrimaryIngress(ctx, reason); },
+        complete: () => markIngressAdmitted(ctx),
+      };
+    }
     const effectiveThreadChatId = existingDs?.chatId ?? chatId;
     const restrictedText = grantRestrictedSlashCommandText(larkAppId, effectiveThreadChatId, senderOpenId, cmd);
     if (restrictedText) {
@@ -31299,6 +31368,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     getActiveCount,
     prepareRawInputTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
+    loadScheduledTaskForIdentity: (appId, taskId) =>
+      readScheduledTaskFromAuthority(scheduleAuthorityStore, appId, taskId),
     onTriggerTurnStarted: (ds, title, turnId) => beginNewTurn(ds, title, turnId),
     closeSession(ds: DaemonSession): Promise<boolean> {
       // Route through the dashboard-aware helper so session.exited / session.update

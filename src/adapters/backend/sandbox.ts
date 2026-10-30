@@ -27,7 +27,7 @@ import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
-import { compileToBwrap, type FsPolicy } from '../cli/fs-policy.js';
+import { accessForPath, compileToBwrap, type FsPolicy } from '../cli/fs-policy.js';
 import { CA_BUNDLE_ENV_KEYS, PROXY_ENV_KEYS } from '../../utils/child-env.js';
 import { isStandaloneBinary } from '../../core/self-spawn.js';
 import { linuxIsolationLaunch, linuxIsolationLaunchViaArgsFile } from '../../core/linux-isolation.js';
@@ -404,6 +404,68 @@ export function reexposeRunBinArgs(binPaths: (string | undefined)[]): string[] {
   const out: string[] = [];
   for (const dir of dirs) out.push('--ro-bind-try', dir, dir);
   return out;
+}
+
+/** systemd-resolved, resolvconf and NetworkManager make /etc/resolv.conf a
+ *  symlink into /run, which every sandbox replaces with a fresh tmpfs — the
+ *  link then dangles inside and name resolution fails (EAI_AGAIN) while the
+ *  host terminal works. Follows the chain hop by hop and returns the FIRST
+ *  hop lexical-under a shadowed root: that is where the in-sandbox lookup
+ *  stops, since the fresh tmpfs holds none of the host's entries — not even a
+ *  symlinked directory that happens to live under /run on the host. A
+ *  symlinked PARENT outside the shadowed roots (Debian's /var/run → /run) is
+ *  still resolved on the host because the sandbox replicates that one.
+ *  Undefined when the chain never enters a shadowed root, loops, or cannot be
+ *  read. Note the link TEXT escaping the bound tree is not handled (an oncall
+ *  root has no /var/run symlink, so /etc/resolv.conf → /var/run/… breaks one
+ *  hop earlier than any bind can reach). */
+export function shadowedResolverPath(link = '/etc/resolv.conf', shadowedRoots: readonly string[] = ['/run']): string | undefined {
+  let current = link;
+  for (let hop = 0; hop < 16; hop++) {
+    let target: string;
+    try {
+      if (!lstatSync(current).isSymbolicLink()) return undefined;
+      target = readlinkSync(current);
+    } catch { return undefined; }
+    current = resolve(dirname(current), target);
+    // Canonicalise a symlinked parent only while the chain is still OUTSIDE
+    // the shadowed roots (the sandbox follows those too, e.g. /var/run → /run);
+    // a missing one (dangling link) stays lexical. Once lexical-inside a
+    // shadowed root, resolving the parent would point at a host path the fresh
+    // tmpfs does not contain — the in-sandbox lookup stops at the literal name.
+    const insideShadowedRoot = shadowedRoots.some(
+      root => current === root || current.startsWith(`${root}/`),
+    );
+    if (!insideShadowedRoot) {
+      try { current = join(realpathSync(dirname(current)), basename(current)); } catch { /* */ }
+    }
+    if (shadowedRoots.some(root => current.startsWith(`${root}/`))) return current;
+  }
+  return undefined;
+}
+
+/** Read-only bind of the host's resolver file at its shadowed hop. Only the
+ *  one file: its directory also holds resolved's Unix sockets. A bind pins
+ *  the inode, so a resolver rewritten by rename mid-session is seen by the
+ *  next session, not the running one. No args when /etc/resolv.conf is a
+ *  plain file, the chain does not end in a regular file, or `denied` matches
+ *  any name of it — policies hold CANONICAL paths, so an operator's deny of
+ *  /etc/resolv.conf arrives as the /run target and must still win. */
+export function hostResolverBindArgs(opts: {
+  denied: (path: string) => boolean;
+  link?: string;
+  shadowedRoots?: readonly string[];
+}): string[] {
+  const link = opts.link ?? '/etc/resolv.conf';
+  const hop = shadowedResolverPath(link, opts.shadowedRoots);
+  if (!hop) return [];
+  let source: string;
+  try {
+    source = realpathSync(link);
+    if (!statSync(source).isFile()) return [];
+  } catch { return []; }
+  if ([link, hop, source].some(opts.denied)) return [];
+  return ['--dir', dirname(hop), '--ro-bind', source, hop];
 }
 
 /** Canonicalize if possible (Seatbelt/bwrap both resolve symlinks). */
@@ -996,6 +1058,24 @@ export interface DirectSandboxSpawn {
  * No overlays, no upper/work dirs — writes inside readWrite zones hit the
  * real filesystem directly.
  */
+/**
+ * TAR_OPTIONS for the bwrap child. `--unshare-user` maps only the worker's own
+ * uid, so for a daemon running as root GNU tar (root → --same-owner by
+ * default) fails every extraction of an archive owned by anyone else
+ * ("Cannot change ownership to uid 1001: Invalid argument"). CLIs that fetch
+ * their helpers as tarballs hit it on every start: Pi re-downloads fd/rg each
+ * launch and swallows the first input while doing so. `--no-same-owner` is
+ * already tar's default for non-root, so only root gets it; the child's own
+ * TAR_OPTIONS (bot env or worker env) is kept and extended, and one that
+ * already picks an owner mode is left alone. undefined = set nothing.
+ */
+export function sandboxTarOptions(inherited: string | undefined, uid: number | undefined): string | undefined {
+  if (uid !== 0) return undefined;
+  const current = inherited?.trim() ?? '';
+  if (/(^|\s)--(no-)?same-owner(\s|$)/.test(current)) return undefined;
+  return current ? `${current} --no-same-owner` : '--no-same-owner';
+}
+
 export function prepareDirectSandbox(opts: {
   networkPolicy?: SandboxNetworkPolicy;
   sessionId: string;
@@ -1033,6 +1113,9 @@ export function prepareDirectSandbox(opts: {
    * exact alias to its already-granted canonical directory on symlinked homes.
    * Only the minimax worker supplies this; absent leaves the mount plan intact. */
   minimaxDataDir?: string;
+  /** The child's own TAR_OPTIONS (bot env merged over the worker env), the
+   *  base sandboxTarOptions extends. Absent → the worker process env. */
+  childTarOptions?: string;
 }): DirectSandboxSpawn | null {
   if (process.platform !== 'linux') return null;
   const proxyError = networkProxyError(opts.networkPolicy, process.env);
@@ -1149,6 +1232,17 @@ export function prepareDirectSandbox(opts: {
   }
 
   const args = [...compiled.args];
+  // Recreate only this session's short link in the private namespace. Link to
+  // the already-mounted policy view so descendant deny masks still apply.
+  if (opts.tempDir && resolve(opts.tempDir) !== canonical(opts.tempDir)) {
+    const target = resolve(opts.tempDir);
+    const source = canonical(opts.tempDir);
+    if (!opts.policy.rules.some(rule => rule.access === 'readWrite' && rule.path === source)) {
+      rollbackSandboxSetup(sessionRoot, createdMasks);
+      throw new Error('session temp alias requires an exact writable scratch grant');
+    }
+    args.push('--dir', dirname(target), '--symlink', source, target);
+  }
   if (opts.networkPolicy) {
     args.push('--cap-drop', 'ALL', '--disable-userns', '--add-seccomp-fd', '5');
     const resolver = join(sessionRoot, 'resolv.conf');
@@ -1156,8 +1250,12 @@ export function prepareDirectSandbox(opts: {
     // systemd-resolved links /etc/resolv.conf into /run, which the sandbox
     // masks with a fresh tmpfs. Recreate only the resolved parent and bind our
     // explicit DNS file there, without exposing the host resolver directory.
-    const resolverTarget = canonical('/etc/resolv.conf');
+    const resolverTarget = shadowedResolverPath() ?? canonical('/etc/resolv.conf');
     args.push('--dir', dirname(resolverTarget), '--ro-bind', resolver, resolverTarget);
+  } else {
+    // Same /run masking without a policy: re-expose the host's own resolver
+    // file (read-only) unless the operator denied it.
+    args.push(...hostResolverBindArgs({ denied: path => accessForPath(opts.policy.rules, path).access === 'deny' }));
   }
   // Shim bin at a fixed path under the fresh /run tmpfs — appended after the
   // rule mounts (later mount wins over the tmpfs). PATH points here first.
@@ -1257,6 +1355,8 @@ export function prepareDirectSandbox(opts: {
   if (process.env.BOTMUX_DAEMON_IPC_PORT) {
     env.BOTMUX_DAEMON_IPC_PORT = process.env.BOTMUX_DAEMON_IPC_PORT;
   }
+  const tarOptions = sandboxTarOptions('childTarOptions' in opts ? opts.childTarOptions : process.env.TAR_OPTIONS, process.getuid?.());
+  if (tarOptions !== undefined) env.TAR_OPTIONS = tarOptions;
   if (sandboxMcpGatewaySocketPath) {
     env[MCP_GATEWAY_SOCKET_ENV] = sandboxMcpGatewaySocketPath;
     env[MCP_GATEWAY_REQUIRED_ENV] = '1';
