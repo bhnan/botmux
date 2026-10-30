@@ -33,3 +33,9 @@
 expected-link仅检查渲染卡片是否包含显式指定URL，删除行出现相同URL也会满足；该既有语义不能证明修改后的文档保留链接。
 
 直连/host路径使用真实CLI及假provider验证，已有watcher协议回归通过；没有在真实OS sandbox做端到端验证。本轮不改变生产守卫、身份、投递或回放语义。
+
+## FIFO修复本地回归
+
+新增无写端FIFO的真实CLI回归，5秒保护超时内必须拿到exit2及单行“diff需要普通UTF-8文件”，不能把超时当通过；旧实现超时失败。普通文件symlink正控保留接受。修复仅使用O_RDONLY|O_NONBLOCK并保留fstat普通文件检查。目标CLI24项在Vitest与原生Bun均通过，普通/超大文件、增长、UTF-8、final/回放及relay行为保持；本轮按明确授权更新至既有PR。
+
+本地FIFO修复完整构建与utree总结通过；移除O_NONBLOCK会再次触发回归超时，源码精确恢复。当前构建实际CLI对FIFO迅速返回exit2，对普通文件、symlink和5.3MiB差异返回exit0，超大预览保持120行（两文件各60）。

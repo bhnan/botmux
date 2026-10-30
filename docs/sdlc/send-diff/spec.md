@@ -62,3 +62,7 @@ src/services/send-policy.ts：parseDiffFlag/diffUsageError；src/im/lark/md-card
 ## diff调用中的链接约定
 
 botmux-send技能规定：文内链接按普通diff文本展示，不自动收集或加入--expected-link校验。云端文档入口URL在摘要中交付，需要防漏时可显式用--expected-link指定该入口，文内其他链接不加入。校验沿用整张卡片包含指定URL的既有行为，不强制只在摘要区域匹配；本轮不改CLI逻辑。
+
+## FIFO非阻塞文件检查
+
+使用O_RDONLY|O_NONBLOCK打开diff路径，再以fstat检查已打开对象是否为普通文件。无写端FIFO立即进入既有exit2错误路径，不读取管道内容；普通文件及symlink指向普通文件保持接受。未添加O_NOFOLLOW，不扩展管道输入接口，2MiB前缀和60行预览预算不变。

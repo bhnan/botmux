@@ -34,7 +34,7 @@ import { authorizeOwnerlessScheduleCreator, authorizeScheduleOperator,
 import { readScheduleUpdate, SCHEDULE_UPDATE_USAGE } from './cli/schedule-update.js';
 import { planScheduleFinalCleanup } from './cli/schedule-final-cleanup.js';
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, copyFileSync, createReadStream, readFileSync, writeFileSync, renameSync, readdirSync, statSync, unlinkSync, rmSync, realpathSync, openSync, fstatSync, readSync, closeSync } from 'node:fs';
+import { constants as fsConstants, existsSync, mkdirSync, copyFileSync, createReadStream, readFileSync, writeFileSync, renameSync, readdirSync, statSync, unlinkSync, rmSync, realpathSync, openSync, fstatSync, readSync, closeSync } from 'node:fs';
 import { underReadIsolation, sendCredFilePath } from './adapters/cli/read-isolation.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { readAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
@@ -10221,7 +10221,7 @@ type SendDiffInput = { files: DiffFile[]; inputBytes?: number; inputName: string
 
 function readSendDiffFile(path: string): SendDiffInput {
   try {
-    const fd = openSync(path, 'r');
+    const fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
     try {
       const stat = fstatSync(fd);
       if (!stat.isFile()) throw new Error('diff 需要普通 UTF-8 文件');

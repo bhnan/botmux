@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, watch, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, watch, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -14,6 +15,7 @@ const patch = '--- a/doc.md\n+++ b/doc.md\n@@ -1 +1 @@\n-old\n+new\n';
 const captured = (stdout: unknown) => String(stdout).split('\n')
   .filter(line => line.startsWith('CAPTURE_REPLY='))
   .map(line => JSON.parse(line.slice('CAPTURE_REPLY='.length)));
+const posixIt = process.platform === 'win32' ? it.skip : it;
 
 function preview(args: string[], bytes: string | Buffer = patch, input = '', summaryContent = 'file summary\n', filePolicy?: 'forbid_read' | 'grow_after_stat') {
   const root = mkdtempSync(join(tmpdir(), 'botmux-diff-dry-'));
@@ -79,6 +81,42 @@ describe('send --diff CLI', () => {
     expect(empty.status, String(empty.stderr)).toBe(0);
     expect(JSON.parse(String(empty.stdout)).diff.stats.files).toBe(0);
   });
+
+  posixIt('rejects a FIFO without waiting for a writer', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-diff-fifo-'));
+    try {
+      const path = join(root, 'change.fifo');
+      execFileSync('mkfifo', [path], { timeout: 5_000 });
+      const result = spawnSyncTsScript(cli, ['send', '--dry-run', '--diff', path, '--no-mention'], {
+        env: { PATH: process.env.PATH, SESSION_DATA_DIR: join(root, 'data'), BOTS_CONFIG: join(root, 'missing.json') },
+        encoding: 'utf8', timeout: 5_000, killSignal: 'SIGKILL',
+      });
+      expect(result.status, String(result.stderr)).toBe(2);
+      expect(result.error).toBeUndefined();
+      expect(result.signal).toBeNull();
+      expect(String(result.stderr).trim()).toBe('botmux send: diff 需要普通 UTF-8 文件');
+      expect(String(result.stdout)).toBe('');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 30_000);
+
+  posixIt('accepts a symlink to a regular diff file', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-diff-symlink-'));
+    try {
+      const path = join(root, 'actual.diff');
+      const link = join(root, 'linked.diff');
+      writeFileSync(path, patch);
+      symlinkSync(path, link);
+      const result = spawnSyncTsScript(cli, ['send', '--dry-run', '--diff', link, '--no-mention'], {
+        env: { PATH: process.env.PATH, SESSION_DATA_DIR: join(root, 'data'), BOTS_CONFIG: join(root, 'missing.json') },
+        encoding: 'utf8', timeout: 5_000, killSignal: 'SIGKILL',
+      });
+      expect(result.status, String(result.stderr)).toBe(0);
+      expect(result.error).toBeUndefined();
+      const output = JSON.parse(String(result.stdout));
+      expect(output.fits).toBe(true);
+      expect(output.diff.stats).toEqual({ files: 1, added: 1, removed: 1 });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 30_000);
 
   it.each([
     { name: '摘要字节超限', summary: 'x'.repeat(4001), reason: '摘要过长' },
