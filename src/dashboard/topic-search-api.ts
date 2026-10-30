@@ -16,8 +16,9 @@ import { readGlobalConfig, type TopicSearchGlobalConfig } from '../global-config
 import { embedSummaryText } from '../topic/embedding-client.js';
 import { resolveTopicSearchConfig, type TopicSearchConfig } from '../topic/config.js';
 import { TopicSearchRuntime } from '../topic/runtime.js';
-import { TopicSearchService, type TopicSearchInput, type TopicSearchOutput } from '../topic/search.js';
+import { TopicSearchService, type TopicSearchFilters, type TopicSearchInput, type TopicSearchOutput } from '../topic/search.js';
 import type { TopicHistoryWindow, TopicReadTarget } from '../topic/source.js';
+import { scheduleTimeZone } from '../utils/timezone.js';
 import { logger } from '../utils/logger.js';
 
 export interface TopicSearchHostRegistry {
@@ -53,8 +54,8 @@ async function readTopicWindowViaDaemon(
   const params = new URLSearchParams({
     chatId: target.chatId,
     rootMessageId: target.rootMessageId,
-    limit: '200',
   });
+  if (target.untilMessageId) params.set('until', target.untilMessageId);
   const response = await fetchDaemonIpc(port, `/api/topic-messages?${params.toString()}`, {
     signal: AbortSignal.timeout(15_000),
   });
@@ -62,6 +63,8 @@ async function readTopicWindowViaDaemon(
   const body = await response.json() as {
     ok?: boolean;
     truncated?: boolean;
+    cursorFound?: boolean;
+    rootCreatedAtMs?: number;
     messages?: Array<{ messageId: string; senderType?: string; senderName?: string; text?: string; createTimeMs?: number }>;
   };
   if (body.ok !== true) throw new Error('topic_search_read_unavailable');
@@ -74,6 +77,8 @@ async function readTopicWindowViaDaemon(
       text: typeof m.text === 'string' ? m.text : '',
     })),
     truncated: body.truncated === true,
+    ...(body.cursorFound !== undefined ? { cursorFound: body.cursorFound } : {}),
+    ...(body.rootCreatedAtMs !== undefined ? { rootCreatedAtMs: body.rootCreatedAtMs } : {}),
   };
 }
 
@@ -130,6 +135,50 @@ export function topicSearchHostActive(): boolean {
 
 export type { TopicSearchInput, TopicSearchOutput };
 
+const CALENDAR_DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/** Wall-clock time in `zone` → UTC epoch ms (change.md 复测问题 4). */
+function zonedWallToUtcMs(wall: string, zone: string): number {
+  const naive = Date.parse(`${wall}Z`);
+  if (!Number.isFinite(naive)) return Number.NaN;
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone: zone,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  });
+  const parts = dtf.formatToParts(new Date(naive));
+  const get = (type: Intl.DateTimeFormatPartTypes) => Number(parts.find(p => p.type === type)?.value);
+  // Parts carry second precision: restore the sub-second part before deriving
+  // the offset, so wall times like .999 don't smear the result.
+  const asUtc = Date.UTC(get('year'), get('month') - 1, get('day'), get('hour') % 24, get('minute'), get('second')) + (naive % 1000);
+  return naive - (asUtc - naive);
+}
+
+/** Expand date-only bounds (YYYY-MM-DD from the UI date inputs) into full-day
+ * instants in the explicitly chosen calendar zone — the same zone the host's
+ * scheduled tasks use, so「3 日到 3 日」means the WHOLE local day 3, not its
+ * UTC midnight instant. Full ISO-8601 timestamps (with 'T') pass through
+ * unchanged; unparseable values are dropped rather than silently no-op'd. */
+export function expandTopicSearchDateFilters(
+  filters: TopicSearchFilters,
+  zone = scheduleTimeZone(),
+): TopicSearchFilters {
+  const expand = (value: string | null | undefined, endOfDay: boolean): string | null | undefined => {
+    if (typeof value !== 'string' || !value) return value;
+    if (value.includes('T')) return value; // explicit ISO datetime: caller means the instant
+    if (!CALENDAR_DAY_RE.test(value)) return undefined; // garbage: drop
+    const utc = zonedWallToUtcMs(`${value}T${endOfDay ? '23:59:59.999' : '00:00:00'}`, zone);
+    return Number.isFinite(utc) ? new Date(utc).toISOString() : undefined;
+  };
+  return {
+    ...filters,
+    from: expand(filters.from, false),
+    to: expand(filters.to, true),
+    sourceFrom: expand(filters.sourceFrom, false),
+    sourceTo: expand(filters.sourceTo, true),
+  };
+}
+
 export interface TopicSearchQueryOutcome {
   status: number;
   body:
@@ -161,7 +210,11 @@ export async function handleTopicSearchQuery(input: TopicSearchInput): Promise<T
   }
   const service = new TopicSearchService(serviceOptions);
   try {
-    const result = await service.search({ ...input, indexVersion: state.runtime.topicStore.catalogVersion() }, candidates);
+    const normalized: TopicSearchInput = {
+      ...input,
+      ...(input.filters ? { filters: expandTopicSearchDateFilters(input.filters) } : {}),
+    };
+    const result = await service.search({ ...normalized, indexVersion: state.runtime.topicStore.catalogVersion() }, candidates);
     return { status: 200, body: { ok: true, result } };
   } catch (error) {
     const code = (error as { code?: string }).code ?? 'invalid_request';

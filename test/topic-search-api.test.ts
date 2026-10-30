@@ -159,7 +159,7 @@ describe('handleTopicSearchQuery', () => {
       generatorKey: 'm1', now: '2026-10-29T00:00:00Z',
     });
     state!.runtime.topicStore.observeTopicTimes(topic.topicKey, {
-      earliestObservedAt: '2026-10-01T00:00:00Z', latestObservedAt: '2026-10-05T00:00:00Z',
+      earliestObservedAt: '2026-10-01T00:00:00Z', latestObservedAt: '2026-10-05T04:00:00Z',
     }, '2026-10-29T00:00:00Z');
     // 纯日期（无关键词）+ topicCreated 口径：10-01~02 命中，10-04 后不命中
     const hit = await handleTopicSearchQuery({ query: '', mode: 'auto', limit: 10, filters: { timeBasis: 'topicCreated', from: '2026-10-01T00:00:00Z', to: '2026-10-02T00:00:00Z' } });
@@ -170,6 +170,10 @@ describe('handleTopicSearchQuery', () => {
     // 旧参数 sourceFrom/sourceTo 兼容（映射 latestMessage 口径）：10-06 起排除
     const legacy = await handleTopicSearchQuery({ query: '', mode: 'auto', limit: 10, filters: { sourceFrom: '2026-10-06T00:00:00Z' } });
     expect(legacy.body.ok && legacy.body.result.items).toHaveLength(0);
+    // UI 日历日（YYYY-MM-DD）按宿主时区展开为完整日：同日 12:00 消息命中（复测问题4）
+    const dayOnly = await handleTopicSearchQuery({ query: '', mode: 'auto', limit: 10, filters: { timeBasis: 'latestMessage', from: '2026-10-05', to: '2026-10-05' } });
+    expect(dayOnly.status).toBe(200);
+    expect(dayOnly.body.ok && dayOnly.body.result.items).toHaveLength(1); // 10-05T00:00Z 在当天内
     // 空查询且无收窄仍 400
     const bare = await handleTopicSearchQuery({ query: '', mode: 'auto', limit: 10 });
     expect(bare.status).toBe(400);

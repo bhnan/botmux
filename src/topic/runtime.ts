@@ -26,7 +26,7 @@ import { topicModelKey, type TopicSearchConfig } from './config.js';
 import { topicIdentityFromSessionRow, topicNativeThreadId, type TopicIdentity } from './identity.js';
 import { evaluateDueRun, nextSlot, type ScheduleSlot } from './scheduler.js';
 import { TopicStore, type TopicJobRecord } from './store.js';
-import type { TopicHistoryReader } from './source.js';
+import { decodeSourceCursor, type TopicHistoryReader } from './source.js';
 import { updateTopicFromWindow, type TopicUpdateOutcome } from './summary-updater.js';
 
 export const SCAN_CURSOR_KEY = 'scan_cursor';
@@ -308,8 +308,17 @@ export class TopicSearchRuntime {
   /** Read + update one topic. Read failures surface as model_failed codes
    * with no store mutation beyond a retry-job enqueue (they must not block
    * other topics, spec §5.4). */
-  private async processOneTopic(config: TopicSearchConfig, topic: { topicKey: string; chatId: string; rootMessageId: string; sourceLarkAppId?: string }, firstRunSinceMs: number): Promise<TopicUpdateOutcome> {
-    const identity = { topicKey: topic.topicKey, chatId: topic.chatId, rootMessageId: topic.rootMessageId, ...(topic.sourceLarkAppId ? { larkAppId: topic.sourceLarkAppId } : {}) };
+  private async processOneTopic(config: TopicSearchConfig, topic: { topicKey: string; chatId: string; rootMessageId: string; sourceLarkAppId?: string; summarizedThroughCursor?: string }, firstRunSinceMs: number): Promise<TopicUpdateOutcome> {
+    // The reader must prove continuity to the success cursor (scan back to
+    // it) — a newer-looking tail is not proof of an unobserved gap.
+    const cursorId = topic.summarizedThroughCursor ? decodeSourceCursor(topic.summarizedThroughCursor) : '';
+    const identity = {
+      topicKey: topic.topicKey,
+      chatId: topic.chatId,
+      rootMessageId: topic.rootMessageId,
+      ...(topic.sourceLarkAppId ? { larkAppId: topic.sourceLarkAppId } : {}),
+      ...(cursorId ? { untilMessageId: cursorId } : {}),
+    };
     let window;
     try {
       window = await this.deps.readHistory(identity);

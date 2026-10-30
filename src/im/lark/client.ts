@@ -2255,6 +2255,82 @@ export async function listThreadMessages(larkAppId: string, chatId: string, root
   return (await listThreadMessagesWithContext(larkAppId, chatId, rootMessageId, pageSize)).messages;
 }
 
+/** Bounded continuous-increment read for the topic-search source (change.md
+ * 复测问题 2/3): page the thread NEWEST → OLDEST until `untilMessageId` (the
+ * topic's success cursor) is reached, then return the contiguous block AFTER
+ * the cursor, chronologically. `cursorFound=false` means continuity could
+ * NOT be proven within `maxScan` — the caller must not treat the tail as a
+ * continuous increment. Also returns the root message's create time when the
+ * platform serves it (independent topic-creation evidence, change.md §3). */
+export async function listThreadMessagesUntil(
+  larkAppId: string,
+  chatId: string,
+  rootMessageId: string,
+  untilMessageId: string | undefined,
+  maxScan: number = 2_000,
+): Promise<{ messages: any[]; cursorFound: boolean; rootCreatedAtMs?: number; threadId?: string }> {
+  const c = getBotClient(larkAppId);
+  // One message.get serves both the thread id and the root's create time.
+  let threadId: string | undefined;
+  let rootCreatedAtMs: number | undefined;
+  try {
+    const res = await larkGet(c, `/open-apis/im/v1/messages/${encodeURIComponent(rootMessageId)}`);
+    if (res.code === 0) {
+      const item = res.data?.items?.[0];
+      threadId = typeof item?.thread_id === 'string' && item.thread_id ? item.thread_id : undefined;
+      const createTime = Number(item?.create_time);
+      if (Number.isFinite(createTime) && createTime > 0) rootCreatedAtMs = createTime;
+    }
+  } catch { /* root detail unavailable: thread scan falls back below */ }
+  const tailCap = Math.min(maxScan, 200);
+  if (!untilMessageId) {
+    const window = threadId
+      ? await listByThread(c, threadId, tailCap)
+      : await listByChatFilter(c, chatId, rootMessageId, tailCap);
+    return {
+      messages: window,
+      cursorFound: true, // no cursor requested: the window is simply the tail
+      ...(rootCreatedAtMs !== undefined ? { rootCreatedAtMs } : {}),
+      ...(threadId ? { threadId } : {}),
+    };
+  }
+  if (!threadId) {
+    // No native thread container: fall back to the tail window and PROVE the
+    // cursor from its presence — never assume continuity we cannot show.
+    const window = await listByChatFilter(c, chatId, rootMessageId, tailCap);
+    const cursorIndex = window.findIndex(m => m?.message_id === untilMessageId);
+    return {
+      messages: cursorIndex >= 0 ? window.slice(cursorIndex + 1) : window,
+      cursorFound: cursorIndex >= 0,
+      ...(rootCreatedAtMs !== undefined ? { rootCreatedAtMs } : {}),
+    };
+  }
+  // Newest → oldest scan until the cursor message shows up (or budget ends).
+  const after: any[] = []; // messages newer than the cursor, newest → oldest
+  let cursorFound = false;
+  for await (const items of iterateMessagePages(c, {
+    containerType: 'thread',
+    containerId: threadId,
+    errorAction: 'list thread messages for topic search',
+    pageSize: messageListRequestPageSize(50),
+  })) {
+    for (const message of items) {
+      if (message?.message_id === untilMessageId) {
+        cursorFound = true;
+        break;
+      }
+      after.push(message);
+    }
+    if (cursorFound || after.length >= maxScan) break;
+  }
+  return {
+    messages: after.slice(0, maxScan).reverse(),
+    cursorFound,
+    ...(rootCreatedAtMs !== undefined ? { rootCreatedAtMs } : {}),
+    threadId,
+  };
+}
+
 /** Preserve whether membership was proved by a native thread container. A
  * root-only chat scan also matches ordinary quoted replies, so is not proof. */
 export async function listThreadMessagesWithContext(larkAppId: string, chatId: string, rootMessageId: string, pageSize: number = 50): Promise<{

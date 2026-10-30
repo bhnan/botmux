@@ -104,52 +104,53 @@ describe('updateTopicFromWindow', () => {
     expect(stored.summarizedThroughCursor).toBeUndefined();
   });
 
-  it('CAS 冲突（并发新增摘要）：放弃本轮，绝不重放同批 mutations（防重复/游标回退，spec §5.5）', async () => {
+  it('CAS 快照绑定（复测问题1）：模型等待期间并发提交——旧结果绝不借新 revision 落库', async () => {
     const topic = seedTopic();
-    // 冲突注入点：包装 commitSummaryUpdate，在 updater 读取 revision 之后、
-    // 真正提交之前完成一次并发提交（另一实例抢先落库）
-    const racingStore = Object.create(store) as TopicStore;
-    racingStore.commitSummaryUpdate = input => {
-      // 先完成并发提交（revision 被抢先推进），再执行被包装的原提交（旧 revision → 冲突）
+    let modelCalls = 0;
+    const outcome = await updateTopicFromWindow(deps(async input => {
+      modelCalls++;
+      expect(input.newMessages.map(x => x.messageId)).toEqual(['om_1']); // 第一批上下文
+      // 模型等待期间，另一连接抢先提交（真实双写者场景，同探针）
       store.commitSummaryUpdate({
         topicKey: topic.topicKey,
         expectedRevision: store.getTopic(topic.topicKey)!.revision,
-        mutations: [{ op: 'add', text: '并发摘要', keywords: [], sourceMessageIds: ['om_0'] }],
-        generatorKey: 'other', now: T0,
+        mutations: [{ op: 'add', text: 'winner', keywords: [], sourceMessageIds: ['om_1'] }],
+        generatorKey: 'other', now: T0, summarizedThroughCursor: 'msg:om_2',
+        sourceThroughAt: new Date(BASE + 1000).toISOString(),
       });
-      return store.commitSummaryUpdate(input);
-    };
-    const outcome = await updateTopicFromWindow(
-      { store: racingStore, callModel: async () => mutationFromModel([{ op: 'add', text: '我的摘要', keywords: ['k'], sourceMessageIds: ['om_1'] }]), now: () => T0 },
-      { topicKey: topic.topicKey, window: windowOf([m('om_1')]) },
-      { firstRunSinceMs: BASE - 1 },
-    );
-    expect(outcome).toMatchObject({ kind: 'commit_conflict' });
+      return mutationFromModel([{ op: 'add', text: 'stale', keywords: [], sourceMessageIds: ['om_1'] }]);
+    }), { topicKey: topic.topicKey, window: windowOf([m('om_1')]) }, { firstRunSinceMs: BASE - 1 });
+    // 胜者游标 om_2 已越过本批（om_1）：重切分后无可证明的 pending → 不推进
+    expect(outcome).toMatchObject({ kind: 'no_increment' });
     const stored = store.getTopic(topic.topicKey)!;
-    expect(stored.summaries.map(s => s.text)).toEqual(['并发摘要']); // 无重复条目
-    expect(stored.summarizedThroughCursor).toBeUndefined(); // 本轮游标不动
+    expect(stored.summaries.map(s => s.text)).toEqual(['winner']); // stale 不落库
+    expect(stored.summarizedThroughCursor).toBe('msg:om_2'); // 游标绝不回退
+    expect(modelCalls).toBe(1);
   });
 
-  it('CAS 冲突（并发把游标推得更远）：游标绝不回退到本批终点之后', async () => {
+  it('CAS 快照绑定（复测问题1 变体）：胜者只推进到批内中段——仅处理其后 pending，一次重生成', async () => {
     const topic = seedTopic();
-    const racingStore = Object.create(store) as TopicStore;
-    racingStore.commitSummaryUpdate = input => {
-      // 抢先提交并推进游标到 om_8（本批只有 om_1）
-      store.commitSummaryUpdate({
-        topicKey: topic.topicKey,
-        expectedRevision: store.getTopic(topic.topicKey)!.revision,
-        mutations: [{ op: 'add', text: '胜者摘要', keywords: [], sourceMessageIds: ['om_1'] }],
-        generatorKey: 'other', now: T0, summarizedThroughCursor: 'msg:om_8',
-      });
-      return store.commitSummaryUpdate(input); // 旧 revision → 冲突
-    };
-    const outcome = await updateTopicFromWindow(
-      { store: racingStore, callModel: async () => mutationFromModel([{ op: 'add', text: '败者摘要', keywords: [], sourceMessageIds: ['om_1'] }]), now: () => T0 },
-      { topicKey: topic.topicKey, window: windowOf([m('om_1')]) },
-      { firstRunSinceMs: BASE - 1 },
-    );
-    expect(outcome).toMatchObject({ kind: 'commit_conflict' });
-    expect(store.getTopic(topic.topicKey)!.summarizedThroughCursor).toBe('msg:om_8'); // 胜者游标不被回退
+    let modelCalls = 0;
+    const outcome = await updateTopicFromWindow(deps(async input => {
+      modelCalls++;
+      if (modelCalls === 1) {
+        store.commitSummaryUpdate({
+          topicKey: topic.topicKey,
+          expectedRevision: store.getTopic(topic.topicKey)!.revision,
+          mutations: [{ op: 'add', text: 'winner', keywords: [], sourceMessageIds: ['om_1'] }],
+          generatorKey: 'other', now: T0, summarizedThroughCursor: 'msg:om_1',
+        });
+        return mutationFromModel([{ op: 'add', text: 'stale', keywords: [], sourceMessageIds: ['om_1'] }]);
+      }
+      // 重生成只拿 om_2（胜者游标之后）
+      expect(input.newMessages.map(x => x.messageId)).toEqual(['om_2']);
+      return mutationFromModel([{ op: 'add', text: 'fresh', keywords: [], sourceMessageIds: ['om_2'] }]);
+    }), { topicKey: topic.topicKey, window: windowOf([m('om_1'), m('om_2')]) }, { firstRunSinceMs: BASE - 1 });
+    expect(outcome).toMatchObject({ kind: 'committed' });
+    expect(modelCalls).toBe(2);
+    const stored = store.getTopic(topic.topicKey)!;
+    expect(stored.summaries.map(s => s.text)).toEqual(['winner', 'fresh']); // 无 stale、无重复
+    expect(stored.summarizedThroughCursor).toBe('msg:om_2');
   });
 
   it('引用消息从完整窗口消失：失效关联摘要且本轮不总结新消息（游标不动）', async () => {
@@ -170,26 +171,34 @@ describe('updateTopicFromWindow', () => {
     const stored = store.getTopic(topic.topicKey)!;
     expect(stored.summaries).toHaveLength(0);
     expect(stored.summarizedThroughCursor).toBe('msg:om_1'); // 不推进
-    // 下一轮（无消失引用）正常处理 om_2 增量
+    // 下一轮：游标消息 om_1 已被删除，reader 无法证明连续 → 显式跳过（不静默推进）
     const next = await updateTopicFromWindow(deps(async () => mutationFromModel([{ op: 'add', text: '新事件', keywords: [], sourceMessageIds: ['om_2'] }])), {
       topicKey: topic.topicKey, window: windowOf([m('om_2')]),
     });
-    expect(next).toMatchObject({ kind: 'committed' });
-    expect(store.getTopic(topic.topicKey)!.summarizedThroughCursor).toBe('msg:om_2');
+    expect(next).toMatchObject({ kind: 'no_increment', skippedReason: 'cursor_beyond_window' });
+    expect(store.getTopic(topic.topicKey)!.summarizedThroughCursor).toBe('msg:om_1');
   });
 
-  it('截断窗口不做删除核对（窗口外引用不误伤）', async () => {
+  it('截断窗口不做删除核对（窗口外引用不误伤）；且游标不在窗口内时不推进（复测问题2）', async () => {
     const topic = seedTopic();
     store.commitSummaryUpdate({
       topicKey: topic.topicKey, expectedRevision: 1,
       mutations: [{ op: 'add', text: '引用 om_1', keywords: [], sourceMessageIds: ['om_1'] }],
       generatorKey: 'g', now: T0, summarizedThroughCursor: 'msg:om_1', sourceThroughAt: T0,
     });
-    // 截断窗口只包含 om_2（om_1 在窗口外但未消失）
+    // 截断窗口只含 om_2（om_1 在窗口外）：无删除误伤，也无连续证明 → 不推进
     const outcome = await updateTopicFromWindow(deps(async () => mutationFromModel([{ op: 'add', text: 'om_2 事件', keywords: [], sourceMessageIds: ['om_2'] }])), {
-      topicKey: topic.topicKey, window: windowOf([m('om_2')], true),
+      topicKey: topic.topicKey, window: { ...windowOf([m('om_2')], true), cursorFound: false },
     });
-    expect(outcome).toMatchObject({ kind: 'committed' });
+    expect(outcome).toMatchObject({ kind: 'no_increment', skippedReason: 'cursor_beyond_window' });
+    const stored = store.getTopic(topic.topicKey)!;
+    expect(stored.summaries).toHaveLength(1); // 引用未误伤、未新增
+    expect(stored.summarizedThroughCursor).toBe('msg:om_1');
+    // reader 回溯证明连续（cursorFound）后才处理 om_2
+    const proven = await updateTopicFromWindow(deps(async () => mutationFromModel([{ op: 'add', text: 'om_2 事件', keywords: [], sourceMessageIds: ['om_2'] }])), {
+      topicKey: topic.topicKey, window: { ...windowOf([m('om_2')], true), cursorFound: true },
+    });
+    expect(proven).toMatchObject({ kind: 'committed' });
     expect(store.getTopic(topic.topicKey)!.summaries).toHaveLength(2);
   });
 

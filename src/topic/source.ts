@@ -2,19 +2,17 @@
  *
  * The source adapter contract: the reader returns ONE topic's thread messages
  * oldest→newest, deduplicated by message id, plus whether the window was
- * truncated (thread longer than the read budget). Lark message ids are
- * opaque — order comes from the array position the adapter resolved, never
- * from string comparison; `create_time` is display metadata only
- * (same-millisecond messages must survive slicing, spec §5.2 step 4).
+ * truncated and — when a cursor was requested — whether the read PROVED
+ * continuity by scanning back to that cursor. Lark message ids are opaque —
+ * order comes from the array position the adapter resolved, never from
+ * string comparison; `create_time` is display metadata only (same-millisecond
+ * messages must survive slicing, spec §5.2 step 4).
  *
  * Incremental boundary: `summarizedThroughCursor` encodes the id of the last
- * message successfully processed. There is no server-side "since" parameter —
- * the adapter reads the bounded thread window and slicing happens here.
- * When the window's tail outruns the cursor (long threads), the cursor
- * message leaves the visible window; slicing then relies on the recorded
- * `sourceThroughAt` time to prove the whole window is newer than everything
- * already processed. Without that proof the run reports `cursorBeyondWindow`
- * instead of silently reprocessing or silently stalling.
+ * message successfully processed. Continuity to that cursor is proven only by
+ * the reader reaching it (or the cursor being present in the window); a
+ * window that is merely NEWER than the cursor is not proof — the gap was
+ * never observed and must never be advanced over (change.md 复测问题 2).
  */
 import type { TopicIdentity } from './identity.js';
 
@@ -28,14 +26,24 @@ export interface SourceMessage {
 }
 
 /** What a reader receives: the routing identity plus the host-assigned read
- * hint (which lark app's daemon can fetch this thread). */
-export type TopicReadTarget = TopicIdentity & { larkAppId?: string };
+ * hint (which lark app's daemon can fetch this thread) and the topic's
+ * success cursor the reader must scan back to (continuity proof). */
+export type TopicReadTarget = TopicIdentity & { larkAppId?: string; untilMessageId?: string };
 
 export interface TopicHistoryWindow {
   messages: SourceMessage[];
   /** True when the read hit its budget — older messages exist but were not
    * fetched. Deletion checks must not run on a truncated window. */
   truncated: boolean;
+  /** When a cursor was requested: whether the read PROVED continuity by
+   * actually reaching the cursor message (scanning back to it). A tail
+   * window whose messages are merely newer than the cursor is NOT proof —
+   * the gap in between was never observed (change.md 复测问题 2). */
+  cursorFound?: boolean;
+  /** Root message create time from the platform (change.md §3): the only
+   * evidence allowed to set Topic.topicCreatedAt. Absent = unknown — the
+   * earliest message of a truncated window is NOT a substitute. */
+  rootCreatedAtMs?: number;
 }
 
 /** Opaque, forward-compatible cursor: the last processed message id. */
@@ -70,9 +78,11 @@ export interface SliceIncrementOptions {
   firstRunSinceMs?: number;
   /** Upper bound of one batch; the rest waits for the next run. */
   maxBatchMessages: number;
-  /** Epoch-ms of the newest input already processed (Topic.sourceThroughAt).
-   * Used only when the cursor message has left the visible window. */
-  sourceThroughAtMs?: number;
+  /** Reader's continuity proof for the requested cursor (window.cursorFound).
+   * Continuity is established ONLY by the reader scanning back to the cursor
+   * or by the cursor message being present in the window — never by the
+   * window merely being newer than the cursor (that skips the gap). */
+  cursorFound?: boolean;
 }
 
 export interface SliceIncrementResult {
@@ -95,17 +105,15 @@ export function sliceIncrement(messagesIn: readonly SourceMessage[], options: Sl
     const cursorIndex = messages.findIndex(m => m.messageId === cursorId);
     if (cursorIndex >= 0) {
       startIndex = cursorIndex + 1;
-    } else {
-      // Cursor message is outside the visible window. Proceed only when the
-      // recorded processing time proves every visible message is newer;
-      // otherwise stop loudly (skippedReason) rather than double-process or
-      // silently stall the topic forever.
-      const windowStartMs = messages[0]?.createTimeMs;
-      const provable = options.sourceThroughAtMs !== undefined
-        && windowStartMs !== undefined
-        && windowStartMs >= options.sourceThroughAtMs;
-      if (!provable) return { batch: [], hasIncrement: false, skippedReason: 'cursor_beyond_window' };
+    } else if (options.cursorFound === true) {
+      // Reader scanned back to the cursor and returned the contiguous block
+      // after it (cursor excluded from the window): process the whole window.
       startIndex = 0;
+    } else {
+      // Continuity NOT proven (budget exhausted or window is a detached
+      // tail): processing it would silently skip the unobserved gap. Stop
+      // loudly instead of advancing a success cursor over missing messages.
+      return { batch: [], hasIncrement: false, skippedReason: 'cursor_beyond_window' };
     }
   } else if (options.firstRunSinceMs !== undefined) {
     while (startIndex < messages.length

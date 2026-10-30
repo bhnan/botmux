@@ -58,7 +58,8 @@ async function makeRuntime(
   const readHistory: TopicHistoryReader = async identity => {
     harness.readCalls++;
     const key = `${identity.chatId}:${identity.rootMessageId}`;
-    return harness.windows.get(key) ?? { messages: [], truncated: false };
+    const window = harness.windows.get(key) ?? { messages: [], truncated: false };
+    return { ...window, cursorFound: !identity.untilMessageId || window.messages.some(m => m.messageId === identity.untilMessageId) };
   };
   const deps: TopicSearchRuntimeDeps = {
     dataDir: tempDir,
@@ -259,7 +260,8 @@ async function makeRuntimeAt(harness: Harness, nowMs: number, dir: string): Prom
   const readHistory: TopicHistoryReader = async identity => {
     harness.readCalls++;
     const key = `${identity.chatId}:${identity.rootMessageId}`;
-    return harness.windows.get(key) ?? { messages: [], truncated: false };
+    const window = harness.windows.get(key) ?? { messages: [], truncated: false };
+    return { ...window, cursorFound: !identity.untilMessageId || window.messages.some(m => m.messageId === identity.untilMessageId) };
   };
   const runtime = await TopicSearchRuntime.create({
     dataDir: dir,
@@ -290,7 +292,8 @@ async function makeRuntimeFlipping(harness: Harness): Promise<TopicSearchRuntime
     // 第一次读取成功后立即停用功能（模拟运行边界上的禁用）
     harness.config = null;
     const key = `${identity.chatId}:${identity.rootMessageId}`;
-    return harness.windows.get(key) ?? { messages: [], truncated: false };
+    const window = harness.windows.get(key) ?? { messages: [], truncated: false };
+    return { ...window, cursorFound: !identity.untilMessageId || window.messages.some(m => m.messageId === identity.untilMessageId) };
   };
   const runtime = await TopicSearchRuntime.create({
     dataDir: tempDir,

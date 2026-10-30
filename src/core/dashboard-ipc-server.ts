@@ -229,7 +229,7 @@ import {
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
-import { deleteMessage, getChatMode, getChatModeStrict, replyMessage, sendMessage, resolveUnionIdFromOpenId, resolveTargetAppOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, getMessageThreadId, getMessageDetail, type ChatBotMember } from '../im/lark/client.js';
+import { deleteMessage, getChatMode, getChatModeStrict, replyMessage, sendMessage, resolveUnionIdFromOpenId, resolveTargetAppOpenId, listThreadMessages, listThreadMessagesUntil, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, getMessageThreadId, getMessageDetail, type ChatBotMember } from '../im/lark/client.js';
 import { fillNativeTopicId, isNativeTopicId } from './native-topic-id.js';
 import { parseProjectCoordinatorAction } from '../services/project-coordinator.js';
 import { projectCoordinator } from '../services/project-coordinator-runtime.js';
@@ -4988,21 +4988,24 @@ ipcRoute('GET', '/api/sessions/:sessionId/history', async (req, res, params) => 
   }
 });
 
-// 话题检索（spec 20261028-topic-search）：供 Dashboard 中心进程的后台 runtime
-// 读取一个 thread 话题的消息窗口。只读路由，走默认 trusted-host IPC 门禁（不在
-// 窄孔白名单内）；消息体不落盘，只返回已解析的文本形态。窗口截断标记让调用方
-// 知道更早的消息未被读取（删除核对只对完整窗口生效）。
+// 话题检索（spec 20261028-topic-search + change.md 复测修复）：供 Dashboard 中心
+// 进程的后台 runtime 读取一个 thread 话题的消息窗口。只读路由，走默认
+// trusted-host IPC 门禁（不在窄孔白名单内）；消息体不落盘。`until` 为话题成功
+// 游标：按新→旧回溯读取直到命中游标，返回其后连续块——cursorFound=false 表示
+// 预算内无法证明连续，调用方不得把尾部当连续增量。另返回被证实的根消息创建
+// 时间（话题创建口径的独立来源，change.md §3）。
 ipcRoute('GET', '/api/topic-messages', requireBoundBot(async (req, res) => {
   const url = new URL(req.url ?? '/', 'http://localhost');
   const chatId = url.searchParams.get('chatId') ?? '';
   const rootMessageId = url.searchParams.get('rootMessageId') ?? '';
-  const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') ?? '200', 10) || 200, 1), 200);
+  const until = url.searchParams.get('until') ?? undefined;
+  const maxScan = Math.min(Math.max(parseInt(url.searchParams.get('maxScan') ?? '2000', 10) || 2000, 200), 2000);
   if (!chatId || !rootMessageId || !rootMessageId.startsWith('om_')) {
     return jsonRes(res, 400, { ok: false, error: 'bad_request' });
   }
   try {
-    const raw = await listThreadMessages(cachedLarkAppId, chatId, rootMessageId, limit);
-    const messages = raw.map((m: any) => {
+    const raw = await listThreadMessagesUntil(cachedLarkAppId, chatId, rootMessageId, until, maxScan);
+    const messages = raw.messages.map((m: any) => {
       const parsed = parseApiMessage(m);
       return {
         messageId: parsed.messageId,
@@ -5012,7 +5015,13 @@ ipcRoute('GET', '/api/topic-messages', requireBoundBot(async (req, res) => {
         createTimeMs: Number(parsed.createTime) || undefined,
       };
     });
-    jsonRes(res, 200, { ok: true, truncated: raw.length >= limit, messages });
+    jsonRes(res, 200, {
+      ok: true,
+      truncated: !raw.cursorFound || raw.messages.length >= maxScan,
+      cursorFound: raw.cursorFound,
+      ...(raw.rootCreatedAtMs !== undefined ? { rootCreatedAtMs: raw.rootCreatedAtMs } : {}),
+      messages,
+    });
   } catch (err: any) {
     jsonRes(res, 502, { ok: false, error: ipcErrorText(err) });
   }

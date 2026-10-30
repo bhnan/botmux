@@ -73,23 +73,28 @@ describe('sliceIncrement', () => {
     expect(r.batch.map(m => m.messageId)).toEqual(['om_b', 'om_c']);
   });
 
-  it('游标消息已滑出窗口：有 sourceThroughAt 时间证明则整窗为新增量', () => {
+  it('游标消息已滑出窗口：reader 回溯到游标（cursorFound）则整窗为连续新增量', () => {
     const newer = [msg('om_90', BASE + 10 * DAY), msg('om_91', BASE + 10 * DAY + 1)];
     const r = sliceIncrement(newer, {
-      cursor: encodeSourceCursor('om_2'), // 已不在窗口内
+      cursor: encodeSourceCursor('om_2'), // 已不在窗口内，但 reader 证明过连续
       maxBatchMessages: 100,
-      sourceThroughAtMs: BASE + 3_000,    // 上次处理到的输入时间
+      cursorFound: true,
     });
     expect(r.hasIncrement).toBe(true);
     expect(r.batch.map(m => m.messageId)).toEqual(['om_90', 'om_91']);
   });
 
-  it('游标滑出窗口且无时间证明：显式 skip 而非静默重复或永久停更', () => {
+  it('游标滑出窗口且无连续证明：显式 skip——「窗口比游标新」不是证明（复测问题 2）', () => {
     const newer = [msg('om_90', BASE + 10 * DAY)];
     const noProof = sliceIncrement(newer, { cursor: encodeSourceCursor('om_2'), maxBatchMessages: 100 });
     expect(noProof).toMatchObject({ hasIncrement: false, skippedReason: 'cursor_beyond_window' });
-    const conflicting = sliceIncrement(newer, { cursor: encodeSourceCursor('om_2'), maxBatchMessages: 100, sourceThroughAtMs: BASE + 20 * DAY });
-    expect(conflicting).toMatchObject({ hasIncrement: false, skippedReason: 'cursor_beyond_window' });
+    // 即使窗口时间远晚于任何历史边界，只要没有 cursorFound/游标在场，绝不推进
+    const newerStill = sliceIncrement(newer, {
+      cursor: encodeSourceCursor('om_2'),
+      maxBatchMessages: 100,
+      cursorFound: false,
+    });
+    expect(newerStill).toMatchObject({ hasIncrement: false, skippedReason: 'cursor_beyond_window' });
   });
 });
 
