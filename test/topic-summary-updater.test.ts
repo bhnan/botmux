@@ -153,17 +153,18 @@ describe('updateTopicFromWindow', () => {
     expect(stored.summarizedThroughCursor).toBe('msg:om_2');
   });
 
-  it('引用消息从完整窗口消失：失效关联摘要且本轮不总结新消息（游标不动）', async () => {
+  it('引用消息消失（有全覆盖证据）：失效关联摘要且本轮不总结新消息（游标不动）', async () => {
     const topic = seedTopic();
     store.commitSummaryUpdate({
       topicKey: topic.topicKey, expectedRevision: 1,
       mutations: [{ op: 'add', text: '引用了 om_1 的摘要', keywords: [], sourceMessageIds: ['om_1'] }],
       generatorKey: 'g', now: T0, summarizedThroughCursor: 'msg:om_1', sourceThroughAt: T0,
     });
-    // 窗口里 om_1 已消失（被撤回），只有 om_2
+    // 全覆盖证据：整个扫描只见到 om_2 —— om_1 确实被撤回
     let modelCalls = 0;
     const outcome = await updateTopicFromWindow(deps(async () => { modelCalls++; return mutationFromModel([{ op: 'noop' }]); }), {
-      topicKey: topic.topicKey, window: windowOf([m('om_2')]),
+      topicKey: topic.topicKey,
+      window: { ...windowOf([m('om_2')]), cursorFound: true, reachedOldest: true, historyIds: ['om_2'] },
     });
     expect(outcome.kind).toBe('invalidated');
     if (outcome.kind === 'invalidated') expect(outcome.removedSummaryIds).toHaveLength(1);
@@ -171,12 +172,24 @@ describe('updateTopicFromWindow', () => {
     const stored = store.getTopic(topic.topicKey)!;
     expect(stored.summaries).toHaveLength(0);
     expect(stored.summarizedThroughCursor).toBe('msg:om_1'); // 不推进
-    // 下一轮：游标消息 om_1 已被删除，reader 无法证明连续 → 显式跳过（不静默推进）
-    const next = await updateTopicFromWindow(deps(async () => mutationFromModel([{ op: 'add', text: '新事件', keywords: [], sourceMessageIds: ['om_2'] }])), {
-      topicKey: topic.topicKey, window: windowOf([m('om_2')]),
+  });
+
+  it('增量窗口 ≠ 完整历史：连续但无覆盖证据时，游标前引用的旧摘要绝不被误删（复测第二轮问题2）', async () => {
+    const topic = seedTopic();
+    store.commitSummaryUpdate({
+      topicKey: topic.topicKey, expectedRevision: 1,
+      mutations: [{ op: 'add', text: '引用 om_1 的旧摘要', keywords: [], sourceMessageIds: ['om_1'] }],
+      generatorKey: 'g', now: T0, summarizedThroughCursor: 'msg:om_1', sourceThroughAt: T0,
     });
-    expect(next).toMatchObject({ kind: 'no_increment', skippedReason: 'cursor_beyond_window' });
-    expect(store.getTopic(topic.topicKey)!.summarizedThroughCursor).toBe('msg:om_1');
+    // reader 回溯到游标 om_1，返回其后 [om_2]；om_1 在窗口外但并未删除
+    const outcome = await updateTopicFromWindow(deps(async () => mutationFromModel([{ op: 'add', text: 'om_2 事件', keywords: [], sourceMessageIds: ['om_2'] }])), {
+      topicKey: topic.topicKey,
+      window: { ...windowOf([m('om_2')]), cursorFound: true }, // 无 reachedOldest
+    });
+    expect(outcome).toMatchObject({ kind: 'committed' });
+    const stored = store.getTopic(topic.topicKey)!;
+    expect(stored.summaries.map(s => s.text)).toEqual(['引用 om_1 的旧摘要', 'om_2 事件']); // 旧摘要保留
+    expect(stored.summarizedThroughCursor).toBe('msg:om_2');
   });
 
   it('截断窗口不做删除核对（窗口外引用不误伤）；且游标不在窗口内时不推进（复测问题2）', async () => {

@@ -32,14 +32,23 @@ export type TopicReadTarget = TopicIdentity & { larkAppId?: string; untilMessage
 
 export interface TopicHistoryWindow {
   messages: SourceMessage[];
-  /** True when the read hit its budget — older messages exist but were not
-   * fetched. Deletion checks must not run on a truncated window. */
+  /** True when the read does NOT cover the full visible history (budget
+   * capped, or an after-cursor increment window). Legacy convenience flag;
+   * the authoritative coverage signal is `reachedOldest`. */
   truncated: boolean;
   /** When a cursor was requested: whether the read PROVED continuity by
    * actually reaching the cursor message (scanning back to it). A tail
    * window whose messages are merely newer than the cursor is NOT proof —
    * the gap in between was never observed (change.md 复测问题 2). */
   cursorFound?: boolean;
+  /** Deletion-check coverage evidence (复测第二轮问题 2): true ONLY when the
+   * scan paged through to the thread's oldest message within budget. An
+   * after-cursor increment window is never full coverage — cited refs before
+   * the cursor are deliberately outside it and must NOT be judged deleted. */
+  reachedOldest?: boolean;
+  /** Every message id observed across the whole scan (present only when
+   * reachedOldest). The ONLY set a deletion check may compare against. */
+  historyIds?: string[];
   /** Root message create time from the platform (change.md §3): the only
    * evidence allowed to set Topic.topicCreatedAt. Absent = unknown — the
    * earliest message of a truncated window is NOT a substitute. */
@@ -136,12 +145,16 @@ export function sliceIncrement(messagesIn: readonly SourceMessage[], options: Sl
 }
 
 /** Cited source refs that vanished from the thread (deletion/revocation,
- * spec §5.4). Runs ONLY over a non-truncated window — on a truncated window a
- * ref outside the fetched era is indistinguishable from a deleted one, so
- * reporting it would destroy valid summaries. */
+ * spec §5.4). Runs ONLY with explicit full-coverage evidence
+ * (`reachedOldest` + `historyIds`): an after-cursor increment window is
+ * never such evidence — refs before the cursor are outside it by design and
+ * must not be judged deleted (复测第二轮问题 2). */
 export function findVanishedSourceRefs(window: TopicHistoryWindow, citedIds: readonly string[]): string[] {
-  if (window.truncated) return [];
-  const observable = new Set(dedupeSourceMessages(window.messages).map(m => m.messageId));
+  if (window.reachedOldest !== true) return [];
+  const observable = new Set<string>([
+    ...(window.historyIds ?? []),
+    ...dedupeSourceMessages(window.messages).map(m => m.messageId),
+  ]);
   return citedIds.filter(id => id && !observable.has(id));
 }
 

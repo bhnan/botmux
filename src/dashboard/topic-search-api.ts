@@ -64,6 +64,8 @@ async function readTopicWindowViaDaemon(
     ok?: boolean;
     truncated?: boolean;
     cursorFound?: boolean;
+    reachedOldest?: boolean;
+    historyIds?: string[];
     rootCreatedAtMs?: number;
     messages?: Array<{ messageId: string; senderType?: string; senderName?: string; text?: string; createTimeMs?: number }>;
   };
@@ -78,6 +80,8 @@ async function readTopicWindowViaDaemon(
     })),
     truncated: body.truncated === true,
     ...(body.cursorFound !== undefined ? { cursorFound: body.cursorFound } : {}),
+    ...(body.reachedOldest !== undefined ? { reachedOldest: body.reachedOldest } : {}),
+    ...(body.historyIds ? { historyIds: body.historyIds } : {}),
     ...(body.rootCreatedAtMs !== undefined ? { rootCreatedAtMs: body.rootCreatedAtMs } : {}),
   };
 }

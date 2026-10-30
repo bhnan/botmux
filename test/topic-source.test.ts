@@ -98,12 +98,15 @@ describe('sliceIncrement', () => {
   });
 });
 
-describe('findVanishedSourceRefs（删除核对）', () => {
-  it('完整窗口报告消失的引用；截断窗口一律不报告', () => {
-    const window = { messages: [msg('om_1', 1), msg('om_2', 2)], truncated: false };
-    expect(findVanishedSourceRefs(window, ['om_1', 'om_9', 'om_2'])).toEqual(['om_9']);
+describe('findVanishedSourceRefs（删除核对，需全覆盖证据）', () => {
+  it('reachedOldest+historyIds 才报告消失引用；无覆盖证据一律不报告（复测第二轮问题2）', () => {
+    const covered = { messages: [msg('om_2', 2)], truncated: false, reachedOldest: true, historyIds: ['om_1', 'om_2'] };
+    expect(findVanishedSourceRefs(covered, ['om_1', 'om_9', 'om_2'])).toEqual(['om_9']);
+    // 回溯到游标的增量窗口（连续但非全覆盖）：游标前引用绝不被判删除
+    const incrementOnly = { messages: [msg('om_2', 2)], truncated: false, cursorFound: true };
+    expect(findVanishedSourceRefs(incrementOnly, ['om_1', 'om_2'])).toEqual([]);
+    // 截断/预算窗口：同样不报告
     const truncated = { messages: [msg('om_2', 2)], truncated: true };
-    // om_1 只是在窗口外，不得误报为已删除
     expect(findVanishedSourceRefs(truncated, ['om_1', 'om_2'])).toEqual([]);
   });
 });

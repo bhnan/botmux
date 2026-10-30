@@ -2260,15 +2260,29 @@ export async function listThreadMessages(larkAppId: string, chatId: string, root
  * topic's success cursor) is reached, then return the contiguous block AFTER
  * the cursor, chronologically. `cursorFound=false` means continuity could
  * NOT be proven within `maxScan` — the caller must not treat the tail as a
- * continuous increment. Also returns the root message's create time when the
- * platform serves it (independent topic-creation evidence, change.md §3). */
+ * continuous increment.
+ *
+ * Deletion-check coverage is a SEPARATE claim (复测第二轮问题 2): an
+ * after-cursor increment window must never be mistaken for the full visible
+ * history. `reachedOldest=true` is reported only when the scan paged through
+ * to the thread's oldest message within the budget, and then `historyIds`
+ * carries EVERY id observed across the whole scan — the only evidence the
+ * updater may use to declare a cited message deleted.
+ * Also returns the root message's create time when the platform serves it. */
 export async function listThreadMessagesUntil(
   larkAppId: string,
   chatId: string,
   rootMessageId: string,
   untilMessageId: string | undefined,
   maxScan: number = 2_000,
-): Promise<{ messages: any[]; cursorFound: boolean; rootCreatedAtMs?: number; threadId?: string }> {
+): Promise<{
+  messages: any[];
+  cursorFound: boolean;
+  reachedOldest: boolean;
+  historyIds?: string[];
+  rootCreatedAtMs?: number;
+  threadId?: string;
+}> {
   const c = getBotClient(larkAppId);
   // One message.get serves both the thread id and the root's create time.
   let threadId: string | undefined;
@@ -2283,31 +2297,27 @@ export async function listThreadMessagesUntil(
     }
   } catch { /* root detail unavailable: thread scan falls back below */ }
   const tailCap = Math.min(maxScan, 200);
-  if (!untilMessageId) {
-    const window = threadId
-      ? await listByThread(c, threadId, tailCap)
-      : await listByChatFilter(c, chatId, rootMessageId, tailCap);
-    return {
-      messages: window,
-      cursorFound: true, // no cursor requested: the window is simply the tail
-      ...(rootCreatedAtMs !== undefined ? { rootCreatedAtMs } : {}),
-      ...(threadId ? { threadId } : {}),
-    };
-  }
   if (!threadId) {
     // No native thread container: fall back to the tail window and PROVE the
-    // cursor from its presence — never assume continuity we cannot show.
+    // cursor from its presence — continuity AND full coverage cannot be
+    // claimed beyond what the window literally shows.
     const window = await listByChatFilter(c, chatId, rootMessageId, tailCap);
     const cursorIndex = window.findIndex(m => m?.message_id === untilMessageId);
     return {
       messages: cursorIndex >= 0 ? window.slice(cursorIndex + 1) : window,
-      cursorFound: cursorIndex >= 0,
+      cursorFound: !untilMessageId || cursorIndex >= 0,
+      reachedOldest: false,
       ...(rootCreatedAtMs !== undefined ? { rootCreatedAtMs } : {}),
     };
   }
-  // Newest → oldest scan until the cursor message shows up (or budget ends).
-  const after: any[] = []; // messages newer than the cursor, newest → oldest
+  // Newest → oldest scan. Phases: (a) until the cursor shows up — collect the
+  // after-cursor block; (b) past the cursor — collect ids only, as deletion-
+  // check coverage evidence, until the thread's oldest message or budget.
+  const after: any[] = []; // newer than the cursor, newest → oldest
+  const preCursorIds: string[] = [];
   let cursorFound = false;
+  let exhausted = false;
+  outer:
   for await (const items of iterateMessagePages(c, {
     containerType: 'thread',
     containerId: threadId,
@@ -2315,17 +2325,39 @@ export async function listThreadMessagesUntil(
     pageSize: messageListRequestPageSize(50),
   })) {
     for (const message of items) {
-      if (message?.message_id === untilMessageId) {
+      const id = message?.message_id;
+      if (!untilMessageId || cursorFound) {
+        if (!untilMessageId) {
+          if (after.length < tailCap) after.push(message);
+          else preCursorIds.push(id);
+        } else if (cursorFound) {
+          preCursorIds.push(id);
+        }
+        if (after.length + preCursorIds.length >= maxScan) break outer;
+        continue;
+      }
+      if (id === untilMessageId) {
         cursorFound = true;
-        break;
+        continue;
       }
       after.push(message);
+      if (after.length >= maxScan) break outer;
     }
-    if (cursorFound || after.length >= maxScan) break;
   }
+  // A `for await` that falls through (no break) means the page iterator
+  // completed: we reached the oldest message the platform will serve.
+  exhausted = after.length + preCursorIds.length < maxScan && cursorFoundOrNoCursor();
+  function cursorFoundOrNoCursor(): boolean {
+    return !untilMessageId || cursorFound;
+  }
+  const messages = untilMessageId
+    ? (cursorFound ? after : []).reverse()
+    : after.reverse();
   return {
-    messages: after.slice(0, maxScan).reverse(),
-    cursorFound,
+    messages,
+    cursorFound: !untilMessageId || cursorFound,
+    reachedOldest: exhausted,
+    ...(exhausted ? { historyIds: [...after.map(m => m?.message_id).filter(Boolean), ...preCursorIds] as string[] } : {}),
     ...(rootCreatedAtMs !== undefined ? { rootCreatedAtMs } : {}),
     threadId,
   };

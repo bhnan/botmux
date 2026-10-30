@@ -83,6 +83,51 @@ describe('复测1：CAS 快照绑定（双连接并发）', () => {
   });
 });
 
+describe('复测第二轮1：重生成分支的 revision 绑定', () => {
+  it('第二次模型等待期间再冲突：不借最新 revision，二次冲突退出、游标不回退', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'topic-retest-cas2-'));
+    const a = await TopicStore.open(dir);
+    const b = await TopicStore.open(dir);
+    try {
+      const topic = a.ensureTopic({
+        topicKey: 'thread:oc_a:om_root', chatId: 'oc_a', rootMessageId: 'om_root',
+        title: 'test', accessPolicyRef: 'chat:oc_a',
+      }, T0).topic;
+      let modelCalls = 0;
+      const result = await updateTopicFromWindow({
+        store: a, now: () => T0,
+        callModel: async () => {
+          modelCalls++;
+          if (modelCalls === 1) {
+            // 第一次等待：B 提交 M1（cursor om_1）→ A 首次提交冲突、触发重生成
+            b.commitSummaryUpdate({
+              topicKey: topic.topicKey, expectedRevision: b.getTopic(topic.topicKey)!.revision,
+              mutations: [add('winner1', 'om_1')], generatorKey: 'test',
+              now: T0, summarizedThroughCursor: 'msg:om_1',
+            });
+            return { ok: true, mutations: [add('stale1', 'om_1')], generatorKey: 'test' };
+          }
+          // 第二次等待（重生成 [om_2] 期间）：B 再提交 M2 → 重生成结果此刻已过期
+          b.commitSummaryUpdate({
+            topicKey: topic.topicKey, expectedRevision: b.getTopic(topic.topicKey)!.revision,
+            mutations: [add('winner2', 'om_2')], generatorKey: 'test',
+            now: T0, summarizedThroughCursor: 'msg:om_2',
+          });
+          return { ok: true, mutations: [add('regen', 'om_2')], generatorKey: 'test' };
+        },
+      }, { topicKey: topic.topicKey, window: { messages: [m('om_1'), m('om_2')], truncated: false } }, { firstRunSinceMs: BASE - 1 });
+      expect(result).toMatchObject({ kind: 'commit_conflict' });
+      expect(modelCalls).toBe(2);
+      const final = a.getTopic(topic.topicKey)!;
+      expect(final.summaries.map(s => s.text)).toEqual(['winner1', 'winner2']); // 无 stale/regen 落库
+      expect(final.summarizedThroughCursor).toBe('msg:om_2'); // 游标停在胜者位置，绝不回退
+    } finally {
+      a.close(); b.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('复测2：有界读取的连续性证明', () => {
   it('旧游标 om_100、尾部窗口 om_301..500 且无连续证明：不推进，gap 永不跳过', async () => {
     const topic = seed();

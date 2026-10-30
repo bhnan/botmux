@@ -97,10 +97,11 @@ export async function updateTopicFromWindow(
     cursorFound: args.window.cursorFound,
   });
 
-  // Deletion-driven invalidation over the observable window (independent of
-  // whether there is an increment — a deleted cited message must not keep
-  // leaking from search).
-  if (!args.window.truncated && topic.summaries.length > 0) {
+  // Deletion-driven invalidation requires INDEPENDENT full-coverage evidence
+  // (reachedOldest): an after-cursor increment window — even a continuous,
+  // cursor-proven one — is not the full history, and treating it as such
+  // would delete every summary citing pre-cursor messages (复测第二轮问题 2).
+  if (args.window.reachedOldest === true && topic.summaries.length > 0) {
     const bySummary = new Map<string, readonly string[]>();
     for (const s of topic.summaries) bySummary.set(s.id, s.sourceMessageIds);
     const allCited = [...bySummary.values()].flat();
@@ -184,11 +185,13 @@ export async function updateTopicFromWindow(
         newMessages: toModelMessages(sliced.batch),
       });
       if (!regenerated.ok) return { kind: 'model_failed', code: regenerated.code };
-      // Re-bind the snapshot to the state the regenerated batch came from.
-      const rebound = deps.store.getTopic(args.topicKey);
-      if (!rebound) return { kind: 'model_failed', code: 'topic_missing' };
+      // Bind the regenerated commit to the state its INPUT came from (the
+      // winner snapshot) — NOT a post-model re-read. A writer that commits
+      // during THIS model wait must force the next conflict (and the loop
+      // exits on it) instead of lending us its revision for stale output
+      // (复测第二轮问题 1).
       modelResult = regenerated;
-      snapshot = rebound;
+      snapshot = winner;
     }
   }
 }

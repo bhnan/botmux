@@ -5017,8 +5017,12 @@ ipcRoute('GET', '/api/topic-messages', requireBoundBot(async (req, res) => {
     });
     jsonRes(res, 200, {
       ok: true,
-      truncated: !raw.cursorFound || raw.messages.length >= maxScan,
+      // 增量连续性（cursorFound）与完整可见范围（reachedOldest）是两个独立主张：
+      // 回溯到游标的增量窗口绝不是完整历史，绝不能据此判定窗口外引用被删除。
+      truncated: !raw.reachedOldest,
       cursorFound: raw.cursorFound,
+      reachedOldest: raw.reachedOldest,
+      ...(raw.historyIds ? { historyIds: raw.historyIds } : {}),
       ...(raw.rootCreatedAtMs !== undefined ? { rootCreatedAtMs: raw.rootCreatedAtMs } : {}),
       messages,
     });
