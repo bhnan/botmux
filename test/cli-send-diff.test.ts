@@ -219,7 +219,7 @@ describe('send --diff CLI', () => {
     const watcher = watch(relay, (_event, file) => {
       if (file?.toString().endsWith('.req.json')) acceptRequest(file.toString());
     });
-    const child = spawnTsScript(cli, ['send', '--diff', path, '--response-kind', 'final', '--mention-back', 'relay summary'], {
+    const child = spawnTsScript(cli, ['send', '--diff', path, '--response-kind', 'final', '--mention-back', '## relay summary'], {
       env: {
         PATH: process.env.PATH, SESSION_DATA_DIR: join(root, 'data'), BOTS_CONFIG: join(root, 'bots.json'),
         BOTMUX_SESSION_ID: 'sid_diff_relay', BOTMUX_TURN_ID: 'om_diff_relay', BOTMUX_LARK_APP_ID: 'cli_diff_test',
@@ -238,7 +238,8 @@ describe('send --diff CLI', () => {
       const payload = JSON.parse(readFileSync(join(relay, file), 'utf8'));
       expect(payload.cardFile).toMatch(/^[a-f0-9]+\.card\.json$/);
       const card = JSON.parse(readFileSync(join(relay, payload.cardFile), 'utf8'));
-      expect(card.body.elements[0]).toEqual({ tag: 'markdown', content: 'relay summary' });
+      expect(card.body.elements[0]).toEqual({ tag: 'markdown', text_size: 'heading-2', content: 'relay summary' });
+      expect(JSON.stringify(card)).not.toContain('botmux_md_h');
       expect(card.body.elements.some((element: { tag: string }) => element.tag === 'collapsible_panel')).toBe(true);
       expect(payload.flags).toEqual(['--response-kind', 'final', '--mention-back']);
       expect(JSON.stringify(payload)).not.toContain(path);

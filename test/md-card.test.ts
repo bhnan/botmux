@@ -1815,6 +1815,7 @@ describe('unified diff reply cards', () => {
 
   it.each(['#', '##'])('keeps %s summary headings displayable in final cards', heading => {
     const result = buildDiffCard(parseUnifiedDiff(BASIC), { summary: `${heading} 修改结果\n\n已更新需求。` });
+    expect(result.card.body.elements[0]).toEqual({ tag: 'markdown', text_size: 'heading-2', content: '修改结果' });
     expect(customFinalCardError(result.card as unknown as Record<string, unknown>)).toBeUndefined();
     expect(JSON.stringify(result.card)).not.toContain('botmux_md_h');
     expect(JSON.stringify(result.card)).toContain('修改结果');

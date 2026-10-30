@@ -1,42 +1,35 @@
 # send --diff 验证记录
 
-## 最终修改
+## 最终行为
 
-增加核心 `botmux send --diff <文件> [摘要]`。参数解析和限制位于 `send-policy.ts`，文件读取和执行留在 `cli.ts`；普通 Markdown 与 diff 卡片统一在 `md-card.ts`，共用 `createReplyCard()`、卡片配置及摘要正文渲染。
+需求讨论中修改文档后，Agent用本轮编辑前文本和实际保存后的文本生成unified diff，通过核心send --diff提供真实折叠预览。普通Markdown与diff摘要共用md-card渲染；H1/H2沿用原heading-2字号，diff摘要移除宿主标题element_id，保持公共final校验严格。
 
-复用原有身份校验、引用、@、final、回放和受约束 `cardFile` relay；没有新增命令框架或独立卡片模块，也没有改变 daemon 生命周期或 CLI 适配器。
+超过2MiB仍保留部分文件/行。CLI最多读取2MiB+1字节，只解码2MiB前缀；解析器仅在明确前缀模式容忍EOF截断，其他非法内容仍拒绝。每文件默认最多60行，整卡预算可能进一步降低行数；小灰字说明实际显示行数，超大输入的计数只代表展示部分。
+
+摘要过长或渲染超预算时，发送前返回一行原因及exit2，不发送兜底卡片。技能要求当前Agent精简摘要/表格后重试，必要时省略可选摘要。
+
+文内链接只作文本预览，不自动收集或校验。需要防止漏发云端文档入口时，在摘要中交付URL并显式指定expected-link；保留既有整卡包含指定URL的检查，不新增摘要区域限定。
 
 ## 验证结果
 
-- 开发版 `bun run build` 通过，包含类型检查、Dashboard 构建和资产审计。
-- 相关13个测试文件：448 项通过，2 项既有 Linux 专用用例在 macOS 跳过。
-- `v3.54.0 + 本次功能` 的本机试用候选：264 项核心相关检查及完整构建通过。
-- 覆盖普通卡片/共享配置、diff 计数、UTF-8/中文路径、转义、缩进、空行、多 hunk、增删文件、元数据、截断预算、摘要优先级、无会话 dry-run、final/@/回放以及受约束 relay。
-- hunk 完整性守卫变异复验能够检出缺失校验；源码在验证后逐字节恢复。
+- Vitest：相关13个文件464项通过，2项既有Linux专用用例在macOS跳过。
+- 原生Bun：Markdown卡片174项、diff CLI22项、custom final29项，225项通过。
+- 新增4个跨CLI/scope的direct与host card-file场景，逐项拒绝合法外形的宿主标题ID、feedback/footer/proposal及非法标题ID；确认exit2、零发送请求。每组使用真实生成的带标题diff卡作成功正控。
+- H1/H2摘要断言同时钉住heading-2组件和无宿主标题ID；bounded relay用例包含H2摘要。
+- host card-file守卫旁路变异：2个host场景失败，2个直连场景仍通过，证明能检出只放宽host的回归；验证后源码逐字节恢复。
+- 覆盖率按配置条件跳过，未声称覆盖率百分比。单测流程Step1–Step7记录于任务证据。
+- 当前分支bun run build通过，包含类型检查、Dashboard构建与资产审计；utree总结flush完成。
 
-验证命令：
+## 展示
 
-```bash
-bun run build
-bun x vitest run --project unit test/md-card.test.ts test/send-policy.test.ts test/cli-send-diff.test.ts test/cli-send-dry-run.test.ts test/cli-send-custom-final.test.ts test/cli-send-dispatch.test.ts test/send-content.test.ts test/cli-send-link-ref.test.ts test/sandbox-relay-watcher.test.ts test/sandbox-relay-link-ref.test.ts test/reply-style-guide.test.ts test/skill-injection-mode.test.ts test/builtin-skills.test.ts
-```
+约5.3MiB的两文件示例由实际CLI dry-run生成，两个文件各保留60行，计数仅代表预览。此前同会话已实际发送验证；下图是按schema2.0结构绘制的示意，非飞书客户端截图。
 
-## 本机试用与展示
+![超限diff的部分预览](../../assets/send-diff-partial-preview.png)
 
-已在本机切换 `v3.54.0 + 本次功能` 的试用构建，14 个机器人 daemon 及 Dashboard 均恢复在线。原生 `send --diff` 的两文件演示实际发送成功，本机试用整体反馈展示效果可用。
+## 边界
 
-展示示意位于 `docs/assets/send-diff-preview.png`，依据命令实际生成的 schema 2.0 卡片绘制，展示展开状态；这是排版示意，非飞书客户端截图。
+摘要去除标题ID后，飞书仍显示标题，但消息回读不再补#或##层级前缀。比例字体不承诺精确列对齐；二进制与combined diff不提供逐行预览。
 
-## 已知边界
+expected-link仅检查渲染卡片是否包含显式指定URL，删除行出现相同URL也会满足；该既有语义不能证明修改后的文档保留链接。
 
-彩色行使用比例字体，长行换行；上下文灰色和缩进的客户端特定边界仍需逐项视觉验收。没有在真实 OS sandbox 中执行端到端验证；现有 relay 协议的CLI集成和回归已通过。未进行外部代码审查。
-
-提交只新增展示输入，权限、投递状态和回放语义使用既有实现；本机保留原二进制与技能备份，可回滚。当前用户已授权提交草稿 PR；正式发布和合并仍属于后续步骤。
-
-## 最新反馈处理
-
-先在Codex/thread、Claude Code/chat上补互斥用例：均exit2且0次provider请求，原生产拒绝正常。新增标题final和摘要超限探测用例在旧版失败，确认P1及错误收口问题；按用户明确授权修复生产代码后通过。
-
-将原来无证明力的非法超限字符串换为结构合法的超限diff；CLI的超大文件“不读全文”与stat后增长分别用独立可控文件场景验证。卡片清楚说明预览省略/统计不可用，不生成伪计数。表格预算用例使用原文低于4000字节、渲染后超18KB的真实表格，验证预算错误收口。
-
-保持md-card/CLI原分工，不新增生产文件，不重启共享daemon。最终：Vitest456项通过/2项Linux专用跳过，Bun272项通过；6项守卫变异被检出，完整构建通过。完整结果见 feedback-fix-report.md。
+直连/host路径使用真实CLI及假provider验证，已有watcher协议回归通过；没有在真实OS sandbox做端到端验证。本轮不改变生产守卫、身份、投递或回放语义。

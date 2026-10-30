@@ -47,14 +47,18 @@ src/services/send-policy.ts：parseDiffFlag/diffUsageError；src/im/lark/md-card
 
 标题展示与原普通send一致：H1/H2均使用heading-2字号，H3-H6沿用正文加粗回退。本功能支持标题语法并修复final拒发，不新增diff专属样式或改变原send标题字号。
 
-## 超限仍保留部分diff（远端更新待审批）
+## 超限仍保留部分diff
 
 超2MiB时使用FD读取有界前缀，最多2MiB+1字节用于判断超限；只解码2MiB，UTF-8流式解码保留末尾字符边界。解析器仅在明确前缀模式允许EOF未完成hunk，非法内容仍拒绝，未完整尾部文件头不展示。
 
 保留原折叠文件面板，每文件最多60行；小灰字说明实际展示行数和计数仅预览。单长行显示前段并提示截断；卡片超过18KB时继续降低实际展示行或文件数。
 
-完整输入的statsScope=full，超限前缀的statsScope=preview，部分计数只统计显示的行，未知全量省略文件数为null。本轮只在本地实现与展示，远端更新待明确审批。
+完整输入的statsScope=full，超限前缀的statsScope=preview，部分计数只统计显示的行，未知全量省略文件数为null。本轮实现、验证和说明按明确授权更新至既有PR。
 
 ## 摘要错误与Agent重试
 
 摘要超长时，命令原因简化为“摘要过长”，仍退出码2并在发送前结束。错误返回当前Agent；Agent精简摘要或表格后使用同一diff重试，必要时去掉可选摘要。程序不自动发送兜底话术或错误说明卡片。已成功发送不重发；本流程不新开Agent轮次，也不在CLI内运行模型。
+
+## diff调用中的链接约定
+
+botmux-send技能规定：文内链接按普通diff文本展示，不自动收集或加入--expected-link校验。云端文档入口URL在摘要中交付，需要防漏时可显式用--expected-link指定该入口，文内其他链接不加入。校验沿用整张卡片包含指定URL的既有行为，不强制只在摘要区域匹配；本轮不改CLI逻辑。
