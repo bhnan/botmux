@@ -6,7 +6,7 @@ import type { Topic, TopicSummary } from '../types.js';
 import { TopicEmbeddingQueue, TOPIC_EMBEDDING_SCHEMA } from './embedding.js';
 import type { TopicModelProfile } from './config.js';
 import { topicIdentity } from './identity.js';
-import { TopicJobQueue, TOPIC_JOB_SCHEMA, type TopicClaim } from './jobs.js';
+import { TopicJobQueue, TOPIC_JOB_SCHEMA, type TopicClaim, type TopicLease } from './jobs.js';
 import { coversCursor, decodeCursor, normalizeTime, type TopicSourceCheckpoint, type TopicMessage, topicSourceFingerprint } from './source.js';
 
 export interface TopicSeed {
@@ -60,7 +60,7 @@ export class TopicStore {
     try {
       this.db.exec('PRAGMA busy_timeout=3000; PRAGMA journal_mode=WAL;');
       const version = (this.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version;
-      if (version > 6) throw new Error('unsupported_topic_schema');
+      if (version > 7) throw new Error('unsupported_topic_schema');
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS topic_documents (key TEXT PRIMARY KEY, chat TEXT NOT NULL, body TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS topic_chat ON topic_documents(chat);
@@ -76,7 +76,7 @@ export class TopicStore {
       for (const field of ['step', 'failures']) {
         if (!jobColumns.some(column => column.name === field)) this.db.exec(`ALTER TABLE topic_jobs ADD COLUMN ${field} INTEGER NOT NULL DEFAULT 0`);
       }
-      this.db.exec(`CREATE TABLE IF NOT EXISTS topic_source_fingerprints (topic TEXT NOT NULL, message TEXT NOT NULL, hash TEXT NOT NULL, created TEXT NOT NULL, checked TEXT NOT NULL, PRIMARY KEY(topic, message)); ${TOPIC_EMBEDDING_SCHEMA} PRAGMA user_version=6;`);
+      this.db.exec(`CREATE TABLE IF NOT EXISTS topic_source_fingerprints (topic TEXT NOT NULL, message TEXT NOT NULL, hash TEXT NOT NULL, created TEXT NOT NULL, checked TEXT NOT NULL, PRIMARY KEY(topic, message)); ${TOPIC_EMBEDDING_SCHEMA} CREATE TABLE IF NOT EXISTS topic_maintenance (key TEXT PRIMARY KEY, value TEXT NOT NULL); PRAGMA user_version=7;`);
       this.jobs = new TopicJobQueue(this.db, action => this.transaction(action), clock);
       this.embeddings = new TopicEmbeddingQueue(this.db, action => this.transaction(action), key => this.read(key), topic => this.write(topic), lease => this.jobs.valid(lease), clock);
     } catch (error) { this.db.close(); throw error; }
@@ -93,10 +93,10 @@ export class TopicStore {
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
 
-  private write(topic: Topic): void {
+  private write(topic: Topic, searchableChange = true): void {
     this.db.prepare('INSERT INTO topic_documents VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET body=excluded.body')
       .run(topic.topicKey, topic.chatId, JSON.stringify(topic));
-    this.db.prepare("UPDATE topic_meta SET value=value+1 WHERE key='generation'").run();
+    if (searchableChange) this.db.prepare("UPDATE topic_meta SET value=value+1 WHERE key='generation'").run();
   }
 
   generation(): number {
@@ -111,6 +111,49 @@ export class TopicStore {
   list(): Topic[] {
     return (this.db.prepare('SELECT body FROM topic_documents ORDER BY key').all() as Array<{ body: string }>)
       .map(row => JSON.parse(row.body) as Topic);
+  }
+
+  /** Directory keys do not deserialize every summary/vector to schedule source work. */
+  keysForChats(chatIds: readonly string[]): string[] {
+    if (!chatIds.length) return [];
+    return (this.db.prepare(`SELECT key FROM topic_documents WHERE chat IN (${chatIds.map(() => '?').join(',')}) ORDER BY key`).all(...chatIds) as Array<{ key: string }>).map(row => row.key);
+  }
+
+  /** Bounded keyset traversal shared by local maintenance/reindex; resumes fairly after a restart. */
+  maintenancePage(lease: TopicLease, task: string, limit = 20): Topic[] {
+    return this.transaction(() => {
+      if (!this.jobs.valid(lease)) throw new Error('stale_topic_maintenance');
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new Error('invalid_topic_maintenance_budget');
+      const after = (this.db.prepare('SELECT value FROM topic_maintenance WHERE key=?').get(task) as { value: string } | undefined)?.value ?? '';
+      const rows = this.db.prepare('SELECT key FROM topic_documents WHERE key>? ORDER BY key LIMIT ?').all(after, limit) as Array<{ key: string }>;
+      this.db.prepare('INSERT INTO topic_maintenance VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(task, rows.length === limit ? rows.at(-1)!.key : '');
+      return rows.map(row => this.require(row.key));
+    });
+  }
+
+  /** Explicit TTL is measured from each summary's last successful content update, not source time.
+   * Keep topic identity, successful cursor, source fingerprints and idempotency receipts: expiry
+   * is not deletion of upstream messages and must neither replay old adds nor restart backfill.
+   */
+  expireSummaries(lease: TopicLease, keys: readonly string[], retentionDays: number | null, now: string): number {
+    return this.transaction(() => {
+      if (!this.jobs.valid(lease)) throw new Error('stale_topic_maintenance');
+      if (retentionDays === null) return 0;
+      if (!Number.isSafeInteger(retentionDays) || retentionDays < 1 || retentionDays > 3650) throw new Error('invalid_topic_retention');
+      const cutoff = Date.parse(normalizeTime(now)) - retentionDays * 86_400_000;
+      let removed = 0;
+      for (const key of new Set(keys)) {
+        const topic = this.read(key); if (!topic) continue;
+        const expired = topic.summaries.filter(summary => Date.parse(summary.updatedAt) <= cutoff);
+        if (!expired.length) continue;
+        const ids = new Set(expired.map(summary => summary.id));
+        topic.summaries = topic.summaries.filter(summary => !ids.has(summary.id));
+        for (const id of ids) this.db.prepare('DELETE FROM topic_embedding_jobs WHERE topic=? AND summary=?').run(key, id);
+        // CAS also fences model calls that started before cleanup and still refer to expired text.
+        topic.revision++; topic.updatedAt = normalizeTime(now); this.write(topic); removed += expired.length;
+      }
+      return removed;
+    });
   }
 
   authorizedTopics(chatIds: readonly string[] | null, limit: number): { topics: Topic[]; truncated: boolean } {
@@ -170,9 +213,10 @@ export class TopicStore {
         if (!topic.latestMessageAt || latest > topic.latestMessageAt) topic.latestMessageAt = latest;
       }
       topic.lastCheckedAt = normalizeTime(observation.checkedAt);
-      if (before !== JSON.stringify([topic.topicCreatedAt, topic.latestMessageAt, topic.nativeThreadId])) topic.revision++;
-      // Observing a source never acknowledges successful model processing.
-      this.write(topic);
+      const changed = before !== JSON.stringify([topic.topicCreatedAt, topic.latestMessageAt, topic.nativeThreadId]);
+      if (changed) topic.revision++;
+      // Check timestamps alone do not invalidate a user's search pagination snapshot.
+      this.write(topic, changed);
       return topic;
     });
   }

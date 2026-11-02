@@ -51,7 +51,7 @@ export class TopicScheduler {
     const policy = this.policy();
     if (policy.slot) this.store.jobs.admit(lease, {
       enabled: policy.enabled, slot: policy.slot, snapshot: policy.snapshot, limit: policy.maxTopicsPerRun,
-      topicKeys: this.store.list().filter(topic => policy.allowedChatIds.includes(topic.chatId)).map(topic => topic.topicKey),
+      topicKeys: this.store.keysForChats(policy.allowedChatIds),
     });
     // Disabled still drains admitted work. Decreasing concurrency stops new starts until below the cap.
     while (this.running.size < policy.maxConcurrentTopics) {

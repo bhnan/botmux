@@ -47,3 +47,12 @@ it('retains the durable index over runtime shutdown and does not require reopeni
   const next = runtime(); next.tick(); await next.idle();
   expect((await next.service().search({ query: 'owner', mode: 'keyword' }, { principal: 'owner', chatIds: null })).items).toHaveLength(1);
 });
+it('applies an explicit retention policy to retained content even when updates are disabled', async () => {
+  const item = runtime(); item.tick(); await item.idle();
+  rows = []; config.enabled = false; config.allowedChatIds = []; config.retentionDays = 1;
+  time += 86_400_000;
+  item.tick(); await item.idle();
+  expect(proxy).toHaveBeenCalledTimes(1); expect(fetcher).toHaveBeenCalledTimes(1);
+  config.enabled = true;
+  expect((await item.service().search({ query: 'owner', mode: 'keyword' }, { principal: 'owner', chatIds: null })).items).toEqual([]);
+});

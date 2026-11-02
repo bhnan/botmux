@@ -33,7 +33,6 @@ export class TopicRuntime {
   private readonly model: TopicModelClient;
   private readonly now: () => number;
   private lastDiscovery = -Infinity;
-  private reindexOffset = 0;
   lastError: string | null = null;
   constructor(private readonly deps: TopicRuntimeDeps) { this.model = deps.model ?? new TopicModelClient(); this.now = deps.now ?? Date.now; }
 
@@ -96,11 +95,13 @@ export class TopicRuntime {
       this.scheduler!.tick();
       const lease = this.scheduler!.currentLease();
       if (lease) {
+        if (config.retentionDays !== null) {
+          const page = this.store!.maintenancePage(lease, 'retention');
+          this.store!.expireSummaries(lease, page.map(topic => topic.topicKey), config.retentionDays, new Date(this.now()).toISOString());
+        }
         if (config.enabled && config.embedding.enabled && config.embedding.modelRef) {
-          const topics = this.store!.list();
-          if (this.reindexOffset >= topics.length) this.reindexOffset = 0;
-          this.store!.embeddings.reindex(lease, topics.slice(this.reindexOffset, this.reindexOffset + 20), config.models[config.embedding.modelRef]);
-          this.reindexOffset += 20;
+          const topics = this.store!.maintenancePage(lease, 'embedding');
+          this.store!.embeddings.reindex(lease, topics, config.models[config.embedding.modelRef]);
         }
         this.embedding!.tick(lease);
       }
