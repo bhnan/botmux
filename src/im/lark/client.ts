@@ -2329,26 +2329,37 @@ interface MessagePageScan {
  * stops — callers rely on that (e.g. a full page ends a bounded scan without
  * paying for the next one).
  */
+async function requestMessagePage(c: any, scan: MessagePageScan, token?: string, order: 'ByCreateTimeAsc' | 'ByCreateTimeDesc' = 'ByCreateTimeDesc'): Promise<{ items: any[]; hasMore: boolean; nextToken?: string }> {
+  scan.signal?.throwIfAborted();
+  const res = await larkGet(c, '/open-apis/im/v1/messages', {
+    container_id_type: scan.containerType, container_id: scan.containerId,
+    page_size: scan.pageSize, sort_type: order, with_sender_name: 'true',
+    ...(token ? { page_token: token } : {}),
+  }, { timeoutMs: scan.timeoutMs, signal: scan.signal });
+  scan.signal?.throwIfAborted();
+  if (res.code !== 0) throw larkApiError(scan.errorAction, res);
+  if (order === 'ByCreateTimeAsc' && (!Array.isArray(res.data?.items) || typeof res.data?.has_more !== 'boolean' || (res.data.has_more && !res.data.page_token))) throw new Error('incomplete_topic_source_page');
+  return { items: res.data?.items ?? [], hasMore: res.data?.has_more ?? !!res.data?.page_token, nextToken: res.data?.page_token || undefined };
+}
+
+/** Explicit single-page contract for contiguous background indexing, not the newest-N context API.
+ * Uses the same transport/pagination request as the history helpers; never mixes sort directions.
+ */
+export async function listNativeThreadPage(larkAppId: string, threadId: string, options: { token?: string; signal?: AbortSignal; timeoutMs?: number } = {}): Promise<{ items: any[]; hasMore: boolean; nextToken?: string }> {
+  if (!/^omt_[A-Za-z0-9_-]+$/.test(threadId)) throw new Error('invalid_native_topic_id');
+  return requestMessagePage(getBotClient(larkAppId), {
+    containerType: 'thread', containerId: threadId, pageSize: LARK_MESSAGE_LIST_MAX_PAGE,
+    errorAction: 'read topic source page', signal: options.signal, timeoutMs: options.timeoutMs,
+  }, options.token, 'ByCreateTimeAsc');
+}
+
 async function* iterateMessagePages(c: any, scan: MessagePageScan): AsyncGenerator<any[], void, void> {
   let pageToken: string | undefined;
   do {
     scan.signal?.throwIfAborted();
-    const res = await larkGet(c, '/open-apis/im/v1/messages', {
-      container_id_type: scan.containerType,
-      container_id: scan.containerId,
-      page_size: scan.pageSize,
-      sort_type: 'ByCreateTimeDesc',
-      with_sender_name: 'true',
-      ...(pageToken ? { page_token: pageToken } : {}),
-    }, { timeoutMs: scan.timeoutMs, signal: scan.signal });
-    scan.signal?.throwIfAborted();
-
-    if (res.code !== 0) {
-      throw larkApiError(scan.errorAction, res);
-    }
-
-    pageToken = res.data?.page_token;
-    yield res.data?.items ?? [];
+    const page = await requestMessagePage(c, scan, pageToken);
+    pageToken = page.nextToken;
+    yield page.items;
   } while (pageToken);
 }
 

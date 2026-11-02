@@ -5,7 +5,7 @@ import { openDatabaseSyncOrThrow, type DatabaseSyncLike } from '../services/sqli
 import type { Topic, TopicSummary } from '../types.js';
 import { topicIdentity } from './identity.js';
 import { TopicJobQueue, TOPIC_JOB_SCHEMA, type TopicClaim } from './jobs.js';
-import { coversCursor, decodeCursor, normalizeTime } from './source.js';
+import { coversCursor, decodeCursor, normalizeTime, type TopicSourceCheckpoint } from './source.js';
 
 export interface TopicSeed {
   chatId: string;
@@ -29,6 +29,7 @@ export interface TopicCommit {
   cursor: string;
   generatorKey: string;
   now: string;
+  sourceCheckpoint?: TopicSourceCheckpoint | null;
 }
 
 export function contentHash(text: string): string {
@@ -46,7 +47,7 @@ export class TopicStore {
     try {
       this.db.exec('PRAGMA busy_timeout=3000; PRAGMA journal_mode=WAL;');
       const version = (this.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version;
-      if (version > 2) throw new Error('unsupported_topic_schema');
+      if (version > 3) throw new Error('unsupported_topic_schema');
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS topic_documents (key TEXT PRIMARY KEY, chat TEXT NOT NULL, body TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS topic_chat ON topic_documents(chat);
@@ -55,7 +56,8 @@ export class TopicStore {
         CREATE TABLE IF NOT EXISTS topic_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
         INSERT OR IGNORE INTO topic_meta VALUES ('generation', 0);
         ${TOPIC_JOB_SCHEMA}
-        PRAGMA user_version=2;
+        CREATE TABLE IF NOT EXISTS topic_source_scans (topic TEXT PRIMARY KEY, body TEXT NOT NULL);
+        PRAGMA user_version=3;
       `);
       this.jobs = new TopicJobQueue(this.db, action => this.transaction(action), clock);
     } catch (error) { this.db.close(); throw error; }
@@ -196,12 +198,50 @@ export class TopicStore {
     topic.updatedAt = normalizeTime(input.now);
     topic.revision++;
     this.write(topic);
+    if (input.sourceCheckpoint !== undefined) this.writeCheckpoint(input.topicKey, input.sourceCheckpoint);
     this.db.prepare('INSERT INTO topic_operations VALUES (?, ?)').run(input.topicKey, input.operationId);
     return 'committed';
   }
 
-  invalidate(key: string, messageIds: readonly string[], now: string): void {
+  beginSource(claim: TopicClaim, lookbackDays: number, now: string): Topic {
+    return this.transaction(() => {
+      this.jobs.assertClaim(claim);
+      const topic = this.require(claim.job.topicKey);
+      if (!topic.coverageStartAt) {
+        topic.coverageStartAt = new Date(Date.parse(normalizeTime(now)) - lookbackDays * 86_400_000).toISOString();
+        topic.revision++;
+        this.write(topic);
+      }
+      return topic;
+    });
+  }
+
+  sourceCheckpoint(key: string): TopicSourceCheckpoint | null {
+    const row = this.db.prepare('SELECT body FROM topic_source_scans WHERE topic=?').get(key) as { body: string } | undefined;
+    return row ? JSON.parse(row.body) as TopicSourceCheckpoint : null;
+  }
+
+  private writeCheckpoint(key: string, checkpoint: TopicSourceCheckpoint | null): void {
+    if (checkpoint === null) this.db.prepare('DELETE FROM topic_source_scans WHERE topic=?').run(key);
+    else this.db.prepare('INSERT INTO topic_source_scans VALUES (?, ?) ON CONFLICT(topic) DO UPDATE SET body=excluded.body').run(key, JSON.stringify(checkpoint));
+  }
+
+  /** Only traversed already-processed history may checkpoint without a successful model commit. */
+  saveSourceProgress(claim: TopicClaim, checkpoint: TopicSourceCheckpoint | null): void {
     this.transaction(() => {
+      this.jobs.assertClaim(claim);
+      const topic = this.require(claim.job.topicKey);
+      if (checkpoint && checkpoint.baseCursor !== (topic.summarizedThroughCursor ?? null)) throw new Error('topic_scan_cursor_mismatch');
+      this.writeCheckpoint(claim.job.topicKey, checkpoint);
+    });
+  }
+
+  invalidate(key: string, messageIds: readonly string[], now: string, claim?: TopicClaim): void {
+    this.transaction(() => {
+      if (claim) {
+        this.jobs.assertClaim(claim);
+        if (claim.job.topicKey !== key) throw new Error('topic_claim_mismatch');
+      }
       const topic = this.require(key);
       for (const id of messageIds) this.db.prepare('INSERT OR IGNORE INTO topic_tombstones VALUES (?, ?)').run(key, id);
       topic.summaries = topic.summaries.filter(summary => !summary.sourceMessageIds.some(id => messageIds.includes(id)));
