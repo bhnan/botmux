@@ -4,7 +4,7 @@ import { readTopicIncrement, encodeCursor, decodeCursor, type TopicReadOptions, 
 const start = '2026-10-01T00:00:00.000Z';
 const message = (n: number, time = n): TopicMessage => ({ id: `om_${n}`, text: `message ${n}`, createdAt: new Date(Date.parse(start) + time).toISOString() });
 function options(patch: Partial<TopicReadOptions> = {}): TopicReadOptions {
-  return { coverageStartAt: start, now: start, maxPages: 2, maxMessages: 10, maxChars: 10_000, signal: new AbortController().signal, observe: vi.fn(), ...patch };
+  return { coverageStartAt: start, now: '2026-10-02T00:00:00.000Z', maxPages: 2, maxMessages: 10, maxChars: 10_000, signal: new AbortController().signal, observe: vi.fn(), ...patch };
 }
 function pages(messages: TopicMessage[]) {
   return vi.fn(async (token?: string): Promise<TopicSourcePage> => {

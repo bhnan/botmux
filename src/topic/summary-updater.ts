@@ -33,15 +33,14 @@ export function topicSummaryExecutor(deps: TopicSummaryUpdaterDeps): TopicExecut
       }
     }, {
       cursor: topic.summarizedThroughCursor, checkpoint: deps.store.sourceCheckpoint(topic.topicKey),
-      coverageStartAt, now, maxPages: config.maxPagesPerRead, maxMessages: config.maxMessagesPerBatch,
+      coverageStartAt, now: new Date(claim.job.acceptedAt).toISOString(), maxPages: config.maxPagesPerRead, maxMessages: config.maxMessagesPerBatch,
       maxChars: Math.max(1, Math.min(config.maxInputChars, profile.maxInputChars) - 2000), signal: context.signal,
+      isRevision: message => deps.store.sourceChanged(topic.topicKey, message),
       observe: times => { deps.store.observe(topic.topicKey, { ...times, checkedAt: now }, claim); },
     });
-    const deleted = result.inspected.filter(message => message.deleted).map(message => message.id);
-    if (deleted.length) deps.store.invalidate(topic.topicKey, deleted, now, claim);
+    deps.store.reconcileSources(claim, result.inspected, now);
     if (!result.messages.length) {
-      deps.store.saveSourceProgress(claim, result.checkpoint);
-      return null;
+      return { kind: 'source-progress', checkpoint: result.checkpoint, maxSteps: config.maxStepsPerTopic };
     }
     const refreshed = deps.store.read(topic.topicKey)!;
     const input: TopicModelInput = { title: topic.title, messages: result.messages.filter(message => !message.deleted), summaries: [] };
@@ -57,9 +56,12 @@ export function topicSummaryExecutor(deps: TopicSummaryUpdaterDeps): TopicExecut
     const mutations = input.messages.length ? await deps.model.summarize(profile, input, context.signal) : [{ op: 'noop' as const }];
     context.signal.throwIfAborted();
     return {
-      topicKey: topic.topicKey, expectedRevision: refreshed.revision, operationId: `job:${claim.job.id}`,
+      topicKey: topic.topicKey, expectedRevision: refreshed.revision, operationId: `job:${claim.job.id}:step:${claim.job.step}`,
       mutations, verifiedMessageIds: input.messages.map(message => message.id), cursor: result.cursor!,
       generatorKey: topicModelKey(profile), now: new Date(deps.now()).toISOString(), sourceCheckpoint: result.checkpoint,
+      processedSources: result.messages,
+      ...(config.embedding.enabled && config.embedding.modelRef ? { embeddingProfile: config.models[config.embedding.modelRef] } : {}),
+      ...(result.partial ? { continuation: { maxSteps: config.maxStepsPerTopic } } : {}),
     };
   };
 }

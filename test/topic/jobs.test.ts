@@ -121,3 +121,12 @@ it('rejects an expired claim before any replacement has changed its attempt or t
   expect(store.read(key)!.latestMessageAt).toBeUndefined();
   expect(store.jobs.list()[0].state).toBe('running');
 });
+it('a completed continuation attempt cannot overwrite the next step even under the same lease', () => {
+  const lease = admit(); const first = store.jobs.claim(lease, 1)!;
+  store.settle(first, { ...input(first), continuation: { maxSteps: 3 } });
+  const next = store.jobs.claim(lease, 1)!;
+  expect(next.job.step).toBe(1); expect(next.job.attempt).toBeGreaterThan(first.job.attempt);
+  expect(() => store.settle(first, input(first))).toThrow('stale_topic_claim');
+  expect(store.jobs.batches()[0].completed).toBeNull();
+  store.settle(next, null); expect(store.jobs.batches()[0].completed).toBe(time);
+});

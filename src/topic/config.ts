@@ -25,6 +25,7 @@ export interface TopicSearchConfig {
   initialLookbackDays: number;
   maxConcurrentTopics: number;
   maxTopicsPerRun: number;
+  maxStepsPerTopic: number;
   maxPagesPerRead: number;
   maxMessagesPerBatch: number;
   maxInputChars: number;
@@ -107,6 +108,7 @@ export function parseTopicSearchConfig(raw?: unknown): TopicSearchConfig {
     embedding: { enabled: bool(embedding.enabled, false), modelRef: embedding.modelRef === undefined || embedding.modelRef === null ? null : name(embedding.modelRef) }, schedule,
     initialLookbackDays: integer(r.initialLookbackDays, 14, 1, 3650),
     maxConcurrentTopics: integer(r.maxConcurrentTopics, 1, 1, 8), maxTopicsPerRun: integer(r.maxTopicsPerRun, 20, 1, 500),
+    maxStepsPerTopic: integer(r.maxStepsPerTopic, 100, 1, 1000),
     maxPagesPerRead: integer(r.maxPagesPerRead, 50, 1, 1000), maxMessagesPerBatch: integer(r.maxMessagesPerBatch, 100, 1, 500),
     maxInputChars: integer(r.maxInputChars, 24_000, 256, 128_000), maxOldSummaries: integer(r.maxOldSummaries, 20, 0, 100),
     maxAttempts: integer(r.maxAttempts, 3, 1, 10), retryBaseMs: integer(r.retryBaseMs, 30_000, 100, 3_600_000),

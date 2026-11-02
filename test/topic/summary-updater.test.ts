@@ -76,3 +76,44 @@ it('concurrent topic revision changes reject a valid but stale result rather tha
   expect(store.read(key)!.summarizedThroughCursor).toBeUndefined();
   expect(store.jobs.list()[0]).toMatchObject({ state: 'queued', error: 'topic_revision_conflict' });
 });
+it('drains bounded continuation steps within the admitted batch while disabled, without awaiting tomorrow', async () => {
+  sourceMessages = Array.from({ length: 73 }, (_, i) => ({ id: `om_${i}`, text: `fact ${i}`, createdAt: '2026-10-01T00:00:00.000Z' }));
+  await tick(); config.enabled = false;
+  expect(store.jobs.list()[0]).toMatchObject({ state: 'queued', step: 1 });
+  for (let i = 0; i < 10; i++) await tick();
+  expect(store.jobs.batches()).toHaveLength(1);
+  expect(store.jobs.list()).toHaveLength(1);
+  expect(store.jobs.list()[0]).toMatchObject({ state: 'done', step: 10 });
+  expect(decodeCursor(store.read(key)!.summarizedThroughCursor!).ids).toHaveLength(73);
+});
+it('keeps the admission upper bound fixed when new messages arrive during a multi-step batch', async () => {
+  sourceMessages = Array.from({ length: 12 }, (_, i) => ({ id: `om_${i}`, text: `fact ${i}`, createdAt: '2026-10-01T00:00:00.000Z' }));
+  await tick(); now += 1000;
+  sourceMessages.push({ id: 'om_after', text: 'later', createdAt: new Date(now).toISOString() });
+  await tick();
+  expect(store.read(key)!.summaries.flatMap(s => s.sourceMessageIds)).not.toContain('om_after');
+  slot++; await tick();
+  expect(store.read(key)!.summaries.flatMap(s => s.sourceMessageIds)).toContain('om_after');
+});
+it('an edited processed source invalidates old facts even when regeneration fails, then retries the edit without cursor regression', async () => {
+  await tick(); const cursor = store.read(key)!.summarizedThroughCursor;
+  sourceMessages[0].text = 'corrected fact';
+  model.mockRejectedValueOnce(new Error('topic_model_http_failed'));
+  slot++; await tick();
+  expect(store.read(key)!.summaries).toEqual([]);
+  expect(store.read(key)!.summarizedThroughCursor).toBe(cursor);
+  now += config.retryBaseMs; await tick(); await tick();
+  expect(store.read(key)!.summaries[0].text).toBe('corrected fact');
+  expect(store.read(key)!.summarizedThroughCursor).toBe(cursor);
+  slot++; await tick();
+  expect(model).toHaveBeenCalledTimes(3);
+});
+it('a failure after many successful continuation steps still gets its own retry budget', async () => {
+  sourceMessages = Array.from({ length: 30 }, (_, i) => ({ id: `om_${i}`, text: `fact ${i}`, createdAt: '2026-10-01T00:00:00.000Z' }));
+  await tick(); await tick(); await tick();
+  model.mockRejectedValueOnce(new Error('topic_model_http_failed')); await tick();
+  expect(store.jobs.list()[0]).toMatchObject({ state: 'queued', step: 3, failures: 1 });
+  now += config.retryBaseMs; await tick(); await tick(); await tick();
+  expect(store.jobs.list()[0].state).toBe('done');
+  expect(decodeCursor(store.read(key)!.summarizedThroughCursor!).ids).toHaveLength(30);
+});

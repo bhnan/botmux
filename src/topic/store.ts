@@ -3,9 +3,11 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { openDatabaseSyncOrThrow, type DatabaseSyncLike } from '../services/sqlite-compat.js';
 import type { Topic, TopicSummary } from '../types.js';
+import { TopicEmbeddingQueue, TOPIC_EMBEDDING_SCHEMA } from './embedding.js';
+import type { TopicModelProfile } from './config.js';
 import { topicIdentity } from './identity.js';
 import { TopicJobQueue, TOPIC_JOB_SCHEMA, type TopicClaim } from './jobs.js';
-import { coversCursor, decodeCursor, normalizeTime, type TopicSourceCheckpoint } from './source.js';
+import { coversCursor, decodeCursor, normalizeTime, type TopicSourceCheckpoint, type TopicMessage, topicSourceFingerprint } from './source.js';
 
 export interface TopicSeed {
   chatId: string;
@@ -30,7 +32,17 @@ export interface TopicCommit {
   generatorKey: string;
   now: string;
   sourceCheckpoint?: TopicSourceCheckpoint | null;
+  continuation?: { maxSteps: number };
+  processedSources?: TopicMessage[];
+  embeddingProfile?: TopicModelProfile;
 }
+
+export interface TopicSourceProgress {
+  kind: 'source-progress';
+  checkpoint: TopicSourceCheckpoint | null;
+  maxSteps: number;
+}
+export type TopicJobResult = TopicCommit | TopicSourceProgress | null;
 
 export function contentHash(text: string): string {
   return createHash('sha256').update(text).digest('hex');
@@ -40,6 +52,7 @@ export function contentHash(text: string): string {
 export class TopicStore {
   private readonly db: DatabaseSyncLike;
   readonly jobs: TopicJobQueue;
+  readonly embeddings: TopicEmbeddingQueue;
 
   constructor(readonly path: string, clock: () => number = Date.now) {
     mkdirSync(dirname(path), { recursive: true });
@@ -47,7 +60,7 @@ export class TopicStore {
     try {
       this.db.exec('PRAGMA busy_timeout=3000; PRAGMA journal_mode=WAL;');
       const version = (this.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version;
-      if (version > 3) throw new Error('unsupported_topic_schema');
+      if (version > 6) throw new Error('unsupported_topic_schema');
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS topic_documents (key TEXT PRIMARY KEY, chat TEXT NOT NULL, body TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS topic_chat ON topic_documents(chat);
@@ -57,9 +70,15 @@ export class TopicStore {
         INSERT OR IGNORE INTO topic_meta VALUES ('generation', 0);
         ${TOPIC_JOB_SCHEMA}
         CREATE TABLE IF NOT EXISTS topic_source_scans (topic TEXT PRIMARY KEY, body TEXT NOT NULL);
-        PRAGMA user_version=3;
+
       `);
+      const jobColumns = this.db.prepare('PRAGMA table_info(topic_jobs)').all() as Array<{ name: string }>;
+      for (const field of ['step', 'failures']) {
+        if (!jobColumns.some(column => column.name === field)) this.db.exec(`ALTER TABLE topic_jobs ADD COLUMN ${field} INTEGER NOT NULL DEFAULT 0`);
+      }
+      this.db.exec(`CREATE TABLE IF NOT EXISTS topic_source_fingerprints (topic TEXT NOT NULL, message TEXT NOT NULL, hash TEXT NOT NULL, created TEXT NOT NULL, checked TEXT NOT NULL, PRIMARY KEY(topic, message)); ${TOPIC_EMBEDDING_SCHEMA} PRAGMA user_version=6;`);
       this.jobs = new TopicJobQueue(this.db, action => this.transaction(action), clock);
+      this.embeddings = new TopicEmbeddingQueue(this.db, action => this.transaction(action), key => this.read(key), topic => this.write(topic), lease => this.jobs.valid(lease), clock);
     } catch (error) { this.db.close(); throw error; }
   }
 
@@ -152,12 +171,23 @@ export class TopicStore {
   }
 
   /** Content, successful cursor, operation receipt and job completion are one SQLite commit. */
-  settle(claim: TopicClaim, input: TopicCommit | null, skipped = false): 'committed' | 'duplicate' | 'conflict' {
+  settle(claim: TopicClaim, input: TopicJobResult, skipped = false): 'committed' | 'duplicate' | 'conflict' {
     return this.transaction(() => {
       this.jobs.assertClaim(claim);
+      if (input && 'kind' in input) {
+        const topic = this.require(claim.job.topicKey);
+        if (input.checkpoint && input.checkpoint.baseCursor !== (topic.summarizedThroughCursor ?? null)) return 'conflict';
+        this.writeCheckpoint(claim.job.topicKey, input.checkpoint);
+        if (input.checkpoint) this.jobs.continueInsideTransaction(claim, input.maxSteps);
+        else this.jobs.finishInsideTransaction(claim, 'done');
+        return 'committed';
+      }
       if (input && input.topicKey !== claim.job.topicKey) throw new Error('topic_claim_mismatch');
       const result = input ? this.commitInsideTransaction(input) : 'committed';
-      if (result !== 'conflict') this.jobs.finishInsideTransaction(claim, skipped ? 'skipped' : 'done');
+      if (result !== 'conflict') {
+        if (input?.continuation && !skipped) this.jobs.continueInsideTransaction(claim, input.continuation.maxSteps);
+        else this.jobs.finishInsideTransaction(claim, skipped ? 'skipped' : 'done');
+      }
       return result;
     });
   }
@@ -198,6 +228,11 @@ export class TopicStore {
     topic.updatedAt = normalizeTime(input.now);
     topic.revision++;
     this.write(topic);
+    for (const source of input.processedSources ?? []) {
+      this.db.prepare('INSERT INTO topic_source_fingerprints VALUES (?, ?, ?, ?, ?) ON CONFLICT(topic, message) DO UPDATE SET hash=excluded.hash, checked=excluded.checked')
+        .run(input.topicKey, source.id, topicSourceFingerprint(source), source.createdAt, input.now);
+    }
+    if (input.embeddingProfile) this.embeddings.enqueueInsideTransaction(topic, input.embeddingProfile);
     if (input.sourceCheckpoint !== undefined) this.writeCheckpoint(input.topicKey, input.sourceCheckpoint);
     this.db.prepare('INSERT INTO topic_operations VALUES (?, ?)').run(input.topicKey, input.operationId);
     return 'committed';
@@ -233,6 +268,29 @@ export class TopicStore {
       const topic = this.require(claim.job.topicKey);
       if (checkpoint && checkpoint.baseCursor !== (topic.summarizedThroughCursor ?? null)) throw new Error('topic_scan_cursor_mismatch');
       this.writeCheckpoint(claim.job.topicKey, checkpoint);
+    });
+  }
+
+  sourceChanged(key: string, message: TopicMessage): boolean {
+    const row = this.db.prepare('SELECT hash FROM topic_source_fingerprints WHERE topic=? AND message=?').get(key, message.id) as { hash: string } | undefined;
+    return !!row && row.hash !== topicSourceFingerprint(message);
+  }
+
+  /** Invalidate stale evidence immediately; only a successful model commit acknowledges edited content. */
+  reconcileSources(claim: TopicClaim, messages: readonly TopicMessage[], now: string): void {
+    this.transaction(() => {
+      this.jobs.assertClaim(claim);
+      const topic = this.require(claim.job.topicKey);
+      const changed = new Set<string>();
+      for (const message of messages) {
+        if (message.deleted || this.sourceChanged(topic.topicKey, message)) changed.add(message.id);
+        if (message.deleted) this.db.prepare('INSERT OR IGNORE INTO topic_tombstones VALUES (?, ?)').run(topic.topicKey, message.id);
+        if (!this.sourceChanged(topic.topicKey, message)) this.db.prepare('UPDATE topic_source_fingerprints SET checked=? WHERE topic=? AND message=?').run(now, topic.topicKey, message.id);
+      }
+      const summaries = topic.summaries.filter(summary => !summary.sourceMessageIds.some(id => changed.has(id)));
+      if (changed.size > 0) {
+        topic.summaries = summaries; topic.revision++; topic.updatedAt = normalizeTime(now); this.write(topic);
+      }
     });
   }
 

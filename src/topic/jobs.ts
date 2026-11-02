@@ -8,6 +8,9 @@ export interface TopicJob {
   snapshot: string;
   state: 'queued' | 'running' | 'done' | 'failed' | 'skipped';
   attempt: number;
+  step: number;
+  failures: number;
+  acceptedAt: number;
   availableAt: number;
   error: string | null;
 }
@@ -19,6 +22,7 @@ export const TOPIC_JOB_SCHEMA = `
   CREATE TABLE IF NOT EXISTS topic_jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT, batch TEXT NOT NULL, topicKey TEXT NOT NULL,
     snapshot TEXT NOT NULL, state TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 0,
+    step INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0,
     availableAt INTEGER NOT NULL, error TEXT, UNIQUE(batch, topicKey)
   );
   CREATE INDEX IF NOT EXISTS topic_jobs_ready ON topic_jobs(state, availableAt, id);
@@ -82,7 +86,7 @@ export class TopicJobQueue {
       if (!Number.isSafeInteger(concurrency) || concurrency < 1) throw new Error('invalid_topic_concurrency');
       const active = this.db.prepare("SELECT COUNT(*) AS n FROM topic_jobs WHERE state='running'").get() as { n: number };
       if (active.n >= concurrency) return null;
-      const job = this.db.prepare("SELECT * FROM topic_jobs WHERE state='queued' AND availableAt<=? ORDER BY availableAt, id LIMIT 1").get(this.clock()) as TopicJob | undefined;
+      const job = this.db.prepare("SELECT j.*, b.accepted AS acceptedAt FROM topic_jobs j JOIN topic_batches b ON b.slot=j.batch WHERE j.state='queued' AND j.availableAt<=? ORDER BY j.availableAt, j.id LIMIT 1").get(this.clock()) as TopicJob | undefined;
       if (!job) return null;
       this.db.prepare("UPDATE topic_jobs SET state='running', attempt=attempt+1 WHERE id=?").run(job.id);
       return { lease: { ...lease }, job: { ...job, state: 'running', attempt: job.attempt + 1 } };
@@ -107,19 +111,26 @@ export class TopicJobQueue {
     this.completeBatch(claim.job.batch);
   }
 
+  continueInsideTransaction(claim: TopicClaim, maxSteps: number): void {
+    this.assertClaim(claim);
+    if (!Number.isSafeInteger(maxSteps) || maxSteps < 1 || maxSteps > 1000) throw new Error('invalid_topic_step_budget');
+    if (claim.job.step + 1 >= maxSteps) { this.finishInsideTransaction(claim, 'done'); return; }
+    this.db.prepare("UPDATE topic_jobs SET state='queued', step=step+1, failures=0, availableAt=?, error=NULL WHERE id=?").run(this.clock(), claim.job.id);
+  }
+
   fail(claim: TopicClaim, code: string, retry: { maxAttempts: number; delayMs: number }): void {
     if (!Number.isSafeInteger(retry.maxAttempts) || retry.maxAttempts < 1 || !Number.isSafeInteger(retry.delayMs) || retry.delayMs < 1) throw new Error('invalid_topic_retry');
     this.transaction(() => {
       this.assertClaim(claim);
       // Persist only a constrained code, never provider output, credentials or source text.
       const error = /^[a-z_]{1,64}$/.test(code) ? code : 'topic_job_failed';
-      this.db.prepare('UPDATE topic_jobs SET state=?, availableAt=?, error=? WHERE id=?')
-        .run(claim.job.attempt >= retry.maxAttempts ? 'failed' : 'queued', this.clock() + retry.delayMs, error, claim.job.id);
+      this.db.prepare('UPDATE topic_jobs SET state=?, failures=failures+1, availableAt=?, error=? WHERE id=?')
+        .run(claim.job.failures + 1 >= retry.maxAttempts ? 'failed' : 'queued', this.clock() + retry.delayMs, error, claim.job.id);
       this.completeBatch(claim.job.batch);
     });
   }
 
-  list(): TopicJob[] { return this.db.prepare('SELECT * FROM topic_jobs ORDER BY id').all() as TopicJob[]; }
+  list(): TopicJob[] { return this.db.prepare('SELECT j.*, b.accepted AS acceptedAt FROM topic_jobs j JOIN topic_batches b ON b.slot=j.batch ORDER BY j.id').all() as TopicJob[]; }
   batches(): Array<{ slot: string; accepted: number; completed: number | null }> {
     return this.db.prepare('SELECT slot, accepted, completed FROM topic_batches ORDER BY accepted, slot').all() as Array<{ slot: string; accepted: number; completed: number | null }>;
   }

@@ -74,6 +74,7 @@ export interface TopicReadOptions {
   maxChars: number;
   signal: AbortSignal;
   /** Called on verified source data, before summarization. Observation survives a model failure. */
+  isRevision?: (message: TopicMessage) => boolean;
   observe: (times: { createdAt?: string; latestAt?: string }) => void;
 }
 
@@ -99,10 +100,15 @@ export async function readTopicIncrement(reader: TopicPageReader, options: Topic
     options.signal.throwIfAborted();
     if (scan.pending.length) {
       const message = scan.pending[0];
+      if (message.createdAt > scan.startedAt) {
+        // Freeze the batch's upper bound: arrivals while providers run belong to a later batch.
+        scan.pending = []; scan.exhausted = true; scan.token = undefined;
+        break;
+      }
       const duplicate = seen.get(message.id);
       const fingerprint = topicSourceFingerprint(message);
       if (duplicate && duplicate !== fingerprint) throw new Error('topic_source_changed_during_scan');
-      if (!duplicate && isNew(message)) {
+      if (!duplicate && (isNew(message) || options.isRevision?.(message))) {
         const cost = message.text.length + message.id.length + message.createdAt.length + 128;
         if (selected.length >= options.maxMessages || chars + cost > options.maxChars) {
           if (!selected.length) throw new Error('topic_source_message_over_budget');
@@ -148,7 +154,7 @@ export async function readTopicIncrement(reader: TopicPageReader, options: Topic
     const time = selected.at(-1)!.createdAt;
     const ids = selected.filter(message => message.createdAt === time).map(message => message.id);
     if (previous?.time === time) ids.push(...previous.ids);
-    cursor = encodeCursor({ time, ids });
+    if (!previous || time >= previous.time) cursor = encodeCursor({ time, ids });
   }
   const partial = !scan.exhausted || scan.pending.length > 0;
   scan.baseCursor = cursor;

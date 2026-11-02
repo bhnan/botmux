@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { TopicStore, TopicCommit } from './store.js';
+import type { TopicStore, TopicJobResult } from './store.js';
 import type { TopicClaim, TopicLease } from './jobs.js';
 
 export interface TopicRunPolicy {
@@ -20,7 +20,7 @@ export interface TopicExecutionContext {
   /** Recheck before each new source/model request; removing a chat revokes new external reads. */
   assertAuthorized(): void;
 }
-export type TopicExecutor = (claim: TopicClaim, context: TopicExecutionContext) => Promise<TopicCommit | null>;
+export type TopicExecutor = (claim: TopicClaim, context: TopicExecutionContext) => Promise<TopicJobResult>;
 
 /** A deployment owner, independent of Session/CLI/PTY lifecycle. The host drives tick and close. */
 export class TopicScheduler {
@@ -89,7 +89,7 @@ export class TopicScheduler {
         if (error instanceof Error && error.message === 'topic_scope_removed') this.store.settle(claim, null, true);
         else this.store.jobs.fail(claim, error instanceof Error ? error.message : 'topic_job_failed', {
           maxAttempts: policy.maxAttempts,
-          delayMs: Math.min(policy.retryBaseMs * 2 ** Math.min(claim.job.attempt - 1, 20), 3_600_000),
+          delayMs: Math.min(policy.retryBaseMs * 2 ** Math.min(claim.job.failures, 20), 3_600_000),
         });
       } catch (failure) {
         if (!(failure instanceof Error) || failure.message !== 'stale_topic_claim') throw failure;
