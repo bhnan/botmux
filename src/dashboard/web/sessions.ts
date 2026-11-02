@@ -1,3 +1,5 @@
+import { sessionTopicKey } from '../../topic/identity.js';
+export { sessionTopicKey } from '../../topic/identity.js';
 // Sessions page shared helpers: pure display helpers and small API utilities.
 import {
   botDisplayName,
@@ -289,20 +291,6 @@ function sessionTopicKind(s: any): SessionTopicKind {
   const rootMessageId = nonEmptyString(s?.rootMessageId);
   if (s?.scope === 'chat') return chatId ? 'chat' : 'session';
   return chatId && rootMessageId ? 'thread' : 'session';
-}
-
-/** Stable location key for the current schema. Keep it separate from any
- * future `collaborationId`: location and logical task identity are different
- * dimensions and must not silently alias each other. */
-export function sessionTopicKey(s: any): string {
-  const chatId = nonEmptyString(s?.chatId);
-  const rootMessageId = nonEmptyString(s?.rootMessageId);
-  const kind = sessionTopicKind(s);
-  if (kind === 'thread') {
-    return `thread:${encodeURIComponent(chatId)}:${encodeURIComponent(rootMessageId)}`;
-  }
-  if (kind === 'chat') return `chat:${encodeURIComponent(chatId)}`;
-  return `session:${encodeURIComponent(nonEmptyString(s?.sessionId) || 'unknown')}`;
 }
 
 function topicTitle(rows: any[], fallback: string): string {

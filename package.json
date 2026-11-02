@@ -43,6 +43,7 @@
     "creds:sync": "bun dist/cli.js suspend --isolated",
     "switch:here": "bun run build && bun run use:here",
     "test": "vitest run --project unit",
+    "test:topic:offline": "vitest run --config vitest.topic-offline.config.ts",
     "test:all": "vitest run",
     "test:e2e": "vitest run --project e2e",
     "test:midscene": "midscene-test test/midscene --result-dir midscene_run/dashboard/results",

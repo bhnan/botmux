@@ -2647,3 +2647,33 @@ export type WorkerToDaemon =
    *  diagnostic (sendAndFlush, truncated) so the daemon can surface the real
    *  crash cause on the card instead of a generic worker-exit message. */
   | { type: 'worker_fatal'; message: string };
+
+/** Persisted public-thread knowledge, independent of execution Session lifecycle. */
+export interface Topic {
+  schemaVersion: 1;
+  topicKey: string;
+  chatId: string;
+  rootMessageId: string;
+  nativeThreadId?: string;
+  title: string;
+  accessPolicyRef: string;
+  revision: number;
+  summaries: TopicSummary[];
+  summarizedThroughCursor?: string;
+  coverageStartAt?: string;
+  sourceThroughAt?: string;
+  lastCheckedAt?: string;
+  topicCreatedAt?: string;
+  latestMessageAt?: string;
+  updatedAt: string;
+}
+
+export interface TopicSummary {
+  id: string;
+  text: string;
+  keywords: string[];
+  sourceMessageIds: string[];
+  updatedAt: string;
+  generatorKey: string;
+  embedding?: { modelKey: string; contentHash: string; vector: number[] };
+}
