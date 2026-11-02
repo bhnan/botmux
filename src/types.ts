@@ -2655,6 +2655,7 @@ export interface Topic {
   chatId: string;
   rootMessageId: string;
   nativeThreadId?: string;
+  sourceBrand?: 'feishu' | 'lark';
   title: string;
   accessPolicyRef: string;
   revision: number;
@@ -2662,6 +2663,8 @@ export interface Topic {
   summarizedThroughCursor?: string;
   coverageStartAt?: string;
   sourceThroughAt?: string;
+  /** Coverage gap survives expiry of temporary raw page tails. */
+  sourceIncomplete?: boolean;
   lastCheckedAt?: string;
   topicCreatedAt?: string;
   latestMessageAt?: string;

@@ -1,5 +1,5 @@
 import { expect, it, vi } from 'vitest';
-import { topicSearchApi } from '../../src/dashboard/topic-search-api.js';
+import { topicSearchApi, topicSourceViewApi } from '../../src/dashboard/topic-search-api.js';
 import { topicSourcePageApi, topicSourceCheckApi } from '../../src/topic/source-api.js';
 import { TopicSearchError } from '../../src/topic/search.js';
 import { resolveDashboardRequestGate } from '../../src/dashboard/request-identity.js';
@@ -47,4 +47,16 @@ it('source review uses the same trusted-host/update-scope boundary and validates
   expect((await topicSourceCheckApi({ ...body, messageId: 'virtual:ref' }, deps)).status).toBe(400);
   expect(check).not.toHaveBeenCalled();
   expect(await topicSourceCheckApi(body, deps)).toEqual({ status: 200, body: { state: 'unknown' } });
+});
+
+it('source navigation preserves sensitive-history authentication and returns raw text only after authorization', async () => {
+  const read = vi.fn().mockResolvedValue({ title: 'T', message: { id: 'om_a', createdAt: '2026-10-01T00:00:00.000Z', text: '<script>untrusted</script>' } });
+  const input = { topicKey: 'thread:oc_a:om_root', messageId: 'om_a' }, signal = new AbortController().signal;
+  expect((await topicSourceViewApi(input, { canManageHost: false }, read, signal)).status).toBe(401);
+  expect((await topicSourceViewApi(input, { canManageHost: false, principal: 'visitor' }, read, signal)).status).toBe(403);
+  expect(read).not.toHaveBeenCalled();
+  const result = await topicSourceViewApi(input, { canManageHost: true, principal: 'owner' }, read, signal);
+  expect(result.status).toBe(200); expect(result.body).toContain('om_a');
+  read.mockRejectedValue(new Error('private raw provider error'));
+  expect(await topicSourceViewApi(input, { canManageHost: true, principal: 'owner' }, read, signal)).toEqual({ status: 503, body: 'topic_source_unavailable' });
 });

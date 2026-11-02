@@ -1,3 +1,6 @@
+/** Temporary provider tokens/raw page tails never inherit the summary retention policy. */
+export const TOPIC_SOURCE_CHECKPOINT_TTL_MS = 24 * 60 * 60 * 1000;
+
 import { createHash } from 'node:crypto';
 
 /** A durable message boundary, never a provider's expiring pagination token. */
@@ -36,6 +39,7 @@ export function coversCursor(next: TopicCursor, previous: TopicCursor): boolean 
 
 /** A page is a proven ascending slice of one native thread, never an unverified chat-tail filter. */
 export interface TopicSourcePage {
+  sourceBrand?: 'feishu' | 'lark';
   messages: TopicMessage[];
   hasMore: boolean;
   nextToken?: string;
@@ -49,6 +53,7 @@ export type TopicPageReader = (token: string | undefined, signal: AbortSignal) =
 
 /** Ephemeral traversal progress is NOT the successful summary cursor. Safe to discard/restart. */
 export interface TopicSourceCheckpoint {
+  expiresAt?: number;
   baseCursor: string | null;
   sourceId?: string;
   token?: string;
@@ -78,7 +83,7 @@ export interface TopicReadOptions {
   signal: AbortSignal;
   /** Called on verified source data, before summarization. Observation survives a model failure. */
   isRevision?: (message: TopicMessage) => boolean;
-  observe: (times: { createdAt?: string; latestAt?: string; nativeThreadId?: string }) => void;
+  observe: (times: { createdAt?: string; latestAt?: string; nativeThreadId?: string; sourceBrand?: 'feishu' | 'lark' }) => void;
 }
 
 /** Consume a contiguous prefix; a full page can be split across commits without discarding its tail.
@@ -144,7 +149,8 @@ export async function readTopicIncrement(reader: TopicPageReader, options: Topic
       time = message.createdAt;
     }
     const latest = [page.latestMessageAt ? normalizeTime(page.latestMessageAt) : '', time ?? ''].sort().at(-1);
-    options.observe({ nativeThreadId: page.nativeThreadId, createdAt: page.topicCreatedAt ? normalizeTime(page.topicCreatedAt) : undefined, latestAt: latest || undefined });
+    if (page.sourceBrand !== undefined && page.sourceBrand !== 'feishu' && page.sourceBrand !== 'lark') throw new Error('invalid_topic_source_brand');
+    options.observe({ sourceBrand: page.sourceBrand, nativeThreadId: page.nativeThreadId, createdAt: page.topicCreatedAt ? normalizeTime(page.topicCreatedAt) : undefined, latestAt: latest || undefined });
     scan.pending = messages;
     scan.lastPageTime = time;
     scan.exhausted = !page.hasMore;

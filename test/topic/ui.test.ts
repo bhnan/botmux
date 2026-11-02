@@ -1,7 +1,7 @@
 import { expect, it, vi } from 'vitest';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { TopicSearchController, topicSearchGroups, topicContentRows, topicSearchRequest, safeTopicLink } from '../../src/dashboard/web/topic-search-controller.js';
+import { TopicSearchController, topicSearchGroups, topicContentRows, topicSearchRequest, safeTopicLink, topicSourceLink } from '../../src/dashboard/web/topic-search-controller.js';
 import { TopicResultDetails } from '../../src/dashboard/web/topic-search-ui.js';
 import { TopicGroupsView } from '../../src/dashboard/web/sessions-page.js';
 import type { TopicSearchItem, TopicSearchResponse } from '../../src/topic/search.js';
@@ -80,4 +80,17 @@ it('bulk-selection candidates exclude every topic hidden by content results, inc
   expect(topicContentRows(rows, [item('a')]).map(row => row.sessionId)).toEqual(['matched']);
   expect(topicContentRows(rows, [])).toEqual([]);
   expect(topicContentRows(rows, undefined)).toEqual(rows);
+});
+
+it('real summary citations navigate to the authenticated source handler, without external URL interpolation', () => {
+  const result = item('a'), tree = TopicResultDetails({ item: result });
+  const links: string[] = [];
+  const walk = (node: any): void => { if (Array.isArray(node)) node.forEach(walk); else if (node && typeof node === 'object') { if (node.type === 'a') links.push(node.props.href); walk(node.props?.children); } };
+  walk(tree);
+  const source = links.find(link => link.startsWith('/api/topic-search/source?'))!;
+  expect(source).toBeDefined();
+  const url = new URL(source, 'https://dashboard.invalid');
+  expect(url.searchParams.get('messageId')).toBe('om_source'); expect(url.searchParams.get('topicKey')).toBe(result.topicKey);
+  expect(topicSourceLink(result.topicKey, 'javascript:alert(1)')).toBeUndefined();
+  expect(topicSourceLink('https://evil.invalid', 'om_source')).toBeUndefined();
 });

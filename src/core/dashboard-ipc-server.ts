@@ -4915,7 +4915,7 @@ ipcRoute('POST', '/api/topic-source/page', requireBoundBot(async (req, res) => {
   try {
     const result = await topicSourcePageApi(body, {
       trustedHost: isTrustedHostIpcRequest(req), allowedChatIds: readGlobalConfig().topicSearch?.allowedChatIds ?? [], signal: abort.signal,
-      read: (location, options) => readLarkTopicPage(cachedLarkAppId!, location, options),
+      read: async (location, options) => ({ ...await readLarkTopicPage(cachedLarkAppId!, location, options), sourceBrand: getBotBrand(cachedLarkAppId!) }),
     });
     jsonRes(res, result.status, result.body);
   } finally { res.off('close', onClose); }

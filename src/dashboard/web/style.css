@@ -36967,3 +36967,5 @@ button.dboard-add-image { min-height: 28px; padding: 0 10px; font-size: var(--fs
 .topic-summary-match code { display: inline-block; margin-right: 8px; font-size: 10px; }
 .topic-search-more { margin: 16px auto; display: block; }
 @media (max-width: 600px) { .topic-search-controls { align-items: stretch; } .topic-search-controls label { width: 100%; justify-content: space-between; } .topic-result-details { padding: 12px; } }
+.topic-summary-match a { text-decoration: underline; text-underline-offset: 2px; }
+.topic-summary-match a:hover code { color: var(--accent-strong); }

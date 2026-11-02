@@ -8,7 +8,7 @@ import { TopicEmbeddingQueue, TOPIC_EMBEDDING_SCHEMA } from './embedding.js';
 import type { TopicModelProfile } from './config.js';
 import { topicIdentity } from './identity.js';
 import { TopicJobQueue, TOPIC_JOB_SCHEMA, type TopicClaim, type TopicLease } from './jobs.js';
-import { coversCursor, decodeCursor, normalizeTime, type TopicSourceCheckpoint, type TopicMessage, topicSourceFingerprint } from './source.js';
+import { coversCursor, decodeCursor, normalizeTime, TOPIC_SOURCE_CHECKPOINT_TTL_MS, type TopicSourceCheckpoint, type TopicMessage, topicSourceFingerprint } from './source.js';
 
 export interface TopicSeed {
   chatId: string;
@@ -56,13 +56,13 @@ export class TopicStore {
   readonly reviews: TopicSourceReviewQueue;
   readonly embeddings: TopicEmbeddingQueue;
 
-  constructor(readonly path: string, clock: () => number = Date.now) {
+  constructor(readonly path: string, private readonly clock: () => number = Date.now) {
     mkdirSync(dirname(path), { recursive: true });
     this.db = openDatabaseSyncOrThrow(path);
     try {
       this.db.exec('PRAGMA busy_timeout=3000; PRAGMA journal_mode=WAL;');
       const version = (this.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version;
-      if (version > 8) throw new Error('unsupported_topic_schema');
+      if (version > 9) throw new Error('unsupported_topic_schema');
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS topic_documents (key TEXT PRIMARY KEY, chat TEXT NOT NULL, body TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS topic_chat ON topic_documents(chat);
@@ -71,14 +71,17 @@ export class TopicStore {
         CREATE TABLE IF NOT EXISTS topic_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
         INSERT OR IGNORE INTO topic_meta VALUES ('generation', 0);
         ${TOPIC_JOB_SCHEMA}
-        CREATE TABLE IF NOT EXISTS topic_source_scans (topic TEXT PRIMARY KEY, body TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS topic_source_scans (topic TEXT PRIMARY KEY, body TEXT NOT NULL, expires INTEGER NOT NULL DEFAULT 0);
 
       `);
       const jobColumns = this.db.prepare('PRAGMA table_info(topic_jobs)').all() as Array<{ name: string }>;
       for (const field of ['step', 'failures']) {
         if (!jobColumns.some(column => column.name === field)) this.db.exec(`ALTER TABLE topic_jobs ADD COLUMN ${field} INTEGER NOT NULL DEFAULT 0`);
       }
-      this.db.exec(`CREATE TABLE IF NOT EXISTS topic_source_fingerprints (topic TEXT NOT NULL, message TEXT NOT NULL, hash TEXT NOT NULL, created TEXT NOT NULL, checked TEXT NOT NULL, PRIMARY KEY(topic, message)); ${TOPIC_EMBEDDING_SCHEMA} CREATE TABLE IF NOT EXISTS topic_maintenance (key TEXT PRIMARY KEY, value TEXT NOT NULL); ${TOPIC_REVIEW_SCHEMA} PRAGMA user_version=8;`);
+      this.db.exec(`CREATE TABLE IF NOT EXISTS topic_source_fingerprints (topic TEXT NOT NULL, message TEXT NOT NULL, hash TEXT NOT NULL, created TEXT NOT NULL, checked TEXT NOT NULL, PRIMARY KEY(topic, message)); ${TOPIC_EMBEDDING_SCHEMA} CREATE TABLE IF NOT EXISTS topic_maintenance (key TEXT PRIMARY KEY, value TEXT NOT NULL); ${TOPIC_REVIEW_SCHEMA} PRAGMA user_version=9;`);
+      const scanColumns = this.db.prepare('PRAGMA table_info(topic_source_scans)').all() as Array<{ name: string }>;
+      if (!scanColumns.some(column => column.name === 'expires')) this.db.exec('ALTER TABLE topic_source_scans ADD COLUMN expires INTEGER NOT NULL DEFAULT 0');
+      this.db.exec('CREATE INDEX IF NOT EXISTS topic_source_scans_expiry ON topic_source_scans(expires)');
       this.jobs = new TopicJobQueue(this.db, action => this.transaction(action), clock);
       this.reviews = new TopicSourceReviewQueue(this.db, action => this.transaction(action), claim => this.jobs.assertClaim(claim));
       this.embeddings = new TopicEmbeddingQueue(this.db, action => this.transaction(action), key => this.read(key), topic => this.write(topic), lease => this.jobs.valid(lease), clock);
@@ -198,14 +201,18 @@ export class TopicStore {
     });
   }
 
-  observe(key: string, observation: { createdAt?: string; latestAt?: string; checkedAt: string; nativeThreadId?: string }, claim?: TopicClaim): Topic {
+  observe(key: string, observation: { createdAt?: string; latestAt?: string; checkedAt: string; nativeThreadId?: string; sourceBrand?: 'feishu' | 'lark' }, claim?: TopicClaim): Topic {
     return this.transaction(() => {
       const topic = this.require(key);
       if (claim) {
         this.jobs.assertClaim(claim);
         if (claim.job.topicKey !== key) throw new Error('topic_claim_mismatch');
       }
-      const before = JSON.stringify([topic.topicCreatedAt, topic.latestMessageAt, topic.nativeThreadId]);
+      const before = JSON.stringify([topic.topicCreatedAt, topic.latestMessageAt, topic.nativeThreadId, topic.sourceBrand]);
+      if (observation.sourceBrand) {
+        if (!['feishu', 'lark'].includes(observation.sourceBrand) || (topic.sourceBrand && observation.sourceBrand !== topic.sourceBrand)) throw new Error('topic_source_brand_changed');
+        topic.sourceBrand = observation.sourceBrand;
+      }
       if (observation.nativeThreadId) {
         if (!/^omt_[A-Za-z0-9_-]+$/.test(observation.nativeThreadId) || (topic.nativeThreadId && topic.nativeThreadId !== observation.nativeThreadId)) throw new Error('topic_source_native_changed');
         topic.nativeThreadId = observation.nativeThreadId;
@@ -216,7 +223,7 @@ export class TopicStore {
         if (!topic.latestMessageAt || latest > topic.latestMessageAt) topic.latestMessageAt = latest;
       }
       topic.lastCheckedAt = normalizeTime(observation.checkedAt);
-      const changed = before !== JSON.stringify([topic.topicCreatedAt, topic.latestMessageAt, topic.nativeThreadId]);
+      const changed = before !== JSON.stringify([topic.topicCreatedAt, topic.latestMessageAt, topic.nativeThreadId, topic.sourceBrand]);
       if (changed) topic.revision++;
       // Check timestamps alone do not invalidate a user's search pagination snapshot.
       this.write(topic, changed);
@@ -306,23 +313,54 @@ export class TopicStore {
     return this.transaction(() => {
       this.jobs.assertClaim(claim);
       const topic = this.require(claim.job.topicKey);
+      let changed = false;
       if (!topic.coverageStartAt) {
         topic.coverageStartAt = new Date(Date.parse(normalizeTime(now)) - lookbackDays * 86_400_000).toISOString();
-        topic.revision++;
-        this.write(topic);
+        topic.revision++; changed = true;
       }
+      if (!topic.sourceIncomplete) { topic.sourceIncomplete = true; changed = true; }
+      if (changed) this.write(topic);
       return topic;
     });
   }
 
   sourceCheckpoint(key: string): TopicSourceCheckpoint | null {
-    const row = this.db.prepare('SELECT body FROM topic_source_scans WHERE topic=?').get(key) as { body: string } | undefined;
-    return row ? JSON.parse(row.body) as TopicSourceCheckpoint : null;
+    const row = this.db.prepare('SELECT body, expires FROM topic_source_scans WHERE topic=?').get(key) as { body: string; expires: number } | undefined;
+    if (!row) return null;
+    if (row.expires <= this.clock()) {
+      this.markSourceIncomplete(key, true);
+      this.db.prepare('DELETE FROM topic_source_scans WHERE topic=? AND expires<=?').run(key, this.clock());
+      return null;
+    }
+    return { ...JSON.parse(row.body), expiresAt: row.expires } as TopicSourceCheckpoint;
   }
 
-  private writeCheckpoint(key: string, checkpoint: TopicSourceCheckpoint | null): void {
-    if (checkpoint === null) this.db.prepare('DELETE FROM topic_source_scans WHERE topic=?').run(key);
-    else this.db.prepare('INSERT INTO topic_source_scans VALUES (?, ?) ON CONFLICT(topic) DO UPDATE SET body=excluded.body').run(key, JSON.stringify(checkpoint));
+  /** Local maintenance runs even when enrichment is disabled and summaries have no TTL.
+   * Expiry discards only temporary traversal state; the successful cursor is never advanced.
+   */
+  purgeExpiredSourceCheckpoints(lease: TopicLease, limit = 100): number {
+    return this.transaction(() => {
+      if (!this.jobs.valid(lease)) throw new Error('stale_topic_maintenance');
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new Error('invalid_topic_maintenance_budget');
+      const rows = this.db.prepare('SELECT topic FROM topic_source_scans WHERE expires<=? ORDER BY expires, topic LIMIT ?').all(this.clock(), limit) as Array<{ topic: string }>;
+      for (const row of rows) { this.markSourceIncomplete(row.topic, true); this.db.prepare('DELETE FROM topic_source_scans WHERE topic=?').run(row.topic); }
+      return rows.length;
+    });
+  }
+
+  hasSourceCheckpoint(key: string): boolean { return !!this.db.prepare('SELECT 1 FROM topic_source_scans WHERE topic=?').get(key); }
+
+  private markSourceIncomplete(key: string, incomplete: boolean): void {
+    const topic = this.read(key);
+    if (topic && !!topic.sourceIncomplete !== incomplete) { topic.sourceIncomplete = incomplete; this.write(topic); }
+  }
+
+  private writeCheckpoint(key: string, checkpoint: TopicSourceCheckpoint | null, incomplete = checkpoint !== null): void {
+    this.markSourceIncomplete(key, incomplete);
+    const expires = checkpoint ? Math.min(checkpoint.expiresAt ?? this.clock() + TOPIC_SOURCE_CHECKPOINT_TTL_MS, this.clock() + TOPIC_SOURCE_CHECKPOINT_TTL_MS) : 0;
+    if (!checkpoint || !Number.isFinite(expires) || expires <= this.clock()) this.db.prepare('DELETE FROM topic_source_scans WHERE topic=?').run(key);
+    else this.db.prepare('INSERT INTO topic_source_scans (topic, body, expires) VALUES (?, ?, ?) ON CONFLICT(topic) DO UPDATE SET body=excluded.body, expires=MIN(topic_source_scans.expires, excluded.expires)')
+      .run(key, JSON.stringify({ ...checkpoint, expiresAt: expires }), expires);
   }
 
   /** Only traversed already-processed history may checkpoint without a successful model commit. */
@@ -331,7 +369,7 @@ export class TopicStore {
       this.jobs.assertClaim(claim);
       const topic = this.require(claim.job.topicKey);
       if (checkpoint && checkpoint.baseCursor !== (topic.summarizedThroughCursor ?? null)) throw new Error('topic_scan_cursor_mismatch');
-      this.writeCheckpoint(claim.job.topicKey, checkpoint);
+      this.writeCheckpoint(claim.job.topicKey, checkpoint, true);
     });
   }
 

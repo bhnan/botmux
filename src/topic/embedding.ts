@@ -105,6 +105,13 @@ export class TopicEmbeddingQueue {
     });
   }
 
+  pause(claim: TopicEmbeddingClaim): void {
+    this.transaction(() => {
+      this.assert(claim);
+      this.db.prepare("UPDATE topic_embedding_jobs SET state='queued' WHERE topic=? AND summary=?").run(claim.topic, claim.summary);
+    });
+  }
+
   pending(): number { return Number((this.db.prepare("SELECT COUNT(*) AS n FROM topic_embedding_jobs WHERE state<>'done'").get() as { n: number }).n); }
 }
 
@@ -130,7 +137,7 @@ export class TopicEmbeddingWorker {
   constructor(private readonly queue: TopicEmbeddingQueue, private readonly model: Pick<TopicModelClient, 'embed'>, private readonly config: () => TopicSearchConfig) {}
 
   tick(lease: TopicLease): void {
-    if (this.active) return;
+    if (this.active || !this.config().embedding.enabled) return;
     const claim = this.queue.claim(lease);
     if (!claim) return;
     this.abort = new AbortController();
@@ -138,6 +145,7 @@ export class TopicEmbeddingWorker {
     this.active = (async () => {
       try {
         const before = this.config();
+        if (!before.embedding.enabled) { this.queue.pause(claim); return; }
         const authorized = before.embedding.modelRef ? before.models[before.embedding.modelRef] : undefined;
         if (!authorized || topicModelKey(authorized) !== claim.model) {
           this.queue.complete(claim, [], authorized ? topicModelKey(authorized) : null); return;

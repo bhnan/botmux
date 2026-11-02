@@ -130,6 +130,15 @@ export class TopicJobQueue {
     });
   }
 
+  diagnostics(): { pendingJobs: number; failedTopics: number; skippedTopics: number; completedTopics: number; lastBatchDurationMs: number | null; failures: Array<{ code: string; count: number }> } {
+    const latest = `SELECT j.* FROM topic_jobs j JOIN (SELECT topicKey, MAX(id) AS id FROM topic_jobs GROUP BY topicKey) l ON l.id=j.id`;
+    const counts = new Map((this.db.prepare(`SELECT state, COUNT(*) AS n FROM (${latest}) GROUP BY state`).all() as Array<{ state: string; n: number }>).map(row => [row.state, row.n]));
+    const pending = this.db.prepare("SELECT COUNT(*) AS n FROM topic_jobs WHERE state IN ('queued', 'running')").get() as { n: number };
+    const batch = this.db.prepare('SELECT completed-accepted AS duration FROM topic_batches WHERE completed IS NOT NULL ORDER BY completed DESC, slot DESC LIMIT 1').get() as { duration: number } | undefined;
+    const failures = this.db.prepare(`SELECT error AS code, COUNT(*) AS count FROM (${latest}) WHERE error IS NOT NULL GROUP BY error ORDER BY count DESC, error LIMIT 10`).all() as Array<{ code: string; count: number }>;
+    return { pendingJobs: pending.n, failedTopics: counts.get('failed') ?? 0, skippedTopics: counts.get('skipped') ?? 0, completedTopics: counts.get('done') ?? 0, lastBatchDurationMs: batch ? Math.max(0, batch.duration) : null, failures };
+  }
+
   list(): TopicJob[] { return this.db.prepare('SELECT j.*, b.accepted AS acceptedAt FROM topic_jobs j JOIN topic_batches b ON b.slot=j.batch ORDER BY j.id').all() as TopicJob[]; }
   batches(): Array<{ slot: string; accepted: number; completed: number | null }> {
     return this.db.prepare('SELECT slot, accepted, completed FROM topic_batches ORDER BY accepted, slot').all() as Array<{ slot: string; accepted: number; completed: number | null }>;

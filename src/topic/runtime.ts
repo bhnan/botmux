@@ -32,6 +32,7 @@ export class TopicRuntime {
   private searchService: TopicSearchService | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
   private stopped = false;
+  private sourceViews = 0;
   private readonly model: TopicModelClient;
   private readonly now: () => number;
   private lastDiscovery = -Infinity;
@@ -116,6 +117,7 @@ export class TopicRuntime {
       this.scheduler!.tick();
       const lease = this.scheduler!.currentLease();
       if (lease) {
+        this.store!.purgeExpiredSourceCheckpoints(lease);
         if (config.retentionDays !== null) {
           const page = this.store!.maintenancePage(lease, 'retention');
           this.store!.expireSummaries(lease, page.map(topic => topic.topicKey), config.retentionDays, new Date(this.now()).toISOString());
@@ -136,9 +138,39 @@ export class TopicRuntime {
     if (this.stopped) throw new TopicSearchError(503, 'topic_search_unavailable');
     this.initialize(); return this.searchService!;
   }
-  status(): { enabled: boolean; pendingJobs: number; pendingEmbeddings: number; error: string | null } {
-    return { enabled: this.deps.config().enabled, pendingJobs: this.store?.jobs.list().filter(job => job.state === 'queued' || job.state === 'running').length ?? 0, pendingEmbeddings: this.store?.embeddings.pending() ?? 0, error: this.lastError };
+  /** User-requested source navigation: never returns cached raw checkpoints or arbitrary IDs. */
+  async sourceView(topicKey: string, messageId: string, signal: AbortSignal): Promise<{ title: string; message: import('./source.js').TopicMessage }> {
+    this.service();
+    if (!/^thread:oc_[A-Za-z0-9_-]+:om_[A-Za-z0-9_-]+$/.test(topicKey) || !/^om_[A-Za-z0-9_-]+$/.test(messageId)) throw new TopicSearchError(400, 'invalid_topic_source_request');
+    const topic = this.store!.read(topicKey);
+    const cited = (value: Topic | null) => value?.summaries.some(summary => summary.sourceMessageIds.includes(messageId));
+    if (!topic || !cited(topic)) throw new TopicSearchError(404, 'topic_source_not_referenced');
+    if (!this.deps.config().allowedChatIds.includes(topic.chatId)) throw new TopicSearchError(403, 'topic_source_scope_denied');
+    if (this.sourceViews >= 4) throw new TopicSearchError(429, 'topic_source_busy');
+    this.sourceViews++;
+    try {
+      const bounded = AbortSignal.any([signal, AbortSignal.timeout(10_000)]);
+      let onAbort!: () => void;
+      const cancelled = new Promise<never>((_, reject) => { onAbort = () => reject(new TopicSearchError(503, 'topic_source_unavailable')); bounded.addEventListener('abort', onAbort, { once: true }); });
+      let result: TopicSourceCheck;
+      try {
+        bounded.throwIfAborted();
+        result = await Promise.race([this.deps.check?.(topic, messageId, bounded) ?? this.check(topic, messageId, bounded), cancelled]);
+      } finally { bounded.removeEventListener('abort', onAbort); }
+      bounded.throwIfAborted();
+      if (this.stopped || !this.deps.config().enabled || !this.deps.config().allowedChatIds.includes(topic.chatId)) throw new TopicSearchError(403, 'topic_source_scope_denied');
+      if (!cited(this.store!.read(topicKey)) || result.state === 'deleted') throw new TopicSearchError(404, 'topic_source_unavailable');
+      if (result.state !== 'present' || result.message.id !== messageId) throw new TopicSearchError(503, 'topic_source_unavailable');
+      return { title: topic.title, message: result.message };
+    } finally { this.sourceViews--; }
   }
+
+  status() {
+    const jobs = this.store?.jobs.diagnostics() ?? { pendingJobs: 0, failedTopics: 0, skippedTopics: 0, completedTopics: 0, lastBatchDurationMs: null, failures: [] };
+    return { enabled: this.deps.config().enabled, ...jobs, pendingEmbeddings: this.store?.embeddings.pending() ?? 0, error: this.lastError,
+      models: this.model.diagnostics(), metricsScope: 'model counters reset on Dashboard restart; task outcomes persist; tokens are provider-reported, not currency cost' };
+  }
+
   async idle(): Promise<void> { await this.scheduler?.idle(); await this.embedding?.idle(); }
   async close(): Promise<void> {
     if (this.stopped) return;

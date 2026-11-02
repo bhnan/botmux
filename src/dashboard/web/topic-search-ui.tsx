@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { TopicSearchItem } from '../../topic/search.js';
-import { TopicSearchController, safeTopicLink, topicSearchRequest, type TopicSearchState } from './topic-search-controller.js';
+import { TopicSearchController, safeTopicLink, topicSourceLink, topicSearchRequest, type TopicSearchState } from './topic-search-controller.js';
 
 export function useTopicSearch(visible: boolean, query: string, chat: string) {
   const [enabled, setEnabled] = useState(false);
@@ -89,7 +89,7 @@ export function TopicResultDetails({ item, historical }: { item: TopicSearchItem
       <span>摘要覆盖至：{date(item.sourceThroughAt)}</span><span>摘要更新：{date(item.updatedAt)}</span>
     </div>
     {item.matches.map(match => <article key={match.summaryId} className="topic-summary-match">
-      <p>{match.text}</p><small>来源消息：{match.sourceMessageIds.map(id => <code key={id}>{id}</code>)}</small>
+      <p>{match.text}</p><small>来源消息：{match.sourceMessageIds.map(id => { const source = topicSourceLink(item.topicKey, id); return source ? <a key={id} href={source} target="_blank" rel="noopener noreferrer"><code>{id}</code></a> : <code key={id}>{id}</code>; })}</small>
     </article>)}
     {!item.matches.length ? <small>标题或日期命中；暂无命中摘要。</small> : null}
   </div>;

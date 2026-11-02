@@ -51,9 +51,24 @@ export function parseTopicMutations(raw: unknown, input: TopicModelInput): Topic
   });
 }
 
+export interface TopicModelUsage {
+  attempts: number;
+  failedRequests: number;
+  inputChars: number;
+  promptTokens: number;
+  completionTokens: number;
+  unreportedUsageRequests: number;
+  lastDurationMs: number | null;
+  totalDurationMs: number;
+}
+const emptyUsage = (): TopicModelUsage => ({ attempts: 0, failedRequests: 0, inputChars: 0, promptTokens: 0, completionTokens: 0, unreportedUsageRequests: 0, lastDurationMs: null, totalDurationMs: 0 });
+
 /** Independent HTTP adapters; no chat sessions, CLI env, tools or agent invocation. */
 export class TopicModelClient {
   private readonly requests = new Map<string, number[]>();
+  private readonly usage = { summary: emptyUsage(), embedding: emptyUsage() };
+  /** Per-process billable-work indicators, not currency estimates or provider invoice totals. */
+  diagnostics(): { summary: TopicModelUsage; embedding: TopicModelUsage } { return structuredClone(this.usage); }
   constructor(private readonly deps: TopicModelClientDeps = defaults) {}
 
   private async request(profile: TopicModelProfile, body: unknown, route: string, signal: AbortSignal): Promise<Record<string, unknown>> {
@@ -67,6 +82,8 @@ export class TopicModelClient {
       const starts = (this.requests.get(key) ?? []).filter(time => time > now - 60_000);
       if (starts.length >= profile.requestsPerMinute) throw new Error('topic_model_rate_limited');
       starts.push(now); this.requests.set(key, starts);
+      const payload = JSON.stringify(body), metric = route === 'embeddings' ? this.usage.embedding : this.usage.summary;
+      const started = this.deps.now(); metric.attempts++; metric.inputChars += payload.length; metric.unreportedUsageRequests++;
       const abort = new AbortController();
       const onAbort = () => abort.abort(signal.reason);
       signal.addEventListener('abort', onAbort, { once: true });
@@ -82,7 +99,7 @@ export class TopicModelClient {
           try {
             response = await this.deps.fetch(`${profile.endpoint.replace(/\/$/, '')}/${route}`, {
               method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${credential}` },
-              body: JSON.stringify(body), signal: abort.signal, redirect: 'error',
+              body: payload, signal: abort.signal, redirect: 'error',
             });
           } catch { retry = true; throw new Error('topic_model_transport_failed'); }
           if (!response.ok) {
@@ -107,11 +124,22 @@ export class TopicModelClient {
           try { return record(JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
           catch { throw new Error('invalid_topic_model_output'); }
         };
-        return await Promise.race([work(), timeout]);
+        const result = await Promise.race([work(), timeout]);
+        const usage = result.usage && typeof result.usage === 'object' ? result.usage as Record<string, unknown> : {};
+        const valid = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+        // Missing counts stay explicitly unknown; never infer token count or pricing from text.
+        if (valid(usage.prompt_tokens) && (route === 'embeddings' || valid(usage.completion_tokens))) {
+          metric.promptTokens += usage.prompt_tokens;
+          metric.completionTokens += valid(usage.completion_tokens) ? usage.completion_tokens : 0;
+          metric.unreportedUsageRequests--;
+        }
+        return result;
       } catch (error) {
+        metric.failedRequests++;
         if (signal.aborted) throw new Error('topic_model_cancelled');
         if (!retry || attempt >= profile.retries) throw error;
       } finally {
+        metric.lastDurationMs = Math.max(0, this.deps.now() - started); metric.totalDurationMs += metric.lastDurationMs;
         if (timer) clearTimeout(timer);
         signal.removeEventListener('abort', onAbort);
         abort.abort();

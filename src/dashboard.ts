@@ -1,5 +1,5 @@
 import { TopicRuntime, disabledTopicSearchConfig } from './topic/runtime.js';
-import { topicSearchApi } from './dashboard/topic-search-api.js';
+import { topicSearchApi, topicSourceViewApi } from './dashboard/topic-search-api.js';
 import { TopicSearchError } from './topic/search.js';
 // src/dashboard.ts
 import { createServer, get as httpGet, type IncomingMessage, type ServerResponse } from 'node:http';
@@ -4372,6 +4372,17 @@ const server = createServer(async (req, res) => {
       } catch (error) {
         return jsonRes(res, error instanceof TopicSearchError ? error.status : 503, { error: error instanceof TopicSearchError ? error.message : 'topic_search_unavailable' });
       }
+    }
+    if (req.method === 'GET' && url.pathname === '/api/topic-search/source') {
+      const abort = new AbortController();
+      const onClose = () => { if (!res.writableEnded) abort.abort(); }; res.once('close', onClose);
+      try {
+        const result = await topicSourceViewApi({ topicKey: url.searchParams.get('topicKey') ?? '', messageId: url.searchParams.get('messageId') ?? '' },
+          { canManageHost, principal: requestIdentity?.authSessionId ?? (authed && activeToken ? legacyDashboardAuthSessionId(activeToken) : undefined) },
+          (key, id, signal) => topicRuntime.sourceView(key, id, signal), abort.signal);
+        res.writeHead(result.status, { 'content-type': 'text/plain; charset=utf-8', 'x-content-type-options': 'nosniff', 'cache-control': 'no-store', 'content-security-policy': "default-src 'none'; sandbox" });
+        return res.end(result.body);
+      } finally { res.off('close', onClose); }
     }
     if (req.method === 'GET' && url.pathname === '/api/topic-search/status') {
       if (!canManageHost) return jsonRes(res, 403, { error: 'topic_search_scope_denied' });

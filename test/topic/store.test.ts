@@ -107,3 +107,9 @@ it('upgrades a content-only database without resetting existing content and reje
   const future = openDatabaseSyncOrThrow(futurePath); future.exec('PRAGMA user_version=99;'); future.close();
   expect(() => new TopicStore(futurePath)).toThrow('unsupported_topic_schema');
 });
+
+it('does not silently move a verified topic to another source brand', () => {
+  store.observe(key, { sourceBrand: 'lark', checkedAt: now });
+  expect(() => store.observe(key, { sourceBrand: 'feishu', checkedAt: now })).toThrow('topic_source_brand_changed');
+  expect(store.read(key)!.sourceBrand).toBe('lark');
+});

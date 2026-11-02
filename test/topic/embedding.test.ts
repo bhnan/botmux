@@ -105,3 +105,29 @@ it('a text update with embedding disabled still rejects an already running vecto
   expect(store.embeddings.complete(claim, [1, 0], topicModelKey(profile))).toBe(false);
   expect(store.read(key)!.summaries[0].embedding).toBeUndefined();
 });
+it('pauses persisted retries on the independent embedding switch and resumes without losing the queue', async () => {
+  add(); const model = { embed: vi.fn().mockRejectedValueOnce(new Error('offline provider failure')).mockResolvedValue([1, 0]) };
+  const config = parseTopicSearchConfig({ embedding: { enabled: true, modelRef: 'embed' }, models: { embed: profile } });
+  const lease = store.jobs.acquire('owner', 60_000)!;
+  const worker = new TopicEmbeddingWorker(store.embeddings, model, () => config);
+  worker.tick(lease); await worker.idle(); expect(model.embed).toHaveBeenCalledTimes(1);
+  config.embedding.enabled = false; time += 2001;
+  worker.tick(lease); await worker.idle();
+  expect(model.embed).toHaveBeenCalledTimes(1); expect(store.embeddings.pending()).toBe(1);
+  expect(store.read(key)!.summaries[0].embedding).toBeUndefined();
+  config.embedding.enabled = true;
+  worker.tick(lease); await worker.idle();
+  expect(model.embed).toHaveBeenCalledTimes(2); expect(store.embeddings.pending()).toBe(0);
+  expect(store.read(key)!.summaries[0].embedding?.vector).toEqual([1, 0]);
+  await worker.close();
+});
+it('an independent switch change between claim and send pauses rather than drops the task', async () => {
+  add(); const model = { embed: vi.fn() };
+  const config = parseTopicSearchConfig({ embedding: { enabled: true, modelRef: 'embed' }, models: { embed: profile } });
+  let reads = 0;
+  const worker = new TopicEmbeddingWorker(store.embeddings, model, () => { if (++reads === 2) config.embedding.enabled = false; return config; });
+  const lease = store.jobs.acquire('owner', 60_000)!; worker.tick(lease); await worker.idle();
+  expect(model.embed).not.toHaveBeenCalled(); expect(store.embeddings.pending()).toBe(1);
+  expect(store.embeddings.claim(lease)?.text).toBe('fact');
+  await worker.close();
+});

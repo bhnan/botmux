@@ -130,3 +130,14 @@ it('a completed continuation attempt cannot overwrite the next step even under t
   expect(store.jobs.batches()[0].completed).toBeNull();
   store.settle(next, null); expect(store.jobs.batches()[0].completed).toBe(time);
 });
+it('diagnostics report latest per-topic outcomes, pending work and completed batch duration without replaying old failures', () => {
+  const lease = admit('first'); let claim = store.jobs.claim(lease, 1)!;
+  expect(store.jobs.diagnostics().pendingJobs).toBe(1);
+  store.jobs.fail(claim, 'private raw source / credential', { maxAttempts: 1, delayMs: 1 });
+  expect(store.jobs.diagnostics()).toMatchObject({ pendingJobs: 0, failedTopics: 1, failures: [{ code: 'topic_job_failed', count: 1 }] });
+  store.jobs.admit(lease, { enabled: true, slot: 'second', topicKeys: [key], snapshot: '{}', limit: 1 });
+  claim = store.jobs.claim(lease, 1)!; time += 25; store.settle(claim, null, true);
+  expect(store.jobs.diagnostics()).toMatchObject({ pendingJobs: 0, failedTopics: 0, skippedTopics: 1, completedTopics: 0, lastBatchDurationMs: 25, failures: [] });
+  const path = store.path; store.close(); store = new TopicStore(path, () => time);
+  expect(store.jobs.diagnostics()).toMatchObject({ skippedTopics: 1, lastBatchDurationMs: 25 });
+});

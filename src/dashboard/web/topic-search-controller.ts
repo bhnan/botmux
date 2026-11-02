@@ -85,3 +85,9 @@ export function safeTopicLink(raw: string): string | undefined {
   } catch { /* no external or executable scheme */ }
   return undefined;
 }
+
+/** Same-origin authenticated navigation; no provider/model URL enters the DOM. */
+export function topicSourceLink(topicKey: string, messageId: string): string | undefined {
+  if (!/^thread:oc_[A-Za-z0-9_-]+:om_[A-Za-z0-9_-]+$/.test(topicKey) || !/^om_[A-Za-z0-9_-]+$/.test(messageId)) return undefined;
+  return `/api/topic-search/source?${new URLSearchParams({ topicKey, messageId })}`;
+}

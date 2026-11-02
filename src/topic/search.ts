@@ -124,7 +124,7 @@ export class TopicSearchService {
     const hasDate = !!(request.filters.from || request.filters.to);
     for (const topic of directory.topics) {
       if (!topic.summarizedThroughCursor) unindexed++;
-      if (this.store.sourceCheckpoint(topic.topicKey) || (topic.latestMessageAt && (!topic.sourceThroughAt || topic.latestMessageAt > topic.sourceThroughAt))) sourcePartial = true;
+      if (topic.sourceIncomplete || this.store.hasSourceCheckpoint(topic.topicKey) || (topic.latestMessageAt && (!topic.sourceThroughAt || topic.latestMessageAt > topic.sourceThroughAt))) sourcePartial = true;
       const date = request.filters.timeBasis === 'topicCreated' ? topic.topicCreatedAt : topic.latestMessageAt;
       if (hasDate && !date) { unknownDates++; continue; }
       if (hasDate && ((request.filters.from && date! < request.filters.from) || (request.filters.to && date! > request.filters.to))) continue;
@@ -177,7 +177,7 @@ export class TopicSearchService {
     for (const row of ranked) {
       let item = grouped.get(row.topic.topicKey);
       if (!item) {
-        const topic = row.topic, brand = this.options.brand?.(topic) ?? 'feishu';
+        const topic = row.topic, brand = this.options.brand?.(topic) ?? topic.sourceBrand ?? 'feishu';
         item = { topicKey: topic.topicKey, chatId: topic.chatId, title: topic.title,
           url: isNativeTopicId(topic.nativeThreadId) ? threadAppLink(topic.chatId, topic.nativeThreadId, brand) : chatAppLink(topic.chatId, brand),
           matches: [], updatedAt: topic.updatedAt, sourceThroughAt: topic.sourceThroughAt, topicCreatedAt: topic.topicCreatedAt, latestMessageAt: topic.latestMessageAt };

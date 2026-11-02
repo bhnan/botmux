@@ -75,3 +75,23 @@ it('requires explicit embedding capability and validates dimension, finiteness a
     await expect(model.embed(embedding, 'fact', signal())).rejects.toThrow('invalid_topic_embedding');
   }
 });
+it('reports request cost units and latency without source text, credentials, or invented token estimates', async () => {
+  let now = 0, calls = 0;
+  const fetcher = vi.fn(async () => {
+    now += 7; calls++;
+    if (calls === 1) return new Response('private error body', { status: 500 });
+    return new Response(JSON.stringify({ ...(calls === 2 ? { usage: { prompt_tokens: 42, completion_tokens: 5 } } : {}), choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ mutations: [mutation] }) } }] }));
+  });
+  const model = new TopicModelClient({ fetch: fetcher as typeof fetch, credential: () => 'do-not-report-secret', now: () => now });
+  await model.summarize(profile, input, signal()); await model.summarize(profile, input, signal());
+  const report = model.diagnostics();
+  expect(report.summary).toMatchObject({ attempts: 3, failedRequests: 1, promptTokens: 42, completionTokens: 5, unreportedUsageRequests: 2, lastDurationMs: 7, totalDurationMs: 21 });
+  expect(report.summary.inputChars).toBeGreaterThan(0); expect(report.embedding.attempts).toBe(0);
+  expect(JSON.stringify(report)).not.toContain('do-not-report-secret'); expect(JSON.stringify(report)).not.toContain(input.messages[0].text);
+  report.summary.attempts = 999; expect(model.diagnostics().summary.attempts).toBe(3);
+});
+it('malformed provider usage remains explicitly unknown instead of poisoning counters', async () => {
+  const fetcher = vi.fn(async () => new Response(JSON.stringify({ usage: { prompt_tokens: -1, completion_tokens: '999' }, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ mutations: [mutation] }) } }] })));
+  const model = client(fetcher); await model.summarize(profile, input, signal());
+  expect(model.diagnostics().summary).toMatchObject({ promptTokens: 0, completionTokens: 0, unreportedUsageRequests: 1 });
+});
