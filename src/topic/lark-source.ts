@@ -1,4 +1,4 @@
-import { getMessageDetail, listNativeThreadPage } from '../im/lark/client.js';
+import { getMessageDetail, listNativeThreadPage, getLarkErrorCode } from '../im/lark/client.js';
 import { parseApiMessage } from '../im/lark/message-parser.js';
 import { isNativeTopicId } from '../core/native-topic-id.js';
 import type { TopicSourcePage } from './source.js';
@@ -43,4 +43,35 @@ export async function readLarkTopicPage(
     return { id: parsed.messageId, text: raw.deleted === true ? '' : parsed.content, createdAt: at, deleted: raw.deleted === true };
   });
   return { messages, hasMore: page.hasMore, nextToken: page.nextToken, verifiedThread: true, nativeThreadId: native, topicCreatedAt: createdAt };
+}
+
+/** A missing/forbidden response is inconclusive; only an explicit withdrawal is deletion. */
+export async function checkLarkTopicMessage(
+  appId: string, location: LarkTopicLocation, messageId: string,
+  options: { signal: AbortSignal; timeoutMs: number }, deps: LarkTopicSourceDeps = production,
+): Promise<import('./source-review.js').TopicSourceCheck> {
+  if (!/^om_[A-Za-z0-9_-]+$/.test(messageId)) throw new Error('invalid_topic_source_message');
+  options.signal.throwIfAborted();
+  let native = location.nativeThreadId;
+  if (!native) {
+    try {
+      const data = await deps.getRoot(appId, location.rootMessageId, { ...options, userCardContent: false });
+      const root = data?.items?.[0];
+      if (root?.chat_id !== location.chatId || root?.message_id !== location.rootMessageId || !isNativeTopicId(root?.thread_id)) return { state: 'unknown' };
+      native = root.thread_id;
+    } catch { options.signal.throwIfAborted(); return { state: 'unknown' }; }
+  }
+  try {
+    const data = await deps.getRoot(appId, messageId, { ...options, userCardContent: false });
+    options.signal.throwIfAborted();
+    const raw = data?.items?.find((item: { message_id?: string }) => item.message_id === messageId);
+    if (!raw || raw.chat_id !== location.chatId || raw.thread_id !== native) return { state: 'unknown' };
+    if (raw.deleted === true) return { state: 'deleted' };
+    const parsed = parseApiMessage(raw, undefined, { resolveMentions: true }), createdAt = sourceTime(parsed.createTime);
+    if (!createdAt || parsed.content.length > 256_000) return { state: 'unknown' };
+    return { state: 'present', message: { id: messageId, text: parsed.content, createdAt, deleted: false } };
+  } catch (error) {
+    options.signal.throwIfAborted();
+    return { state: getLarkErrorCode(error) === 230011 ? 'deleted' : 'unknown' };
+  }
 }

@@ -1,5 +1,5 @@
-import { topicSourcePageApi } from '../topic/source-api.js';
-import { readLarkTopicPage } from '../topic/lark-source.js';
+import { topicSourcePageApi, topicSourceCheckApi } from '../topic/source-api.js';
+import { readLarkTopicPage, checkLarkTopicMessage } from '../topic/lark-source.js';
 import { normalizeCodexProfile, scanCodexProfiles, validateCodexProfile, CodexProfileError } from '../services/codex-profiles.js';
 import { REPLY_FOOTER_KEYS, normalizeReplyFooter, type ReplyFooterPreferences } from '../services/reply-footer.js';
 import { boardErrorStatus, type BoardCliRequest, type DecisionBoardService } from './decision-board/service.js';
@@ -4916,6 +4916,21 @@ ipcRoute('POST', '/api/topic-source/page', requireBoundBot(async (req, res) => {
     const result = await topicSourcePageApi(body, {
       trustedHost: isTrustedHostIpcRequest(req), allowedChatIds: readGlobalConfig().topicSearch?.allowedChatIds ?? [], signal: abort.signal,
       read: (location, options) => readLarkTopicPage(cachedLarkAppId!, location, options),
+    });
+    jsonRes(res, result.status, result.body);
+  } finally { res.off('close', onClose); }
+}));
+
+ipcRoute('POST', '/api/topic-source/check', requireBoundBot(async (req, res) => {
+  let body: unknown;
+  try { body = await readJsonBody(req, 16_384); } catch { return jsonRes(res, 400, { error: 'bad_json' }); }
+  const abort = new AbortController();
+  const onClose = () => { if (!res.writableEnded) abort.abort(); };
+  res.once('close', onClose);
+  try {
+    const result = await topicSourceCheckApi(body, {
+      trustedHost: isTrustedHostIpcRequest(req), allowedChatIds: readGlobalConfig().topicSearch?.allowedChatIds ?? [], signal: abort.signal,
+      check: (location, messageId, options) => checkLarkTopicMessage(cachedLarkAppId!, location, messageId, options),
     });
     jsonRes(res, result.status, result.body);
   } finally { res.off('close', onClose); }

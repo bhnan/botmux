@@ -1,3 +1,4 @@
+import { TopicSourceReviewQueue, TOPIC_REVIEW_SCHEMA } from './source-review.js';
 import { randomUUID, createHash } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
@@ -52,6 +53,7 @@ export function contentHash(text: string): string {
 export class TopicStore {
   private readonly db: DatabaseSyncLike;
   readonly jobs: TopicJobQueue;
+  readonly reviews: TopicSourceReviewQueue;
   readonly embeddings: TopicEmbeddingQueue;
 
   constructor(readonly path: string, clock: () => number = Date.now) {
@@ -60,7 +62,7 @@ export class TopicStore {
     try {
       this.db.exec('PRAGMA busy_timeout=3000; PRAGMA journal_mode=WAL;');
       const version = (this.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version;
-      if (version > 7) throw new Error('unsupported_topic_schema');
+      if (version > 8) throw new Error('unsupported_topic_schema');
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS topic_documents (key TEXT PRIMARY KEY, chat TEXT NOT NULL, body TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS topic_chat ON topic_documents(chat);
@@ -76,8 +78,9 @@ export class TopicStore {
       for (const field of ['step', 'failures']) {
         if (!jobColumns.some(column => column.name === field)) this.db.exec(`ALTER TABLE topic_jobs ADD COLUMN ${field} INTEGER NOT NULL DEFAULT 0`);
       }
-      this.db.exec(`CREATE TABLE IF NOT EXISTS topic_source_fingerprints (topic TEXT NOT NULL, message TEXT NOT NULL, hash TEXT NOT NULL, created TEXT NOT NULL, checked TEXT NOT NULL, PRIMARY KEY(topic, message)); ${TOPIC_EMBEDDING_SCHEMA} CREATE TABLE IF NOT EXISTS topic_maintenance (key TEXT PRIMARY KEY, value TEXT NOT NULL); PRAGMA user_version=7;`);
+      this.db.exec(`CREATE TABLE IF NOT EXISTS topic_source_fingerprints (topic TEXT NOT NULL, message TEXT NOT NULL, hash TEXT NOT NULL, created TEXT NOT NULL, checked TEXT NOT NULL, PRIMARY KEY(topic, message)); ${TOPIC_EMBEDDING_SCHEMA} CREATE TABLE IF NOT EXISTS topic_maintenance (key TEXT PRIMARY KEY, value TEXT NOT NULL); ${TOPIC_REVIEW_SCHEMA} PRAGMA user_version=8;`);
       this.jobs = new TopicJobQueue(this.db, action => this.transaction(action), clock);
+      this.reviews = new TopicSourceReviewQueue(this.db, action => this.transaction(action), claim => this.jobs.assertClaim(claim));
       this.embeddings = new TopicEmbeddingQueue(this.db, action => this.transaction(action), key => this.read(key), topic => this.write(topic), lease => this.jobs.valid(lease), clock);
     } catch (error) { this.db.close(); throw error; }
   }

@@ -1,3 +1,4 @@
+import type { TopicSourceCheck } from './source-review.js';
 import type { Topic } from '../types.js';
 import { parseTopicSearchConfig } from './config.js';
 import { TopicModelClient, topicModelKey, type TopicModelInput } from './model-client.js';
@@ -10,6 +11,7 @@ export interface TopicSummaryUpdaterDeps {
   model: Pick<TopicModelClient, 'summarize'>;
   source: (topic: Topic, context: TopicExecutionContext) => TopicPageReader;
   now: () => number;
+  check?: (topic: Topic, messageId: string, signal: AbortSignal) => Promise<TopicSourceCheck>;
 }
 
 /** All returned content is committed by the scheduler's fenced, atomic settlement. */
@@ -20,6 +22,23 @@ export function topicSummaryExecutor(deps: TopicSummaryUpdaterDeps): TopicExecut
     if (!profile) throw new Error('topic_model_not_configured');
     const now = new Date(deps.now()).toISOString();
     const topic = deps.store.beginSource(claim, config.initialLookbackDays, now);
+    if (deps.check) {
+      for (const candidate of deps.store.reviews.pending(claim, config)) {
+        context.assertAuthorized();
+        let result: TopicSourceCheck;
+        try { result = await deps.check(topic, candidate.message, context.signal); }
+        catch { context.signal.throwIfAborted(); result = { state: 'unknown' }; }
+        context.signal.throwIfAborted();
+        if (result.state === 'deleted') deps.store.reconcileSources(claim, [{ id: candidate.message, text: '', createdAt: candidate.created, deleted: true }], now);
+        else if (result.state === 'present') {
+          if (result.message.id !== candidate.message || result.message.createdAt !== candidate.created) throw new Error('topic_review_identity_mismatch');
+          deps.store.reconcileSources(claim, [result.message], now);
+        }
+        // Invalidation first, receipt second: a crash rechecks safely rather than acknowledging
+        // stale content. Unknown/403/timeout does not fabricate a deletion or a successful check.
+        deps.store.reviews.finish(claim, candidate);
+      }
+    }
     const coverageStartAt = topic.coverageStartAt!;
     const reader = deps.source(topic, context);
     const result = await readTopicIncrement(async (token, signal) => {

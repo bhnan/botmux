@@ -1,3 +1,4 @@
+import type { TopicSourceCheck } from './source-review.js';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Topic } from '../types.js';
@@ -20,6 +21,7 @@ export interface TopicRuntimeDeps {
   now?: () => number;
   model?: TopicModelClient;
   source?: (topic: Topic) => TopicPageReader;
+  check?: (topic: Topic, messageId: string, signal: AbortSignal) => Promise<TopicSourceCheck>;
 }
 
 /** One logical deployment scheduler in Dashboard, with no web-tab or message-main-path dependency. */
@@ -40,7 +42,7 @@ export class TopicRuntime {
     if (this.store) return;
     this.store = new TopicStore(join(this.deps.directory, 'topics.sqlite'), this.now);
     const config = () => this.deps.config();
-    const executor = topicSummaryExecutor({ store: this.store, model: this.model, now: this.now, source: topic => this.deps.source?.(topic) ?? this.reader(topic) });
+    const executor = topicSummaryExecutor({ store: this.store, model: this.model, now: this.now, source: topic => this.deps.source?.(topic) ?? this.reader(topic), check: (topic, id, signal) => this.deps.check?.(topic, id, signal) ?? this.check(topic, id, signal) });
     this.scheduler = new TopicScheduler(this.store, () => {
       const current = config();
       return { ...current, slot: topicScheduleSlot(current.schedule, this.now()), snapshot: JSON.stringify(current) };
@@ -71,6 +73,25 @@ export class TopicRuntime {
       }
       throw new Error('topic_source_unavailable');
     };
+  }
+
+  private async check(topic: Topic, messageId: string, signal: AbortSignal): Promise<TopicSourceCheck> {
+    const online = this.deps.daemons().map(daemon => daemon.larkAppId);
+    const preferred = this.deps.sessions().filter(row => sessionTopicKey(row) === topic.topicKey).map(row => row.larkAppId).filter((id): id is string => typeof id === 'string');
+    for (const appId of [...new Set([...preferred, ...online])].filter(id => online.includes(id))) {
+      signal.throwIfAborted();
+      if (!this.deps.config().allowedChatIds.includes(topic.chatId)) throw new Error('topic_scope_removed');
+      try {
+        const response = await this.deps.proxy(appId, '/api/topic-source/check', {
+          method: 'POST', headers: { 'content-type': 'application/json' }, signal,
+          body: JSON.stringify({ chatId: topic.chatId, rootMessageId: topic.rootMessageId, nativeThreadId: topic.nativeThreadId, messageId }),
+        });
+        if (!response.ok) { await response.body?.cancel(); continue; }
+        const result = await response.json() as TopicSourceCheck;
+        if (result.state === 'deleted' || result.state === 'present') return result;
+      } catch { signal.throwIfAborted(); }
+    }
+    return { state: 'unknown' };
   }
 
   tick(): void {

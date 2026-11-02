@@ -1,6 +1,6 @@
 import { expect, it, vi } from 'vitest';
 import { topicSearchApi } from '../../src/dashboard/topic-search-api.js';
-import { topicSourcePageApi } from '../../src/topic/source-api.js';
+import { topicSourcePageApi, topicSourceCheckApi } from '../../src/topic/source-api.js';
 import { TopicSearchError } from '../../src/topic/search.js';
 import { resolveDashboardRequestGate } from '../../src/dashboard/request-identity.js';
 
@@ -36,4 +36,15 @@ it('rejects fake source anchors, invalid tokens and wrong native id namespace be
   const read = vi.fn(), deps = { trustedHost: true, allowedChatIds: ['oc_a'], signal: new AbortController().signal, read };
   for (const body of [{ chatId: 'oc_a', rootMessageId: 'virtual:root' }, { chatId: 'oc_a', rootMessageId: 'om_a', nativeThreadId: 'om_a' }, { chatId: 'oc_a', rootMessageId: 'om_a', token: 'x'.repeat(4097) }]) expect((await topicSourcePageApi(body, deps)).status).toBe(400);
   expect(read).not.toHaveBeenCalled();
+});
+
+it('source review uses the same trusted-host/update-scope boundary and validates referenced message IDs', async () => {
+  const check = vi.fn().mockResolvedValue({ state: 'unknown' });
+  const deps = { trustedHost: true, allowedChatIds: ['oc_a'], signal: new AbortController().signal, check };
+  const body = { chatId: 'oc_a', rootMessageId: 'om_root', nativeThreadId: 'omt_a', messageId: 'om_ref' };
+  expect((await topicSourceCheckApi(body, { ...deps, trustedHost: false })).status).toBe(403);
+  expect((await topicSourceCheckApi(body, { ...deps, allowedChatIds: [] })).status).toBe(403);
+  expect((await topicSourceCheckApi({ ...body, messageId: 'virtual:ref' }, deps)).status).toBe(400);
+  expect(check).not.toHaveBeenCalled();
+  expect(await topicSourceCheckApi(body, deps)).toEqual({ status: 200, body: { state: 'unknown' } });
 });
