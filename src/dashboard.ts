@@ -1,3 +1,6 @@
+import { TopicRuntime, disabledTopicSearchConfig } from './topic/runtime.js';
+import { topicSearchApi } from './dashboard/topic-search-api.js';
+import { TopicSearchError } from './topic/search.js';
 // src/dashboard.ts
 import { createServer, get as httpGet, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createServer as createTcpServer } from 'node:net';
@@ -1113,6 +1116,7 @@ const subs = new Map<string, { off: () => void; ipcPort: number }>();
 const attaching = new Set<string>();   // dedup concurrent attaches per appId
 
 interface ResolvedDashboardSettings {
+  topicSearch?: import('./topic/config.js').TopicSearchConfig;
   /** Machine-wide prefix applied only by the `/group` and `/g` slash commands. */
   groupNamePrefix: string;
   publicReadOnly: boolean;
@@ -1749,6 +1753,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
   const codexNotifierState = readCodexNotifierWorkerState(config.session.dataDir);
   const larkCli = checkLarkCliVersion();
   return {
+    topicSearch: global.topicSearch ?? disabledTopicSearchConfig(),
     groupNamePrefix: global.groupNamePrefix ?? '',
     publicReadOnly: dashboard.publicReadOnly ?? config.dashboard.publicReadOnly,
     openTerminalInFeishu: dashboard.openTerminalInFeishu === true,
@@ -4001,6 +4006,13 @@ const companionApi = (() => {
   }
 })();
 
+const topicRuntime = new TopicRuntime({
+  directory: join(config.session.dataDir, 'topic-search'),
+  config: () => readGlobalConfig().topicSearch ?? disabledTopicSearchConfig(),
+  sessions: () => aggregator.getSessions(), daemons: () => registry.list(), proxy: proxyToDaemon,
+});
+topicRuntime.start();
+
 const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
@@ -4349,6 +4361,21 @@ const server = createServer(async (req, res) => {
       trustedProxyHops: dashboardH5AuthConfig.trustedProxyHops,
     })) {
       return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/topic-search') {
+      let body: unknown;
+      try { body = await readJsonBody(req, 16_384); } catch { return jsonRes(res, 400, { error: 'bad_json' }); }
+      try {
+        const result = await topicSearchApi(body, { canManageHost, principal: requestIdentity?.authSessionId ?? (authed && activeToken ? legacyDashboardAuthSessionId(activeToken) : undefined) }, canManageHost ? topicRuntime.service() : null);
+        return jsonRes(res, result.status, result.body);
+      } catch (error) {
+        return jsonRes(res, error instanceof TopicSearchError ? error.status : 503, { error: error instanceof TopicSearchError ? error.message : 'topic_search_unavailable' });
+      }
+    }
+    if (req.method === 'GET' && url.pathname === '/api/topic-search/status') {
+      if (!canManageHost) return jsonRes(res, 403, { error: 'topic_search_scope_denied' });
+      return jsonRes(res, 200, topicRuntime.status());
     }
 
     if (url.pathname === '/api/workflows' || url.pathname.startsWith('/api/workflows/')) {
@@ -8267,8 +8294,10 @@ function handlePlatformTeamSync(payload: PlatformTeamSyncMessage): void {
   logger.info(`[platform-tunnel] team-sync 已应用 rev=${applied.rev} teams=${applied.teams.length}`);
 }
 
+
 // Graceful shutdown
 function shutdown(): void {
+  void topicRuntime.close().catch(() => logger.warn('[topic-search] shutdown failed'));
   codexNotifierAbort.abort();
   stopAutoCleanup();
   for (const sub of subs.values()) sub.off();

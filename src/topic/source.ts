@@ -40,6 +40,8 @@ export interface TopicSourcePage {
   hasMore: boolean;
   nextToken?: string;
   verifiedThread: boolean;
+  sourceId?: string;
+  nativeThreadId?: string;
   topicCreatedAt?: string;
   latestMessageAt?: string;
 }
@@ -48,6 +50,7 @@ export type TopicPageReader = (token: string | undefined, signal: AbortSignal) =
 /** Ephemeral traversal progress is NOT the successful summary cursor. Safe to discard/restart. */
 export interface TopicSourceCheckpoint {
   baseCursor: string | null;
+  sourceId?: string;
   token?: string;
   pending: TopicMessage[];
   exhausted: boolean;
@@ -75,7 +78,7 @@ export interface TopicReadOptions {
   signal: AbortSignal;
   /** Called on verified source data, before summarization. Observation survives a model failure. */
   isRevision?: (message: TopicMessage) => boolean;
-  observe: (times: { createdAt?: string; latestAt?: string }) => void;
+  observe: (times: { createdAt?: string; latestAt?: string; nativeThreadId?: string }) => void;
 }
 
 /** Consume a contiguous prefix; a full page can be split across commits without discarding its tail.
@@ -124,6 +127,8 @@ export async function readTopicIncrement(reader: TopicPageReader, options: Topic
     const page = await reader(scan.token, options.signal);
     options.signal.throwIfAborted(); pages++;
     if (!page.verifiedThread) throw new Error('topic_source_unverified_thread');
+    if (scan.sourceId && page.sourceId !== scan.sourceId) throw new Error('topic_source_identity_changed');
+    if (page.sourceId) scan.sourceId = page.sourceId;
     if (!Array.isArray(page.messages) || page.messages.length > 50 || typeof page.hasMore !== 'boolean') throw new Error('invalid_topic_source_page');
     if (page.hasMore && (!page.nextToken || typeof page.nextToken !== 'string' || page.nextToken.length > 4096 || scan.seenTokens.includes(page.nextToken))) throw new Error('topic_source_pagination_loop');
     const messages = page.messages.map(raw => {
@@ -139,7 +144,7 @@ export async function readTopicIncrement(reader: TopicPageReader, options: Topic
       time = message.createdAt;
     }
     const latest = [page.latestMessageAt ? normalizeTime(page.latestMessageAt) : '', time ?? ''].sort().at(-1);
-    options.observe({ createdAt: page.topicCreatedAt ? normalizeTime(page.topicCreatedAt) : undefined, latestAt: latest || undefined });
+    options.observe({ nativeThreadId: page.nativeThreadId, createdAt: page.topicCreatedAt ? normalizeTime(page.topicCreatedAt) : undefined, latestAt: latest || undefined });
     scan.pending = messages;
     scan.lastPageTime = time;
     scan.exhausted = !page.hasMore;

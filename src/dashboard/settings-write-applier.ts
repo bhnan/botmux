@@ -1,3 +1,4 @@
+import { parseTopicSearchConfig } from '../topic/config.js';
 /**
  * Settings write applier — single source of truth for what
  * `PUT /api/settings` (`dashboard.ts:460-498`) used to do inline.
@@ -47,6 +48,7 @@ import { isValidTimeZone } from '../utils/timezone.js';
  * doesn't know how the host computes the snapshot (it just calls a closure).
  */
 export interface ResolvedDashboardSettingsView {
+  topicSearch?: import('../topic/config.js').TopicSearchConfig;
   groupNamePrefix: string;
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
@@ -235,6 +237,8 @@ export type ApplySettingsWriteResult =
  * PR2 Route B) see the same wire vocabulary they had before.
  */
 export type ApplySettingsWriteError =
+  | 'invalid_topic_search'
+  | 'topic_search_mixed_patch_unsupported'
   | 'invalid_groupNamePrefix'
   | 'invalid_publicReadOnly'
   | 'invalid_openTerminalInFeishu'
@@ -395,6 +399,12 @@ export async function applySettingsWrite(
   const obj = body && typeof body === 'object' && !Array.isArray(body)
     ? body as Record<string, unknown>
     : {};
+  if ('topicSearch' in obj) {
+    if (Object.keys(obj).length !== 1) return { ok: false, error: 'topic_search_mixed_patch_unsupported' };
+    try { deps.mergeGlobalConfig({ topicSearch: parseTopicSearchConfig(obj.topicSearch) }); }
+    catch { return { ok: false, error: 'invalid_topic_search' }; }
+    return { ok: true, settings: deps.resolveDashboardSettings() };
+  }
   if (
     Object.hasOwn(obj, 'codexNotifier')
     && Object.keys(obj).some(key => key !== 'codexNotifier')

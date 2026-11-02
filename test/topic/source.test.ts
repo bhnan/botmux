@@ -94,3 +94,9 @@ it('rejects impossible calendar dates instead of silently normalizing them into 
   expect(() => normalizeTime('2026-02-30T00:00:00Z')).toThrow('invalid_source_time');
   expect(normalizeTime('2024-02-29T23:00:00+08:00')).toBe('2024-02-29T15:00:00.000Z');
 });
+it('never combines pagination evidence from two different provider identities', async () => {
+  const reader = vi.fn()
+    .mockResolvedValueOnce({ messages: [message(1)], hasMore: true, nextToken: 'n', verifiedThread: true, sourceId: 'app-a' })
+    .mockResolvedValueOnce({ messages: [message(2)], hasMore: false, verifiedThread: true, sourceId: 'app-b' });
+  await expect(readTopicIncrement(reader, options())).rejects.toThrow('topic_source_identity_changed');
+});

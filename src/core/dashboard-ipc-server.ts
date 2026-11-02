@@ -1,3 +1,5 @@
+import { topicSourcePageApi } from '../topic/source-api.js';
+import { readLarkTopicPage } from '../topic/lark-source.js';
 import { normalizeCodexProfile, scanCodexProfiles, validateCodexProfile, CodexProfileError } from '../services/codex-profiles.js';
 import { REPLY_FOOTER_KEYS, normalizeReplyFooter, type ReplyFooterPreferences } from '../services/reply-footer.js';
 import { boardErrorStatus, type BoardCliRequest, type DecisionBoardService } from './decision-board/service.js';
@@ -4904,6 +4906,21 @@ ipcRoute('POST', '/api/chat-reply-mode', requireBoundBot(async (req, res) => {
 // 会话历史：实时拉取该会话所在话题/群的飞书消息（与 botmux history 同链路，
 // 消息体不落盘），给 dashboard 的会话历史弹窗。复杂卡片的「请升级」兜底文本
 // 用 message.get 的完整表示补齐；merge_forward 保持占位符（原型不展开）。
+ipcRoute('POST', '/api/topic-source/page', requireBoundBot(async (req, res) => {
+  let body: unknown;
+  try { body = await readJsonBody(req, 16_384); } catch { return jsonRes(res, 400, { error: 'bad_json' }); }
+  const abort = new AbortController();
+  const onClose = () => { if (!res.writableEnded) abort.abort(); };
+  res.once('close', onClose);
+  try {
+    const result = await topicSourcePageApi(body, {
+      trustedHost: isTrustedHostIpcRequest(req), allowedChatIds: readGlobalConfig().topicSearch?.allowedChatIds ?? [], signal: abort.signal,
+      read: (location, options) => readLarkTopicPage(cachedLarkAppId!, location, options),
+    });
+    jsonRes(res, result.status, result.body);
+  } finally { res.off('close', onClose); }
+}));
+
 ipcRoute('GET', '/api/sessions/:sessionId/history', async (req, res, params) => {
   const session = findSessionRecord(params.sessionId);
   if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });

@@ -97,6 +97,8 @@ export class TopicScheduler {
     } finally { if (timer) clearTimeout(timer); }
   }
 
+  currentLease(): TopicLease | null { return this.lease && this.store.jobs.valid(this.lease) ? { ...this.lease } : null; }
+
   async idle(): Promise<void> { await Promise.all([...this.running.values()].map(task => task.promise)); }
 
   async close(): Promise<void> {

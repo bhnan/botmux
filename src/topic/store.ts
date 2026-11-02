@@ -113,6 +113,19 @@ export class TopicStore {
       .map(row => JSON.parse(row.body) as Topic);
   }
 
+  authorizedTopics(chatIds: readonly string[] | null, limit: number): { topics: Topic[]; truncated: boolean } {
+    if (chatIds?.length === 0) return { topics: [], truncated: false };
+    const where = chatIds ? ` WHERE chat IN (${chatIds.map(() => '?').join(',')})` : '';
+    const rows = this.db.prepare(`SELECT key, length(CAST(body AS BLOB)) AS size FROM topic_documents${where} ORDER BY key LIMIT ?`).all(...(chatIds ?? []), limit + 1) as Array<{ key: string; size: number }>;
+    const topics: Topic[] = []; let bytes = 0, truncated = rows.length > limit;
+    for (const row of rows.slice(0, limit)) {
+      bytes += row.size;
+      if (bytes > 32 * 1024 * 1024) { truncated = true; break; }
+      const topic = this.read(row.key); if (topic) topics.push(topic);
+    }
+    return { topics, truncated };
+  }
+
   discover(seed: TopicSeed, now: string): Topic {
     const identity = topicIdentity(seed);
     if (!identity) throw new Error('invalid_thread_identity');
@@ -139,21 +152,25 @@ export class TopicStore {
     });
   }
 
-  observe(key: string, observation: { createdAt?: string; latestAt?: string; checkedAt: string }, claim?: TopicClaim): Topic {
+  observe(key: string, observation: { createdAt?: string; latestAt?: string; checkedAt: string; nativeThreadId?: string }, claim?: TopicClaim): Topic {
     return this.transaction(() => {
       const topic = this.require(key);
       if (claim) {
         this.jobs.assertClaim(claim);
         if (claim.job.topicKey !== key) throw new Error('topic_claim_mismatch');
       }
-      const before = JSON.stringify([topic.topicCreatedAt, topic.latestMessageAt]);
+      const before = JSON.stringify([topic.topicCreatedAt, topic.latestMessageAt, topic.nativeThreadId]);
+      if (observation.nativeThreadId) {
+        if (!/^omt_[A-Za-z0-9_-]+$/.test(observation.nativeThreadId) || (topic.nativeThreadId && topic.nativeThreadId !== observation.nativeThreadId)) throw new Error('topic_source_native_changed');
+        topic.nativeThreadId = observation.nativeThreadId;
+      }
       if (observation.createdAt && !topic.topicCreatedAt) topic.topicCreatedAt = normalizeTime(observation.createdAt);
       if (observation.latestAt) {
         const latest = normalizeTime(observation.latestAt);
         if (!topic.latestMessageAt || latest > topic.latestMessageAt) topic.latestMessageAt = latest;
       }
       topic.lastCheckedAt = normalizeTime(observation.checkedAt);
-      if (before !== JSON.stringify([topic.topicCreatedAt, topic.latestMessageAt])) topic.revision++;
+      if (before !== JSON.stringify([topic.topicCreatedAt, topic.latestMessageAt, topic.nativeThreadId])) topic.revision++;
       // Observing a source never acknowledges successful model processing.
       this.write(topic);
       return topic;

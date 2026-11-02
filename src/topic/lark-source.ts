@@ -42,5 +42,5 @@ export async function readLarkTopicPage(
     if (parsed.messageId === location.rootMessageId) createdAt = at;
     return { id: parsed.messageId, text: raw.deleted === true ? '' : parsed.content, createdAt: at, deleted: raw.deleted === true };
   });
-  return { messages, hasMore: page.hasMore, nextToken: page.nextToken, verifiedThread: true, topicCreatedAt: createdAt };
+  return { messages, hasMore: page.hasMore, nextToken: page.nextToken, verifiedThread: true, nativeThreadId: native, topicCreatedAt: createdAt };
 }
