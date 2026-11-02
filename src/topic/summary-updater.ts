@@ -22,17 +22,25 @@ export function topicSummaryExecutor(deps: TopicSummaryUpdaterDeps): TopicExecut
     if (!profile) throw new Error('topic_model_not_configured');
     const now = new Date(deps.now()).toISOString();
     const topic = deps.store.beginSource(claim, config.initialLookbackDays, now);
+    let revision = topic.revision;
+    const assertUnchanged = () => {
+      if (deps.store.read(topic.topicKey)?.revision !== revision) throw new Error('topic_revision_conflict');
+    };
+    const reconcile = (messages: Parameters<TopicStore['reconcileSources']>[1]) => {
+      deps.store.reconcileSources(topic.topicKey, messages, now, { claim, expectedRevision: revision });
+      revision = deps.store.read(topic.topicKey)!.revision;
+    };
     if (deps.check) {
       for (const candidate of deps.store.reviews.pending(claim, config)) {
         context.assertAuthorized();
         let result: TopicSourceCheck;
         try { result = await deps.check(topic, candidate.message, context.signal); }
         catch { context.signal.throwIfAborted(); result = { state: 'unknown' }; }
-        context.signal.throwIfAborted();
-        if (result.state === 'deleted') deps.store.reconcileSources(claim, [{ id: candidate.message, text: '', createdAt: candidate.created, deleted: true }], now);
+        context.assertAuthorized(); assertUnchanged();
+        if (result.state === 'deleted') reconcile([{ id: candidate.message, deleted: true }]);
         else if (result.state === 'present') {
           if (result.message.id !== candidate.message || result.message.createdAt !== candidate.created) throw new Error('topic_review_identity_mismatch');
-          deps.store.reconcileSources(claim, [result.message], now);
+          reconcile([result.message]);
         }
         // Invalidation first, receipt second: a crash rechecks safely rather than acknowledging
         // stale content. Unknown/403/timeout does not fabricate a deletion or a successful check.
@@ -42,12 +50,15 @@ export function topicSummaryExecutor(deps: TopicSummaryUpdaterDeps): TopicExecut
     const coverageStartAt = topic.coverageStartAt!;
     const reader = deps.source(topic, context);
     const result = await readTopicIncrement(async (token, signal) => {
-      context.assertAuthorized();
-      try { return await reader(token, signal); }
-      catch (error) {
+      context.assertAuthorized(); assertUnchanged();
+      try {
+        const page = await reader(token, signal);
+        context.assertAuthorized(); assertUnchanged();
+        return page;
+      } catch (error) {
         // A provider token is not durable authority. Restart traversal after a failed token read;
         // never reset the last successfully summarized message boundary.
-        if (token && !signal.aborted) deps.store.saveSourceProgress(claim, null);
+        if (token && !signal.aborted && deps.store.read(topic.topicKey)?.revision === revision) deps.store.saveSourceProgress(claim, null);
         throw error;
       }
     }, {
@@ -55,11 +66,12 @@ export function topicSummaryExecutor(deps: TopicSummaryUpdaterDeps): TopicExecut
       coverageStartAt, now: new Date(claim.job.acceptedAt).toISOString(), maxPages: config.maxPagesPerRead, maxMessages: config.maxMessagesPerBatch,
       maxChars: Math.max(1, Math.min(config.maxInputChars, profile.maxInputChars) - 2000), signal: context.signal,
       isRevision: message => deps.store.sourceChanged(topic.topicKey, message),
-      observe: times => { deps.store.observe(topic.topicKey, { ...times, checkedAt: now }, claim); },
+      observe: times => { assertUnchanged(); revision = deps.store.observe(topic.topicKey, { ...times, checkedAt: now }, claim).revision; },
     });
-    deps.store.reconcileSources(claim, result.inspected, now);
+    context.assertAuthorized(); assertUnchanged();
+    reconcile(result.inspected);
     if (!result.messages.length) {
-      return { kind: 'source-progress', checkpoint: result.checkpoint, maxSteps: config.maxStepsPerTopic };
+      return { kind: 'source-progress', expectedRevision: revision, checkpoint: result.checkpoint, maxSteps: config.maxStepsPerTopic };
     }
     const refreshed = deps.store.read(topic.topicKey)!;
     const input: TopicModelInput = { title: topic.title, messages: result.messages.filter(message => !message.deleted), summaries: [] };

@@ -80,8 +80,8 @@ it('source navigation resolves only still-cited messages through the verified so
   const signal = new AbortController().signal, key = 'thread:oc_a:om_root';
   await expect(item.sourceView(key, 'om_arbitrary', signal)).rejects.toThrow('topic_source_not_referenced');
   expect(proxy).toHaveBeenCalledTimes(1);
-  proxy.mockResolvedValue(new Response(JSON.stringify({ state: 'present', message: { id: 'om_root', text: 'current raw source', createdAt: '2026-10-01T00:00:00.000Z' } })));
-  expect((await item.sourceView(key, 'om_root', signal)).message.text).toBe('current raw source');
+  proxy.mockResolvedValue(new Response(JSON.stringify({ state: 'present', message: { id: 'om_root', text: 'owner fact', createdAt: '2026-10-01T00:00:00.000Z' } })));
+  expect((await item.sourceView(key, 'om_root', signal)).message.text).toBe('owner fact');
   expect(proxy.mock.calls.at(-1)?.[1]).toBe('/api/topic-source/check');
   config.allowedChatIds = [];
   await expect(item.sourceView(key, 'om_root', signal)).rejects.toThrow('topic_source_scope_denied');

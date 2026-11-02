@@ -159,8 +159,10 @@ export class TopicRuntime {
       } finally { bounded.removeEventListener('abort', onAbort); }
       bounded.throwIfAborted();
       if (this.stopped || !this.deps.config().enabled || !this.deps.config().allowedChatIds.includes(topic.chatId)) throw new TopicSearchError(403, 'topic_source_scope_denied');
-      if (!cited(this.store!.read(topicKey)) || result.state === 'deleted') throw new TopicSearchError(404, 'topic_source_unavailable');
-      if (result.state !== 'present' || result.message.id !== messageId) throw new TopicSearchError(503, 'topic_source_unavailable');
+      if (!cited(this.store!.read(topicKey))) throw new TopicSearchError(404, 'topic_source_unavailable');
+      if (result.state === 'unknown' || (result.state === 'present' && result.message.id !== messageId)) throw new TopicSearchError(503, 'topic_source_unavailable');
+      this.store!.reconcileSources(topicKey, [result.state === 'deleted' ? { id: messageId, deleted: true } : result.message], new Date(this.now()).toISOString(), { expectedRevision: topic.revision });
+      if (result.state === 'deleted') throw new TopicSearchError(404, 'topic_source_unavailable');
       return { title: topic.title, message: result.message };
     } finally { this.sourceViews--; }
   }

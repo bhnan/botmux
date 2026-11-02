@@ -40,6 +40,7 @@ export interface TopicCommit {
 
 export interface TopicSourceProgress {
   kind: 'source-progress';
+  expectedRevision?: number;
   checkpoint: TopicSourceCheckpoint | null;
   maxSteps: number;
 }
@@ -247,6 +248,7 @@ export class TopicStore {
       this.jobs.assertClaim(claim);
       if (input && 'kind' in input) {
         const topic = this.require(claim.job.topicKey);
+        if (input.expectedRevision !== undefined && input.expectedRevision !== topic.revision) return 'conflict';
         if (input.checkpoint && input.checkpoint.baseCursor !== (topic.summarizedThroughCursor ?? null)) return 'conflict';
         this.writeCheckpoint(claim.job.topicKey, input.checkpoint);
         if (input.checkpoint) this.jobs.continueInsideTransaction(claim, input.maxSteps);
@@ -379,19 +381,37 @@ export class TopicStore {
   }
 
   /** Invalidate stale evidence immediately; only a successful model commit acknowledges edited content. */
-  reconcileSources(claim: TopicClaim, messages: readonly TopicMessage[], now: string): void {
+  reconcileSources(key: string, messages: readonly (TopicMessage | { id: string; deleted: true })[], now: string, options: { claim?: TopicClaim; expectedRevision?: number } = {}): void {
     this.transaction(() => {
-      this.jobs.assertClaim(claim);
-      const topic = this.require(claim.job.topicKey);
+      if (options.claim) {
+        this.jobs.assertClaim(options.claim);
+        if (options.claim.job.topicKey !== key) throw new Error('topic_claim_mismatch');
+      }
+      const topic = this.require(key);
+      if (options.expectedRevision !== undefined && topic.revision !== options.expectedRevision) throw new Error('topic_revision_conflict');
       const changed = new Set<string>();
       for (const message of messages) {
-        if (message.deleted || this.sourceChanged(topic.topicKey, message)) changed.add(message.id);
-        if (message.deleted) this.db.prepare('INSERT OR IGNORE INTO topic_tombstones VALUES (?, ?)').run(topic.topicKey, message.id);
-        if (!this.sourceChanged(topic.topicKey, message)) this.db.prepare('UPDATE topic_source_fingerprints SET checked=? WHERE topic=? AND message=?').run(now, topic.topicKey, message.id);
+        if (!/^om_[A-Za-z0-9_-]+$/.test(message.id)) throw new Error('topic_review_identity_mismatch');
+        if (message.deleted) {
+          changed.add(message.id);
+          this.db.prepare('INSERT OR IGNORE INTO topic_tombstones VALUES (?, ?)').run(key, message.id);
+        } else {
+          const present = { ...message, createdAt: normalizeTime((message as TopicMessage).createdAt) } as TopicMessage;
+          const previous = this.db.prepare('SELECT created FROM topic_source_fingerprints WHERE topic=? AND message=?').get(key, message.id) as { created: string } | undefined;
+          if (typeof present.text !== 'string' || present.text.length > 256_000 || (previous && normalizeTime(previous.created) !== normalizeTime(present.createdAt))) throw new Error('topic_review_identity_mismatch');
+          if (this.sourceChanged(key, present)) changed.add(message.id);
+          else this.db.prepare('UPDATE topic_source_fingerprints SET checked=? WHERE topic=? AND message=?').run(now, key, message.id);
+        }
       }
-      const summaries = topic.summaries.filter(summary => !summary.sourceMessageIds.some(id => changed.has(id)));
       if (changed.size > 0) {
-        topic.summaries = summaries; topic.revision++; topic.updatedAt = normalizeTime(now); this.write(topic);
+        const removed = topic.summaries.filter(summary => summary.sourceMessageIds.some(id => changed.has(id)));
+        topic.summaries = topic.summaries.filter(summary => !removed.includes(summary));
+        for (const summary of removed) this.db.prepare('DELETE FROM topic_embedding_jobs WHERE topic=? AND summary=?').run(key, summary.id);
+        // A saved raw tail may predate this observation. Restart from the unchanged successful
+        // boundary; only successful regeneration acknowledges a new fingerprint/coverage.
+        this.db.prepare('DELETE FROM topic_source_scans WHERE topic=?').run(key);
+        topic.sourceIncomplete = true;
+        topic.revision++; topic.updatedAt = normalizeTime(now); this.write(topic);
       }
     });
   }
