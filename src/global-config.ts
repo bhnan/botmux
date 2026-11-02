@@ -1,3 +1,4 @@
+import { parseTopicSearchConfig, type TopicSearchConfig } from './topic/config.js';
 import { normalizeVcMeetingListenerPolicy, type VcMeetingListenerPolicy } from './services/vc-meeting-listener-policy.js';
 /**
  * Global botmux configuration stored at `~/.botmux/config.json`.
@@ -203,6 +204,8 @@ export interface ScheduleDelegationGlobalConfig {
 export const SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN = 64;
 
 export interface GlobalConfig {
+  /** Independent background topic enrichment; absent is disabled. */
+  topicSearch?: TopicSearchConfig;
   lang?: Locale;
   /** Machine-wide LinkRef rollout setting. Missing keeps legacy behavior. */
   linkRefs?: LinkRefConfig;
@@ -875,6 +878,10 @@ export function readGlobalConfig(): GlobalConfig {
   }
   const raw = readRawConfig();
   const out: GlobalConfig = {};
+  if (raw.topicSearch !== undefined) {
+    try { out.topicSearch = parseTopicSearchConfig(raw.topicSearch); }
+    catch { out.topicSearch = parseTopicSearchConfig(); } // Malformed config fails closed, never inherits chat credentials.
+  }
   if (isLocale(raw.lang)) out.lang = raw.lang;
   const linkRefs = normalizeLinkRefConfig(raw.linkRefs);
   if (linkRefs) out.linkRefs = linkRefs;
@@ -1104,6 +1111,7 @@ export function repoPickerScanOptions(): ProjectScanOptions {
  *  the file (and parent dir) on first write. Use `null` to explicitly delete
  *  a known key from the file. */
 export function mergeGlobalConfig(patch: Partial<Record<keyof GlobalConfig, GlobalConfig[keyof GlobalConfig] | null>>): void {
+  if (patch.topicSearch != null) parseTopicSearchConfig(patch.topicSearch);
   assertDurableConfigMutationAllowed('global');
   const path = globalConfigPath();
   const dir = dirname(path);

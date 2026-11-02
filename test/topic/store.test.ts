@@ -92,3 +92,18 @@ it('does not transfer source summaries when a session relays or forks', () => {
   store.discover({ ...seed, rootMessageId: 'om_fork' }, now);
   expect(store.list().map(topic => topic.summaries.length).sort()).toEqual([0, 0, 1]);
 });
+it('upgrades a content-only database without resetting existing content and rejects newer unknown schemas', async () => {
+  const { openDatabaseSyncOrThrow } = await import('../../src/services/sqlite-compat.js');
+  store.commit(commit());
+  const original = store.read(key);
+  const path = store.path; store.close();
+  const legacy = openDatabaseSyncOrThrow(path);
+  legacy.exec('DROP TABLE topic_jobs; DROP TABLE topic_batches; DROP TABLE topic_lease; PRAGMA user_version=1;');
+  legacy.close();
+  store = new TopicStore(path);
+  expect(store.read(key)).toEqual(original);
+  expect(store.jobs.list()).toEqual([]);
+  const futurePath = join(directory, 'future.db');
+  const future = openDatabaseSyncOrThrow(futurePath); future.exec('PRAGMA user_version=99;'); future.close();
+  expect(() => new TopicStore(futurePath)).toThrow('unsupported_topic_schema');
+});

@@ -4,6 +4,7 @@ import { dirname } from 'node:path';
 import { openDatabaseSyncOrThrow, type DatabaseSyncLike } from '../services/sqlite-compat.js';
 import type { Topic, TopicSummary } from '../types.js';
 import { topicIdentity } from './identity.js';
+import { TopicJobQueue, TOPIC_JOB_SCHEMA, type TopicClaim } from './jobs.js';
 import { coversCursor, decodeCursor, normalizeTime } from './source.js';
 
 export interface TopicSeed {
@@ -37,14 +38,15 @@ export function contentHash(text: string): string {
 /** All durable writes are serialized in a single immediate transaction. No Session store writes. */
 export class TopicStore {
   private readonly db: DatabaseSyncLike;
+  readonly jobs: TopicJobQueue;
 
-  constructor(readonly path: string) {
+  constructor(readonly path: string, clock: () => number = Date.now) {
     mkdirSync(dirname(path), { recursive: true });
     this.db = openDatabaseSyncOrThrow(path);
     try {
       this.db.exec('PRAGMA busy_timeout=3000; PRAGMA journal_mode=WAL;');
       const version = (this.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version;
-      if (version > 1) throw new Error('unsupported_topic_schema');
+      if (version > 2) throw new Error('unsupported_topic_schema');
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS topic_documents (key TEXT PRIMARY KEY, chat TEXT NOT NULL, body TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS topic_chat ON topic_documents(chat);
@@ -52,8 +54,10 @@ export class TopicStore {
         CREATE TABLE IF NOT EXISTS topic_tombstones (topic TEXT NOT NULL, message TEXT NOT NULL, PRIMARY KEY(topic, message));
         CREATE TABLE IF NOT EXISTS topic_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
         INSERT OR IGNORE INTO topic_meta VALUES ('generation', 0);
-        PRAGMA user_version=1;
+        ${TOPIC_JOB_SCHEMA}
+        PRAGMA user_version=2;
       `);
+      this.jobs = new TopicJobQueue(this.db, action => this.transaction(action), clock);
     } catch (error) { this.db.close(); throw error; }
   }
 
@@ -114,9 +118,13 @@ export class TopicStore {
     });
   }
 
-  observe(key: string, observation: { createdAt?: string; latestAt?: string; checkedAt: string }): Topic {
+  observe(key: string, observation: { createdAt?: string; latestAt?: string; checkedAt: string }, claim?: TopicClaim): Topic {
     return this.transaction(() => {
       const topic = this.require(key);
+      if (claim) {
+        this.jobs.assertClaim(claim);
+        if (claim.job.topicKey !== key) throw new Error('topic_claim_mismatch');
+      }
       const before = JSON.stringify([topic.topicCreatedAt, topic.latestMessageAt]);
       if (observation.createdAt && !topic.topicCreatedAt) topic.topicCreatedAt = normalizeTime(observation.createdAt);
       if (observation.latestAt) {
@@ -138,45 +146,58 @@ export class TopicStore {
   }
 
   commit(input: TopicCommit): 'committed' | 'duplicate' | 'conflict' {
+    return this.transaction(() => this.commitInsideTransaction(input));
+  }
+
+  /** Content, successful cursor, operation receipt and job completion are one SQLite commit. */
+  settle(claim: TopicClaim, input: TopicCommit | null, skipped = false): 'committed' | 'duplicate' | 'conflict' {
     return this.transaction(() => {
-      const topic = this.require(input.topicKey);
-      if (this.db.prepare('SELECT 1 FROM topic_operations WHERE topic=? AND operation=?').get(input.topicKey, input.operationId)) return 'duplicate';
-      if (topic.revision !== input.expectedRevision) return 'conflict';
-      const cursor = decodeCursor(input.cursor);
-      if (topic.summarizedThroughCursor && !coversCursor(cursor, decodeCursor(topic.summarizedThroughCursor))) throw new Error('cursor_regressed');
-      const allowed = new Set([...input.verifiedMessageIds, ...topic.summaries.flatMap(summary => summary.sourceMessageIds)]);
-      const updated = new Set<string>();
-      for (const mutation of input.mutations) {
-        if (mutation.op === 'noop') continue;
-        if (!mutation.text.trim() || mutation.text.length > 8000 || mutation.keywords.length > 32 || !mutation.sourceMessageIds.length) throw new Error('invalid_summary');
-        for (const id of mutation.sourceMessageIds) {
-          if (!allowed.has(id)) throw new Error('invalid_summary_source');
-          if (this.db.prepare('SELECT 1 FROM topic_tombstones WHERE topic=? AND message=?').get(input.topicKey, id)) throw new Error('deleted_summary_source');
-        }
-        let previous: TopicSummary | undefined;
-        if (mutation.op === 'update') {
-          previous = topic.summaries.find(summary => summary.id === mutation.id);
-          if (!previous || updated.has(mutation.id)) throw new Error('invalid_summary_update');
-          updated.add(mutation.id);
-        }
-        const summary: TopicSummary = {
-          id: previous?.id ?? randomUUID(), text: mutation.text.trim(),
-          keywords: [...new Set(mutation.keywords.map(keyword => keyword.trim()).filter(Boolean))],
-          sourceMessageIds: [...new Set(mutation.sourceMessageIds)],
-          updatedAt: normalizeTime(input.now), generatorKey: input.generatorKey,
-        };
-        if (previous?.text === summary.text && previous.embedding) summary.embedding = previous.embedding;
-        if (previous) topic.summaries[topic.summaries.indexOf(previous)] = summary;
-        else topic.summaries.push(summary);
-      }
-      topic.summarizedThroughCursor = input.cursor;
-      topic.sourceThroughAt = cursor.time;
-      topic.updatedAt = normalizeTime(input.now);
-      topic.revision++;
-      this.write(topic);
-      this.db.prepare('INSERT INTO topic_operations VALUES (?, ?)').run(input.topicKey, input.operationId);
-      return 'committed';
+      this.jobs.assertClaim(claim);
+      if (input && input.topicKey !== claim.job.topicKey) throw new Error('topic_claim_mismatch');
+      const result = input ? this.commitInsideTransaction(input) : 'committed';
+      if (result !== 'conflict') this.jobs.finishInsideTransaction(claim, skipped ? 'skipped' : 'done');
+      return result;
     });
+  }
+
+  private commitInsideTransaction(input: TopicCommit): 'committed' | 'duplicate' | 'conflict' {
+    const topic = this.require(input.topicKey);
+    if (this.db.prepare('SELECT 1 FROM topic_operations WHERE topic=? AND operation=?').get(input.topicKey, input.operationId)) return 'duplicate';
+    if (topic.revision !== input.expectedRevision) return 'conflict';
+    const cursor = decodeCursor(input.cursor);
+    if (topic.summarizedThroughCursor && !coversCursor(cursor, decodeCursor(topic.summarizedThroughCursor))) throw new Error('cursor_regressed');
+    const allowed = new Set([...input.verifiedMessageIds, ...topic.summaries.flatMap(summary => summary.sourceMessageIds)]);
+    const updated = new Set<string>();
+    for (const mutation of input.mutations) {
+      if (mutation.op === 'noop') continue;
+      if (!mutation.text.trim() || mutation.text.length > 8000 || mutation.keywords.length > 32 || !mutation.sourceMessageIds.length) throw new Error('invalid_summary');
+      for (const id of mutation.sourceMessageIds) {
+        if (!allowed.has(id)) throw new Error('invalid_summary_source');
+        if (this.db.prepare('SELECT 1 FROM topic_tombstones WHERE topic=? AND message=?').get(input.topicKey, id)) throw new Error('deleted_summary_source');
+      }
+      let previous: TopicSummary | undefined;
+      if (mutation.op === 'update') {
+        previous = topic.summaries.find(summary => summary.id === mutation.id);
+        if (!previous || updated.has(mutation.id)) throw new Error('invalid_summary_update');
+        updated.add(mutation.id);
+      }
+      const summary: TopicSummary = {
+        id: previous?.id ?? randomUUID(), text: mutation.text.trim(),
+        keywords: [...new Set(mutation.keywords.map(keyword => keyword.trim()).filter(Boolean))],
+        sourceMessageIds: [...new Set(mutation.sourceMessageIds)],
+        updatedAt: normalizeTime(input.now), generatorKey: input.generatorKey,
+      };
+      if (previous?.text === summary.text && previous.embedding) summary.embedding = previous.embedding;
+      if (previous) topic.summaries[topic.summaries.indexOf(previous)] = summary;
+      else topic.summaries.push(summary);
+    }
+    topic.summarizedThroughCursor = input.cursor;
+    topic.sourceThroughAt = cursor.time;
+    topic.updatedAt = normalizeTime(input.now);
+    topic.revision++;
+    this.write(topic);
+    this.db.prepare('INSERT INTO topic_operations VALUES (?, ?)').run(input.topicKey, input.operationId);
+    return 'committed';
   }
 
   invalidate(key: string, messageIds: readonly string[], now: string): void {
