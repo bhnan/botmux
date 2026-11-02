@@ -1,3 +1,6 @@
+import type { TopicSearchItem } from '../../topic/search.js';
+import { topicSearchGroups, topicContentRows } from './topic-search-controller.js';
+import { useTopicSearch, TopicSearchControls, TopicResultDetails } from './topic-search-ui.js';
 import type React from 'react';
 import {
   Fragment,
@@ -1709,6 +1712,9 @@ const KANBAN_ICONS: SessionsKanbanIcons = {
 };
 
 type TopicGroupsViewProps = {
+  footer?: React.ReactNode;
+  searchItems?: TopicSearchItem[];
+  includeHistorical?: boolean;
   rows: SessionRow[];
   relationRows?: SessionRow[];
   selected: Set<string>;
@@ -1731,7 +1737,8 @@ function topicGroupTitle(group: SessionTopicGroup<SessionRow>): string {
 
 function TopicGroupsViewBase(props: TopicGroupsViewProps): React.JSX.Element {
   useT();
-  const groups = useMemo(() => groupSessionsByTopic(props.rows), [props.rows]);
+  const groups = useMemo(() => topicSearchGroups(props.rows, props.relationRows ?? props.rows, props.searchItems, props.includeHistorical !== false), [props.rows, props.relationRows, props.searchItems, props.includeHistorical]);
+  const matches = useMemo(() => new Map(props.searchItems?.map(item => [item.topicKey, item]) ?? []), [props.searchItems]);
   const relationGroups = useMemo(
     () => new Map(groupSessionsByTopic(props.relationRows ?? props.rows).map(group => [group.key, group])),
     [props.relationRows, props.rows],
@@ -1744,7 +1751,7 @@ function TopicGroupsViewBase(props: TopicGroupsViewProps): React.JSX.Element {
         // erase the topic's multi-Bot relationship.
         const relation = relationGroups.get(group.key) ?? group;
         const representative = group.rows[0];
-        const location = sessionLocationText(representative);
+        const location = representative ? sessionLocationText(representative) : group.chatId;
         const title = topicGroupTitle(relation);
         const anchor = relation.rootMessageId || relation.chatId;
         return (
@@ -1781,6 +1788,7 @@ function TopicGroupsViewBase(props: TopicGroupsViewProps): React.JSX.Element {
                 <span className="session-topic-updated">{t('sessions.last')}: {relTime(relation.latestActivityAt)}</span>
               </div>
             </header>
+            {matches.has(group.key) ? <TopicResultDetails item={matches.get(group.key)!} historical={!group.rows.length} /> : null}
             <div className="session-topic-members">
               {group.rows.map(row => (
                 <BoardCard
@@ -1803,6 +1811,7 @@ function TopicGroupsViewBase(props: TopicGroupsViewProps): React.JSX.Element {
           </section>
         );
       }) : <div className="sessions-topic-empty">{t('sessions.topic.empty')}</div>}
+      {props.footer}
     </div>
   );
 }
@@ -2817,6 +2826,7 @@ function SessionsPage(): React.JSX.Element {
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
   const [hiddenColumns, setHiddenColumns] = useState<Set<string>>(() => new Set(readStoredHiddenTableColumns(windowStorage())));
   const [viewMode, setViewMode] = useState<SessionsViewMode>(() => readStoredSessionsViewMode(windowStorage()));
+  const contentSearch = useTopicSearch(viewMode === 'topics' && ui.authed, filters.q, filters.chat);
   const [boardOrder, setBoardOrder] = useState<string[]>(() => readStoredBoardOrder(windowStorage()));
   const [boardAnimated, setBoardAnimated] = useState(false);
   const [dragColId, setDragColId] = useState<string | null>(null);
@@ -2909,7 +2919,7 @@ function SessionsPage(): React.JSX.Element {
   }, [chatOptions, filters.chat]);
 
   const rows = useMemo(() => {
-    const q = filters.q.toLowerCase();
+    const q = contentSearch.active ? '' : filters.q.toLowerCase();
     const cli = [...filters.cli];
     const cliFilterActive = cli.length > 0 && cli.length < CLI_FILTER_OPTIONS.length;
     const keepClosed = viewMode === 'kanban';
@@ -2919,7 +2929,7 @@ function SessionsPage(): React.JSX.Element {
         .filter(group => !filters.botTriggeredTopics || group.inferredBotTriggered)
         .map(group => group.key))
       : null;
-    const base = storeRows
+    const base = topicContentRows(storeRows, contentSearch.active ? contentSearch.result?.items ?? [] : undefined)
       .filter(s => !cliFilterActive || cli.includes(s.cliId ?? 'unknown'))
       .filter(s => filters.showUnknownChats || !isUnknownChatSession(s))
       .filter(s => !filters.status || s.status === filters.status)
@@ -2933,7 +2943,7 @@ function SessionsPage(): React.JSX.Element {
     return base
       .filter(row => acceptedTopicKeys.has(sessionTopicKey(row)))
       .sort((a, b) => compareRows(a, b, sortKey, sortDir));
-  }, [filters, revision, sortDir, sortKey, storeRows, viewMode]);
+  }, [filters, revision, sortDir, sortKey, storeRows, viewMode, contentSearch.active, contentSearch.result?.items]);
   const runtimeCounts = useMemo(() => sessionRuntimeCounts(storeRows), [storeRows]);
 
   const rowsById = useMemo(() => new Map(storeRows.map(row => [row.sessionId, row])), [storeRows, revision]);
@@ -3895,6 +3905,7 @@ function SessionsPage(): React.JSX.Element {
           onRun: runIdleCleanup,
         }}
       />
+      {viewMode === 'topics' && ui.authed ? <TopicSearchControls search={contentSearch} /> : null}
       <BulkBar
         selectedCount={selected.size}
         lockDisabled={!selectedRows.some(row => !row.locked)}
@@ -3963,6 +3974,9 @@ function SessionsPage(): React.JSX.Element {
 
         {bootstrapped && viewMode === 'topics' ? (
         <TopicGroupsView
+          footer={contentSearch.active && contentSearch.result?.nextCursor ? <button type="button" className="topic-search-more" disabled={contentSearch.loading} onClick={contentSearch.more}>加载更多话题</button> : null}
+          searchItems={contentSearch.active ? contentSearch.result?.items ?? [] : undefined}
+          includeHistorical={!filters.status && !filters.adopt && !filters.multiBotTopics && !filters.botTriggeredTopics && (filters.cli.size === 0 || filters.cli.size === CLI_FILTER_OPTIONS.length)}
           rows={rows}
           relationRows={storeRows}
           selected={selected}

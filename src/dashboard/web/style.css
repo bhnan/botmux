@@ -36951,3 +36951,19 @@ button.dboard-add-image { min-height: 28px; padding: 0 10px; font-size: var(--fs
 .bd-steward-guide-input { width: 100%; min-height: 96px; resize: vertical; }
 .bd-steward-guide-actions { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
 .bd-steward-open { display: inline-block; margin-top: 4px; color: var(--accent-strong); font-size: var(--fs-13); }
+
+/* Persisted topic knowledge stays inside the existing topic/session layout. */
+.topic-content-search { padding: 12px 16px; margin: 8px 0 14px; border: 1px solid var(--border); border-radius: 12px; }
+.topic-search-controls, .topic-search-feedback, .topic-result-meta { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; }
+.topic-search-controls label { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 12px; }
+.topic-search-controls input, .topic-search-controls select { max-width: 100%; min-height: 32px; }
+.topic-content-search > small, .topic-search-feedback { display: block; margin-top: 10px; font-size: 12px; color: var(--muted); }
+.topic-search-feedback > * { margin-right: 12px; }
+.topic-result-details { padding: 12px 18px; border-top: 1px solid var(--border); min-width: 0; }
+.topic-result-meta { font-size: 11px; color: var(--muted); }
+.topic-summary-match { margin-top: 10px; border-left: 3px solid #3b82f6; padding: 2px 12px; overflow-wrap: anywhere; }
+.topic-summary-match p { margin: 4px 0 8px; white-space: pre-wrap; line-height: 1.6; }
+.topic-summary-match small { color: var(--muted); }
+.topic-summary-match code { display: inline-block; margin-right: 8px; font-size: 10px; }
+.topic-search-more { margin: 16px auto; display: block; }
+@media (max-width: 600px) { .topic-search-controls { align-items: stretch; } .topic-search-controls label { width: 100%; justify-content: space-between; } .topic-result-details { padding: 12px; } }
