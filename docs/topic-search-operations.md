@@ -114,7 +114,7 @@ bun --bun node_modules/vitest/vitest.mjs run --config vitest.topic-offline.confi
 bun run build
 ```
 
-macOS arm64 / Node 22.23.3 与 Bun 1.4.3：上述离线测试各 265 项通过，构建通过（本次修复待独立复审确认）。包括现有 Dashboard 分组与飞书分页行为回归。Linux、单文件编译态完整执行链及真实 CLI/IM 联调没有在本轮运行，不能用 macOS 单测代替。
+macOS arm64 / Node 22.23.3 与 Bun 1.4.3：上述离线测试各 265 项通过，构建通过（生产头 `28ca551cd` 已通过独立离线复审，不代表线上验收）。包括现有 Dashboard 分组与飞书分页行为回归。Linux、单文件编译态完整执行链及真实 CLI/IM 联调没有在本轮运行，不能用 macOS 单测代替。
 
 视觉夹具使用生产组件/CSS 和合成数据，隔离 Playwright context 离线、阻断所有请求、无真实浏览器 profile。桌面/390px 截图无横向溢出，不等于线上手测。
 
