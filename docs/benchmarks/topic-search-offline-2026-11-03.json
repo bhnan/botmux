@@ -1,0 +1,1183 @@
+{
+  "productionHead": "c31cc031b",
+  "reports": {
+    "node": {
+      "fixture": "authored-synthetic-v1",
+      "corpusContentSha256": "59435f1e9ed5ca3ca8d71470ff24f4fc51e4227688bd42578bd3696e95ceb0a3",
+      "topics": 1000,
+      "summaries": 10000,
+      "queries": 20,
+      "limits": "Authored relevance labels, no human production-query confirmation. Hybrid vectors are idealized manual labels; not a real embedding quality/cost result. Isolated HTTP fixture reuses production API/search but not the full Dashboard process.",
+      "environment": {
+        "platform": "darwin",
+        "arch": "arm64",
+        "release": "27.2.0",
+        "cpu": "Apple M6",
+        "runtime": "v22.23.3",
+        "bun": null
+      },
+      "groups": [
+        {
+          "mode": "baseline",
+          "top3": 0,
+          "serverP50Ms": 0.48166599999990467,
+          "serverP95Ms": 0.8089580000000751,
+          "roundtripP95Ms": 1.433791999999812,
+          "budgetLimitedQueries": 0
+        },
+        {
+          "mode": "keyword",
+          "top3": 1,
+          "serverP50Ms": 77.66708299999982,
+          "serverP95Ms": 91.96512500000017,
+          "roundtripP95Ms": 94.342083,
+          "budgetLimitedQueries": 0
+        },
+        {
+          "mode": "hybrid",
+          "top3": 1,
+          "serverP50Ms": 120.04225000000042,
+          "serverP95Ms": 125.36487500000021,
+          "roundtripP95Ms": 125.84845799999948,
+          "budgetLimitedQueries": 0
+        }
+      ],
+      "embeddingCalls": 20,
+      "realProviderCalls": 0,
+      "sourceCalls": 0,
+      "forbiddenFetches": 0,
+      "rssBytesAtEnd": 415531008,
+      "measurements": [
+        {
+          "mode": "baseline",
+          "query": "跨应用 owner 身份",
+          "hit": false,
+          "serverMs": 1.365291999999954,
+          "roundtripMs": 5.053124999999909,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "PTY 原生模块缺失",
+          "hit": false,
+          "serverMs": 0.8089580000000751,
+          "roundtripMs": 1.433791999999812,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "SQLITE_BUSY",
+          "hit": false,
+          "serverMs": 0.567833999999948,
+          "roundtripMs": 1.0246670000001359,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "工作树共享依赖被覆盖",
+          "hit": false,
+          "serverMs": 0.5763750000000982,
+          "roundtripMs": 1.2746250000000146,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "分页同毫秒消息丢失",
+          "hit": false,
+          "serverMs": 0.5379169999998794,
+          "roundtripMs": 1.2203750000001037,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "关闭后排队任务继续执行",
+          "hit": false,
+          "serverMs": 0.4871249999998781,
+          "roundtripMs": 0.759499999999889,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "过期租约迟到写入",
+          "hit": false,
+          "serverMs": 0.4561670000000504,
+          "roundtripMs": 0.7130409999999756,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "话题创建时间 日期筛选",
+          "hit": false,
+          "serverMs": 0.48920899999984613,
+          "roundtripMs": 0.8043330000000424,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "向量模型更换 维度",
+          "hit": false,
+          "serverMs": 0.5766669999998157,
+          "roundtripMs": 1.1894580000000587,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "消息撤回 230011",
+          "hit": false,
+          "serverMs": 0.4765419999998812,
+          "roundtripMs": 0.7550830000000133,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "命令分类 command-schema",
+          "hit": false,
+          "serverMs": 0.46708300000000236,
+          "roundtripMs": 0.6912080000001879,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "编译态 $bunfs 路径",
+          "hit": false,
+          "serverMs": 0.45745899999997164,
+          "roundtripMs": 0.67512499999998,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "EADDRINUSE 端口冲突",
+          "hit": false,
+          "serverMs": 0.4957910000000538,
+          "roundtripMs": 0.7167080000001533,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "请求超时 退避重试",
+          "hit": false,
+          "serverMs": 0.5497920000000249,
+          "roundtripMs": 0.7815839999998389,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "保留期限 到期清理摘要",
+          "hit": false,
+          "serverMs": 0.45308300000010604,
+          "roundtripMs": 0.6320420000001832,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "中文检索 同义表达",
+          "hit": false,
+          "serverMs": 0.48166599999990467,
+          "roundtripMs": 0.7032500000000255,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "源消息编辑 摘要失效",
+          "hit": false,
+          "serverMs": 0.4612919999999576,
+          "roundtripMs": 0.6792089999999007,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "跨群候选 抢占预算",
+          "hit": false,
+          "serverMs": 0.46270800000002055,
+          "roundtripMs": 0.6424999999999272,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "跨时区 cron 夏令时",
+          "hit": false,
+          "serverMs": 0.45633300000008603,
+          "roundtripMs": 0.6484580000001188,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "查询切换 旧响应覆盖",
+          "hit": false,
+          "serverMs": 0.45679199999995035,
+          "roundtripMs": 0.6273750000000291,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "跨应用 owner 身份",
+          "hit": true,
+          "serverMs": 88.48841700000003,
+          "roundtripMs": 90.59674999999993,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "PTY 原生模块缺失",
+          "hit": true,
+          "serverMs": 91.96512500000017,
+          "roundtripMs": 94.342083,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "SQLITE_BUSY",
+          "hit": true,
+          "serverMs": 57.875749999999925,
+          "roundtripMs": 59.46137499999986,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "工作树共享依赖被覆盖",
+          "hit": true,
+          "serverMs": 86.46516599999995,
+          "roundtripMs": 88.98179200000004,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "分页同毫秒消息丢失",
+          "hit": true,
+          "serverMs": 76.72737500000017,
+          "roundtripMs": 79.6780839999999,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "关闭后排队任务继续执行",
+          "hit": true,
+          "serverMs": 77.66708299999982,
+          "roundtripMs": 80.79725000000008,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "过期租约迟到写入",
+          "hit": true,
+          "serverMs": 90.13954100000001,
+          "roundtripMs": 94.01058400000011,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "话题创建时间 日期筛选",
+          "hit": true,
+          "serverMs": 86.47554200000013,
+          "roundtripMs": 89.38533400000006,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "向量模型更换 维度",
+          "hit": true,
+          "serverMs": 78.67049999999972,
+          "roundtripMs": 80.3458340000002,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "消息撤回 230011",
+          "hit": true,
+          "serverMs": 68.84020900000041,
+          "roundtripMs": 70.61508300000014,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "命令分类 command-schema",
+          "hit": true,
+          "serverMs": 73.17933300000004,
+          "roundtripMs": 74.81637499999988,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "编译态 $bunfs 路径",
+          "hit": true,
+          "serverMs": 77.62908299999981,
+          "roundtripMs": 79.24220799999966,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "EADDRINUSE 端口冲突",
+          "hit": true,
+          "serverMs": 75.91304100000025,
+          "roundtripMs": 77.77229100000022,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "请求超时 退避重试",
+          "hit": true,
+          "serverMs": 90.46000000000004,
+          "roundtripMs": 92.89183299999968,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "保留期限 到期清理摘要",
+          "hit": true,
+          "serverMs": 77.51066700000001,
+          "roundtripMs": 80.48208299999988,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "中文检索 同义表达",
+          "hit": true,
+          "serverMs": 73.07974999999988,
+          "roundtripMs": 75.71008299999994,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "源消息编辑 摘要失效",
+          "hit": true,
+          "serverMs": 79.25525000000016,
+          "roundtripMs": 80.91054200000008,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "跨群候选 抢占预算",
+          "hit": true,
+          "serverMs": 77.327542,
+          "roundtripMs": 79.06954199999973,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "跨时区 cron 夏令时",
+          "hit": true,
+          "serverMs": 81.76420800000005,
+          "roundtripMs": 83.27083300000004,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "查询切换 旧响应覆盖",
+          "hit": true,
+          "serverMs": 97.12145899999996,
+          "roundtripMs": 97.89966600000025,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "跨应用 owner 身份",
+          "hit": true,
+          "serverMs": 123.20966699999963,
+          "roundtripMs": 123.72833400000036,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "PTY 原生模块缺失",
+          "hit": true,
+          "serverMs": 122.3972920000001,
+          "roundtripMs": 122.84299999999985,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "SQLITE_BUSY",
+          "hit": true,
+          "serverMs": 100.39875000000029,
+          "roundtripMs": 100.82175000000007,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "工作树共享依赖被覆盖",
+          "hit": true,
+          "serverMs": 120.54195899999968,
+          "roundtripMs": 120.97808400000031,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "分页同毫秒消息丢失",
+          "hit": true,
+          "serverMs": 120.71004099999982,
+          "roundtripMs": 121.14795800000002,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "关闭后排队任务继续执行",
+          "hit": true,
+          "serverMs": 123.90549999999985,
+          "roundtripMs": 124.44687500000009,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "过期租约迟到写入",
+          "hit": true,
+          "serverMs": 119.20974999999953,
+          "roundtripMs": 119.65612500000043,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "话题创建时间 日期筛选",
+          "hit": true,
+          "serverMs": 131.86791599999924,
+          "roundtripMs": 132.30979200000002,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "向量模型更换 维度",
+          "hit": true,
+          "serverMs": 119.33833400000003,
+          "roundtripMs": 119.78941699999996,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "消息撤回 230011",
+          "hit": true,
+          "serverMs": 107.47466600000007,
+          "roundtripMs": 107.92066599999998,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "命令分类 command-schema",
+          "hit": true,
+          "serverMs": 113.91662500000075,
+          "roundtripMs": 114.34554099999968,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "编译态 $bunfs 路径",
+          "hit": true,
+          "serverMs": 117.03733299999931,
+          "roundtripMs": 117.50529199999983,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "EADDRINUSE 端口冲突",
+          "hit": true,
+          "serverMs": 114.63824999999997,
+          "roundtripMs": 115.06233299999985,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "请求超时 退避重试",
+          "hit": true,
+          "serverMs": 123.5850419999997,
+          "roundtripMs": 124.00508300000001,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "保留期限 到期清理摘要",
+          "hit": true,
+          "serverMs": 118.87120799999957,
+          "roundtripMs": 119.30983399999968,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "中文检索 同义表达",
+          "hit": true,
+          "serverMs": 112.53441699999985,
+          "roundtripMs": 112.95158300000003,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "源消息编辑 摘要失效",
+          "hit": true,
+          "serverMs": 120.2895410000001,
+          "roundtripMs": 120.7100419999997,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "跨群候选 抢占预算",
+          "hit": true,
+          "serverMs": 125.36487500000021,
+          "roundtripMs": 125.84845799999948,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "跨时区 cron 夏令时",
+          "hit": true,
+          "serverMs": 124.6162089999998,
+          "roundtripMs": 125.08087499999965,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "查询切换 旧响应覆盖",
+          "hit": true,
+          "serverMs": 120.04225000000042,
+          "roundtripMs": 120.46683399999984,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        }
+      ]
+    },
+    "bun": {
+      "fixture": "authored-synthetic-v1",
+      "corpusContentSha256": "59435f1e9ed5ca3ca8d71470ff24f4fc51e4227688bd42578bd3696e95ceb0a3",
+      "topics": 1000,
+      "summaries": 10000,
+      "queries": 20,
+      "limits": "Authored relevance labels, no human production-query confirmation. Hybrid vectors are idealized manual labels; not a real embedding quality/cost result. Isolated HTTP fixture reuses production API/search but not the full Dashboard process.",
+      "environment": {
+        "platform": "darwin",
+        "arch": "arm64",
+        "release": "27.2.0",
+        "cpu": "Apple M6",
+        "runtime": "v26.3.0",
+        "bun": "1.4.3"
+      },
+      "groups": [
+        {
+          "mode": "baseline",
+          "top3": 0,
+          "serverP50Ms": 0.5167080000001079,
+          "serverP95Ms": 1.035209000000009,
+          "roundtripP95Ms": 1.3518750000000637,
+          "budgetLimitedQueries": 0
+        },
+        {
+          "mode": "keyword",
+          "top3": 1,
+          "serverP50Ms": 48.213708,
+          "serverP95Ms": 71.9464579999999,
+          "roundtripP95Ms": 72.87183299999992,
+          "budgetLimitedQueries": 0
+        },
+        {
+          "mode": "hybrid",
+          "top3": 1,
+          "serverP50Ms": 93.52649999999994,
+          "serverP95Ms": 107.85429199999999,
+          "roundtripP95Ms": 109.10354200000029,
+          "budgetLimitedQueries": 0
+        }
+      ],
+      "embeddingCalls": 20,
+      "realProviderCalls": 0,
+      "sourceCalls": 0,
+      "forbiddenFetches": 0,
+      "rssBytesAtEnd": 327648288,
+      "measurements": [
+        {
+          "mode": "baseline",
+          "query": "跨应用 owner 身份",
+          "hit": false,
+          "serverMs": 1.4117500000000973,
+          "roundtripMs": 5.292708999999945,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "PTY 原生模块缺失",
+          "hit": false,
+          "serverMs": 0.5612079999999651,
+          "roundtripMs": 0.9972920000000158,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "SQLITE_BUSY",
+          "hit": false,
+          "serverMs": 0.5073340000000144,
+          "roundtripMs": 0.8132919999999331,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "工作树共享依赖被覆盖",
+          "hit": false,
+          "serverMs": 0.5525000000000091,
+          "roundtripMs": 0.81087500000001,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "分页同毫秒消息丢失",
+          "hit": false,
+          "serverMs": 0.5521249999999327,
+          "roundtripMs": 0.7851249999999936,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "关闭后排队任务继续执行",
+          "hit": false,
+          "serverMs": 1.035209000000009,
+          "roundtripMs": 1.3518750000000637,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "过期租约迟到写入",
+          "hit": false,
+          "serverMs": 0.6020409999999856,
+          "roundtripMs": 0.8892500000000609,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "话题创建时间 日期筛选",
+          "hit": false,
+          "serverMs": 0.5292920000000549,
+          "roundtripMs": 0.7625410000000556,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "向量模型更换 维度",
+          "hit": false,
+          "serverMs": 0.4731249999999818,
+          "roundtripMs": 0.6871250000000373,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "消息撤回 230011",
+          "hit": false,
+          "serverMs": 0.5054159999999683,
+          "roundtripMs": 0.7102499999999736,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "命令分类 command-schema",
+          "hit": false,
+          "serverMs": 0.5093329999999696,
+          "roundtripMs": 0.7210419999998976,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "编译态 $bunfs 路径",
+          "hit": false,
+          "serverMs": 0.8495410000000447,
+          "roundtripMs": 1.1581669999999349,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "EADDRINUSE 端口冲突",
+          "hit": false,
+          "serverMs": 0.497792000000004,
+          "roundtripMs": 0.7507500000000391,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "请求超时 退避重试",
+          "hit": false,
+          "serverMs": 0.5092910000000757,
+          "roundtripMs": 0.7084580000000642,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "保留期限 到期清理摘要",
+          "hit": false,
+          "serverMs": 0.5167080000001079,
+          "roundtripMs": 0.7524159999999256,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "中文检索 同义表达",
+          "hit": false,
+          "serverMs": 0.47670799999991686,
+          "roundtripMs": 0.6802079999999933,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "源消息编辑 摘要失效",
+          "hit": false,
+          "serverMs": 0.5642910000000256,
+          "roundtripMs": 0.8791250000000446,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "跨群候选 抢占预算",
+          "hit": false,
+          "serverMs": 0.8207089999999653,
+          "roundtripMs": 1.221667000000025,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "跨时区 cron 夏令时",
+          "hit": false,
+          "serverMs": 0.46058399999992616,
+          "roundtripMs": 0.7680829999999332,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "baseline",
+          "query": "查询切换 旧响应覆盖",
+          "hit": false,
+          "serverMs": 0.438541999999984,
+          "roundtripMs": 0.641666999999984,
+          "examinedTopics": 0,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "跨应用 owner 身份",
+          "hit": true,
+          "serverMs": 72.69279199999994,
+          "roundtripMs": 73.055791,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "PTY 原生模块缺失",
+          "hit": true,
+          "serverMs": 71.9464579999999,
+          "roundtripMs": 72.87183299999992,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "SQLITE_BUSY",
+          "hit": true,
+          "serverMs": 51.10895899999991,
+          "roundtripMs": 51.5406660000001,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "工作树共享依赖被覆盖",
+          "hit": true,
+          "serverMs": 58.65037499999994,
+          "roundtripMs": 59.49233299999992,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "分页同毫秒消息丢失",
+          "hit": true,
+          "serverMs": 63.123375000000124,
+          "roundtripMs": 64.06533299999978,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "关闭后排队任务继续执行",
+          "hit": true,
+          "serverMs": 55.828040999999985,
+          "roundtripMs": 56.884874999999965,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "过期租约迟到写入",
+          "hit": true,
+          "serverMs": 47.22262500000011,
+          "roundtripMs": 48.278749999999945,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "话题创建时间 日期筛选",
+          "hit": true,
+          "serverMs": 45.02925000000005,
+          "roundtripMs": 45.90779199999997,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "向量模型更换 维度",
+          "hit": true,
+          "serverMs": 44.606416999999965,
+          "roundtripMs": 45.5346669999999,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "消息撤回 230011",
+          "hit": true,
+          "serverMs": 42.596541000000116,
+          "roundtripMs": 43.55037500000003,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "命令分类 command-schema",
+          "hit": true,
+          "serverMs": 41.824292000000014,
+          "roundtripMs": 42.78037500000005,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "编译态 $bunfs 路径",
+          "hit": true,
+          "serverMs": 43.53854200000001,
+          "roundtripMs": 44.441957999999886,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "EADDRINUSE 端口冲突",
+          "hit": true,
+          "serverMs": 44.975791999999956,
+          "roundtripMs": 46.0525419999999,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "请求超时 退避重试",
+          "hit": true,
+          "serverMs": 52.644457999999986,
+          "roundtripMs": 53.69337500000006,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "保留期限 到期清理摘要",
+          "hit": true,
+          "serverMs": 49.55420800000002,
+          "roundtripMs": 50.52404200000001,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "中文检索 同义表达",
+          "hit": true,
+          "serverMs": 51.052000000000135,
+          "roundtripMs": 52.20329200000015,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "源消息编辑 摘要失效",
+          "hit": true,
+          "serverMs": 47.27383400000008,
+          "roundtripMs": 48.165333000000146,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "跨群候选 抢占预算",
+          "hit": true,
+          "serverMs": 45.46929100000011,
+          "roundtripMs": 47.53308300000003,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "跨时区 cron 夏令时",
+          "hit": true,
+          "serverMs": 57.67591700000003,
+          "roundtripMs": 58.067999999999984,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "keyword",
+          "query": "查询切换 旧响应覆盖",
+          "hit": true,
+          "serverMs": 48.213708,
+          "roundtripMs": 49.202165999999806,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "跨应用 owner 身份",
+          "hit": true,
+          "serverMs": 99.27295800000002,
+          "roundtripMs": 99.67783299999996,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "PTY 原生模块缺失",
+          "hit": true,
+          "serverMs": 107.85429199999999,
+          "roundtripMs": 109.10354200000029,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "SQLITE_BUSY",
+          "hit": true,
+          "serverMs": 82.12820800000009,
+          "roundtripMs": 82.998333,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "工作树共享依赖被覆盖",
+          "hit": true,
+          "serverMs": 97.3311249999997,
+          "roundtripMs": 97.89041699999962,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "分页同毫秒消息丢失",
+          "hit": true,
+          "serverMs": 93.78829200000018,
+          "roundtripMs": 94.78012500000023,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "关闭后排队任务继续执行",
+          "hit": true,
+          "serverMs": 93.34066600000006,
+          "roundtripMs": 93.76912500000026,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "过期租约迟到写入",
+          "hit": true,
+          "serverMs": 94.73599999999988,
+          "roundtripMs": 95.16758400000026,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "话题创建时间 日期筛选",
+          "hit": true,
+          "serverMs": 93.3204169999999,
+          "roundtripMs": 93.78441699999985,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "向量模型更换 维度",
+          "hit": true,
+          "serverMs": 93.516208,
+          "roundtripMs": 94.38595900000018,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "消息撤回 230011",
+          "hit": true,
+          "serverMs": 92.04708299999993,
+          "roundtripMs": 92.46974999999975,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "命令分类 command-schema",
+          "hit": true,
+          "serverMs": 95.8762499999998,
+          "roundtripMs": 96.43737499999997,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "编译态 $bunfs 路径",
+          "hit": true,
+          "serverMs": 109.90983300000016,
+          "roundtripMs": 110.9982500000001,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "EADDRINUSE 端口冲突",
+          "hit": true,
+          "serverMs": 105.9491250000001,
+          "roundtripMs": 107.253917,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "请求超时 退避重试",
+          "hit": true,
+          "serverMs": 105.92899999999963,
+          "roundtripMs": 106.49270800000022,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "保留期限 到期清理摘要",
+          "hit": true,
+          "serverMs": 97.2417089999999,
+          "roundtripMs": 98.20383300000003,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "中文检索 同义表达",
+          "hit": true,
+          "serverMs": 93.01304200000004,
+          "roundtripMs": 93.46324999999979,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "源消息编辑 摘要失效",
+          "hit": true,
+          "serverMs": 91.95158300000003,
+          "roundtripMs": 92.37925000000041,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "跨群候选 抢占预算",
+          "hit": true,
+          "serverMs": 93.52649999999994,
+          "roundtripMs": 94.42675000000008,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "跨时区 cron 夏令时",
+          "hit": true,
+          "serverMs": 91.51741700000002,
+          "roundtripMs": 92.00616599999967,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        },
+        {
+          "mode": "hybrid",
+          "query": "查询切换 旧响应覆盖",
+          "hit": true,
+          "serverMs": 92.60587499999974,
+          "roundtripMs": 93.45116599999983,
+          "examinedTopics": 1000,
+          "budgetLimited": false
+        }
+      ]
+    }
+  }
+}
